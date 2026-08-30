@@ -4,8 +4,12 @@ Run the guards before shipping. They exist because two defects reached productio
 careful review and a clean self-audit.
 
 ```bash
-python guards.py --html staged/index.html --derive staged/derive.py --ticks ticks-sample.jsonl
+python guards.py --html index.html --derive derive.py --ticks ticks-sample.jsonl
 ```
+
+`ticks-sample.jsonl` currently contains 204 collector-2.0.0-era ticks and none carries
+`read_budget`. Refresh this gitignored guard corpus after every tick-schema change so the
+guards exercise the new manifest shape; a legacy-only corpus cannot validate newly added fields.
 
 Non-zero exit means do not deploy.
 

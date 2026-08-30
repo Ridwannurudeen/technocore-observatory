@@ -1,9 +1,13 @@
+import ast
+import inspect
 import json
 import re
+import textwrap
 from copy import deepcopy
 
 import pytest
 
+import collect
 import derive
 
 from derive import derive_records, inject_html, read_jsonl, ssr_values, validate_tick
@@ -217,6 +221,98 @@ def embedded_data(source):
     )
     assert match
     return json.loads(match.group(1))
+
+
+def test_methodology_version_is_bumped_for_room_sampling_change():
+    result = derive_records([])
+    assert derive.METHODOLOGY_VERSION == "1.4.0"
+    assert result["methodology_version"] == "1.4.0"
+    assert (
+        "since collector 2.2.0 a sender without a nonce is never counted"
+        in result["methodology"]["signer_funnel"]
+    )
+
+
+def test_room_sampling_grouping_sentence_matches_accumulator_key():
+    source = inspect.getsource(derive.derived_room_sampling)
+    tree = ast.parse(textwrap.dedent(source))
+    assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "key"
+            for target in node.targets
+        )
+    ]
+    assert len(assignments) == 1
+    key_node = assignments[0].value
+    assert isinstance(key_node, ast.Tuple)
+    key_fields = [
+        element.slice.value
+        for element in key_node.elts
+        if (
+            isinstance(element, ast.Subscript)
+            and isinstance(element.value, ast.Name)
+            and element.value.id == "manifest"
+            and isinstance(element.slice, ast.Constant)
+            and isinstance(element.slice.value, str)
+        )
+    ]
+    assert len(key_fields) == len(key_node.elts)
+    assert key_fields == [
+        "selector_version",
+        "seed",
+        "epoch",
+        "frame_id",
+        "frame_size",
+    ]
+
+    methodology = derive.methodology_definitions()["room_sampling"]
+    grouping = re.search(
+        r"Cumulative unique rooms, repeats and failed reads are counted "
+        r".*?denominator\.",
+        methodology,
+    )
+    assert grouping
+    field_phrases = {
+        "selector_version": "selector version",
+        "seed": "seed",
+        "epoch": "epoch",
+        "frame_id": "frame identifier",
+        "frame_size": "frame-size denominator",
+        "read_budget": "read budget",
+    }
+    mentioned_fields = {
+        field
+        for field, phrase in field_phrases.items()
+        if phrase in grouping.group(0)
+    }
+    assert mentioned_fields == set(key_fields)
+
+
+def test_published_room_listing_endpoints_match_collector_request():
+    collector_source = inspect.getsource(collect.collect_tick)
+    collector_endpoints = re.findall(
+        r'client\.get\("(/rooms\?format=json&limit=\d+)"\)',
+        collector_source,
+    )
+    assert collector_endpoints == ["/rooms?format=json&limit=200"]
+    room_endpoint = collector_endpoints[0]
+
+    methodology = derive.methodology_definitions()
+    listing_entries = (
+        "first_message_only",
+        "capacity",
+        "room_sampling",
+        "service_engagement",
+    )
+    for name in listing_entries:
+        assert room_endpoint in methodology[name]
+
+    bare_room_endpoint = re.compile(r"/rooms\?format=json(?!&limit=200)")
+    for name, text in methodology.items():
+        assert bare_room_endpoint.search(text) is None, name
 
 
 def test_rate_math_and_sample_counts():
@@ -483,6 +579,9 @@ def test_room_sampling_prose_distinguishes_recorded_and_legacy_budgets():
         in legacy_coverage
     )
     assert "when absent on legacy ticks it is reported as not recorded" in methodology
+    for coverage_text in (recorded_coverage, legacy_coverage):
+        assert "1 / 200 distinct room hashes selected" in coverage_text
+        assert "distinct room hashes observed" not in coverage_text
     for prose in (recorded_coverage, legacy_coverage, methodology):
         assert "20 room reads" not in prose
 
@@ -504,6 +603,36 @@ def test_cumulative_unique_room_coverage_and_repeats_are_frame_scoped():
     assert sampling["sampled_rooms"] == 2
     assert sampling["cumulative_unique_rooms"] == 3
     assert sampling["repeat_count"] == 1
+
+
+def test_read_budget_change_does_not_fork_frame_coverage():
+    first = manifest(
+        "aaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbb",
+        success=[True, False],
+        read_budget=20,
+    )
+    second = manifest(
+        "bbbbbbbbbbbbbbbb",
+        "cccccccccccccccc",
+        success=[True, True],
+        read_budget=80,
+    )
+    records = [
+        tick("2026-08-28T08:00:00Z", room_sampling=first),
+        tick(
+            "2026-08-28T08:02:00Z",
+            event_seq=30001,
+            lobby=5001,
+            room_sampling=second,
+        ),
+    ]
+    sampling = derive_records(records)["points"][-1]["room_sampling"]
+    assert sampling["read_budget"] == 80
+    assert sampling["cumulative_unique_rooms"] == 3
+    assert sampling["repeat_count"] == 1
+    assert sampling["failed_reads"] == 1
+    assert sampling["failed_reads_this_tick"] == 0
 
 
 def test_failed_room_read_is_counted_without_becoming_zero():

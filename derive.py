@@ -28,12 +28,13 @@ UUID_LIKE_RE = re.compile(
 )
 MIXED_TOKEN_RE = re.compile(r"^[a-z0-9]{12,}$", re.IGNORECASE)
 TRAILING_WINDOW_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.3.0"
+METHODOLOGY_VERSION = "1.4.0"
 ROOM_SAMPLING_STRUCTURAL_CEILING = 200
-# Five 120-second collector intervals. The rebuild cron runs independently of
-# the collector, so a payload whose newest tick is older than this at rebuild
-# time means collection has stalled; age exactly at the threshold is not yet a
-# stall (strictly greater).
+# A fixed ten-minute honesty threshold. At the measured post-deploy cadence of
+# about 258 seconds per tick, this is about 2.3 collector intervals. The rebuild
+# cron runs independently of the collector, so a payload whose newest tick is
+# older than this at rebuild time means collection has stalled; age exactly at
+# the threshold is not yet a stall (strictly greater).
 STALL_THRESHOLD_SECONDS = 600
 FUNNEL_BASE_FIELDS = (
     "well_formed_did_notes",
@@ -491,7 +492,6 @@ def derived_room_sampling(
         manifest["epoch"],
         manifest["frame_id"],
         manifest["frame_size"],
-        manifest["read_budget"],
     )
     state = coverage_by_frame.setdefault(
         key,
@@ -709,7 +709,7 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
             f"{format_int(max(0, frame_size - 1))} newest-listing rooms plus lobby. "
             f"{read_budget_text}"
             f"{format_int(coverage['cumulative_unique_rooms'])} / "
-            f"{format_int(frame_size)} distinct room hashes observed; "
+            f"{format_int(frame_size)} distinct room hashes selected; "
             f"{format_int(coverage['sampled_rooms'])} selected this tick; "
             f"{format_int(coverage['failed_reads'])} cumulative failed reads and "
             f"{format_int(coverage['repeat_count'])} repeated selections in this frame epoch. "
@@ -846,15 +846,17 @@ def methodology_definitions() -> dict[str, str]:
             "Numerator: captured new-room events whose same-tick newest-room record has "
             "sequence <= 1. Denominator: captured new-room events matched by exact room "
             "name to that listing. Window: one collector interval. Endpoints: "
-            "/r/events?format=json&limit=200 and /rooms?format=json. Deduplication key: "
-            "event sequence, then exact room name for the join. It is a newest-listing "
+            "/r/events?format=json&limit=200 and /rooms?format=json&limit=200. "
+            "Deduplication key: event sequence, then exact room name for the join. "
+            "It is a newest-listing "
             "sample and a live lower-bound signal, not a final outcome; unmatched and "
             "missing rooms are excluded, never counted as zero."
         ),
         "capacity": (
             "Numerator and denominator for utilisation: current total and current "
-            "operator cap from /rooms?format=json; headroom is max(0, cap - total), and "
-            "fill fraction is min(1, total / cap). Net-change rate is "
+            "operator cap from /rooms?format=json&limit=200; headroom is "
+            "max(0, cap - total), and fill fraction is min(1, total / cap). "
+            "Net-change rate is "
             "(last total - first total) / elapsed UTC seconds over at most 24 hours of "
             "gap-free samples under one unchanged cap; its sample count and window are "
             "published. These are point observations and a trailing measurement, not a "
@@ -869,7 +871,7 @@ def methodology_definitions() -> dict[str, str]:
             "characters of SHA-256(room name), so attacker-controlled names are not "
             "republished. Cumulative unique rooms, repeats and failed reads are counted "
             "only within the exact selector version, seed, epoch, frame identifier and "
-            "frame-size denominator. Endpoint: /rooms?format=json then "
+            "frame-size denominator. Endpoint: /rooms?format=json&limit=200 then "
             "/r/<name>?format=json&limit=200. Deduplication key: hashed normalized room "
             "name. This is a sample; a failed read remains a recorded failure and "
             "contributes no message body."
@@ -905,8 +907,8 @@ def methodology_definitions() -> dict[str, str]:
             "windowed_note_to_message_ratio and zero_response_share — computed by the "
             "service over its own message window, whose declared figures (window_cap "
             "and windowed_messages) are republished beside every value. Endpoint: "
-            "/rooms?format=json. These are the service's own figures, republished "
-            "unverified under the service's own field names: the observatory cannot "
+            "/rooms?format=json&limit=200. These are the service's own figures, "
+            "republished unverified under the service's own field names: the observatory cannot "
             "recompute them, and they describe the service's declared window, never "
             "the whole network. A tick without a well-formed engagement object or "
             "field publishes 'not recorded', never zero."

@@ -6,6 +6,7 @@ import types
 import pytest
 
 from collect import (
+    COLLECTOR_VERSION,
     ROOM_READ_BUDGET,
     CollectionError,
     exclusive_state_lock,
@@ -25,6 +26,10 @@ def room_body(*messages):
 
 def message(seq, sender, **extra):
     return {"seq": seq, "ts": "2026-08-28T08:00:00Z", "from": sender, "text": "x", **extra}
+
+
+def test_collector_version_is_bumped_for_budgeted_200_room_sampling():
+    assert COLLECTOR_VERSION == "2.3.0"
 
 
 def test_room_sampling_manifest_records_configured_read_budget():
