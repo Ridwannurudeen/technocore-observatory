@@ -3,6 +3,10 @@
 Fable-5 ceiling analysis, 2026-08-29. Key claims independently verified by the operator; the
 verified ones are marked. This is a ceiling analysis, not a bug list.
 
+> **Superseded status, 2026-08-30:** The F5a SQLite/cap release moved signer state to v3 and
+> retired the 200,000-DID insertion cap. The frozen-cohort paragraph below records the condition
+> at the time of this analysis; it is no longer a present-tense description of collection.
+
 ## The hardest finding
 
 **The funnel cannot answer the question its own visual poses.** Stage 1 counts published DID-note

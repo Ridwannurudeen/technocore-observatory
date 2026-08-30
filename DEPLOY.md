@@ -37,12 +37,52 @@ the second names the exact path.
 
 ## Deploy
 
-1. Guards pass.
-2. Snapshot for rollback, including `ticks.jsonl` — forward-collected data is unrecoverable:
-   `cp collect.py derive.py index.html template.html ticks.jsonl signers.json /root/observatory-rollback-$(date -u +%Y%m%dT%H%M%SZ)/`
-3. `systemctl stop technocore-observatory.service`, copy the four files, strip CRLF, copy
-   `index.html` to `template.html`, `chown technocore:technocore`.
-4. `systemctl start technocore-observatory.service`; wait for a tick and confirm it carries the
-   expected schema before trusting the rebuild.
-5. `rebuild.sh`, then check `accepted` / `rejected` in `data.json`. Any rejected tick after a
-   schema change means backward compatibility broke — roll back rather than lose collection.
+1. Run the guards and stop if any guard fails.
+2. Fence both signer-state writers before taking a snapshot or running a migration:
+   - `systemctl stop technocore-observatory.service`.
+   - Disable or comment out the `23 */6` census cron entry.
+   - Confirm that no daemon or census invocation is still running. Do not migrate while either
+     writer can reach the signer state.
+3. Take a rollback snapshot only after both writers are stopped. Forward-collected ticks and the
+   SQLite DID table are unrecoverable:
+   - Set `rollback_dir=/root/observatory-rollback-$(date -u +%Y%m%dT%H%M%SZ)` and run
+     `mkdir -m 700 "$rollback_dir"`.
+   - Copy `collect.py`, `derive.py`, `migrate_signers.py`, `index.html`, `rebuild.sh`,
+     `ticks.jsonl`, and `signers.json` into that directory.
+   - Copy `signers.sqlite3` and each existing `signers.sqlite3-wal` and
+     `signers.sqlite3-shm` sidecar into the same directory. Writers are stopped, so the database
+     and any remaining sidecars form one coherent snapshot.
+4. Copy the release versions of `collect.py`, `derive.py` and `migrate_signers.py`, then strip
+   CRLF from the copied scripts.
+
+   There is no separate template: `derive.py --html index.html` rewrites the deployed
+   `index.html` in place, and `rebuild.sh` publishes to `/opt/technocore-observatory` only after
+   that injection. So copy the committed `index.html` **only when the page markup, CSS or
+   JavaScript actually changed**, and never as a routine step — it carries baked values from
+   whichever run last touched it. When you do copy it, step 7 must run before anything is
+   served, which is what replaces those values.
+5. For a one-time JSON-to-SQLite migration only:
+   - Run `python migrate_signers.py --help` and use the paths required by that checked-in
+     migrator version.
+   - Confirm every migration output path does not already exist. The migrator refuses
+     pre-existing outputs; do not delete or overwrite an existing SQLite store to force it.
+   - Run the migration only while both writers remain fenced. Preserve the source JSON and the
+     rollback snapshot if migration fails.
+   - Skip this step when the authoritative v3 SQLite store already exists.
+6. Before starting either writer, make every deployed script and state file owned by
+   `technocore:technocore`. This includes `signers.json`, `signers.sqlite3`, and every existing
+   `signers.sqlite3-wal` or `signers.sqlite3-shm` sidecar. Files created by a root-run migration
+   must not remain root-owned.
+7. Run `rebuild.sh` while the service and census cron are still stopped. It injects the payload
+   derived from the deployed `ticks.jsonl` into `index.html` and only then publishes to
+   `/opt/technocore-observatory`, so the public page never shows another run's baked values. Check `accepted` and `rejected` in `data.json`, then inspect the no-JavaScript SSR
+   versions, warning text, and tracked-DID label. Any newly rejected historical tick means
+   backward compatibility broke; do not serve the rebuilt page.
+8. Start `technocore-observatory.service`, restore the fenced census cron entry, and wait for one
+   collector tick. Confirm that the tick carries the expected collector and signer-state schema.
+9. Run `rebuild.sh` again and repeat the accepted/rejected and no-JavaScript SSR checks.
+10. For a code rollback, fence both writers again and snapshot the current live ledger and SQLite
+    store before changing anything. Restore only the previous code and page, then rebuild from
+    the current live `ticks.jsonl`. Never overwrite the current `ticks.jsonl`, `signers.json`, or
+    SQLite store with the pre-deploy snapshot as part of an ordinary code rollback; those copies
+    are disaster-recovery material, not rollback inputs.

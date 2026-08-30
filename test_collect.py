@@ -1,10 +1,12 @@
 import json
+import sqlite3
 import sys
 import time
 import types
 
 import pytest
 
+import collect
 from collect import (
     COLLECTOR_VERSION,
     ROOM_READ_BUDGET,
@@ -80,7 +82,7 @@ def insert_record(
 
 
 def test_collector_version_is_bumped_for_sqlite_signer_storage():
-    assert COLLECTOR_VERSION == "2.4.0"
+    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 4, 0)
 
 
 def test_room_sampling_manifest_records_configured_read_budget():
@@ -296,8 +298,15 @@ def test_saturation_disclosure_uses_recorded_timestamps():
 
     assert "2026-08-29T18:00:15Z" in disclosure["warning"]
     assert "2026-08-30T09:10:11Z" in disclosure["warning"]
-    assert "not recorded" in disclosure["warning"]
-    assert "undercount is permanent" in disclosure["warning"]
+    assert (
+        "DIDs first appearing during that interval and never re-observed were lost entirely."
+        in disclosure["warning"]
+    )
+    assert "understate that cohort until those counters rebuild" in disclosure["warning"]
+    assert (
+        "has a first-observed timestamp no earlier than that later observation"
+        in disclosure["warning"]
+    )
     assert "without an insertion cap" in disclosure["methodology"]
 
 
@@ -381,6 +390,62 @@ def test_v2_migration_preserves_all_funnel_counts(tmp_path):
     assert "dids" not in migrated_metadata
     assert migrated_metadata["selector_seed"] == state["selector_seed"]
     assert migrated_metadata["selector_epoch"] == state["selector_epoch"]
+
+
+def test_sqlite_error_skips_tick_and_daemon_loop_continues(
+    tmp_path, monkeypatch, capsys
+):
+    output = tmp_path / "ticks.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect.py",
+            "--base-url",
+            "https://example.invalid",
+            "--output",
+            str(output),
+            "--interval",
+            "1",
+        ],
+    )
+
+    attempts = []
+
+    def collect_once_then_succeed(*args, **kwargs):
+        attempts.append((args, kwargs))
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return {"tick": len(attempts)}
+
+    written = []
+    monkeypatch.setattr(collect, "collect_tick", collect_once_then_succeed)
+    monkeypatch.setattr(
+        collect,
+        "append_jsonl",
+        lambda path, record: written.append((path, record)),
+    )
+
+    class StopDaemon(Exception):
+        pass
+
+    sleeps = []
+
+    def stop_after_second_iteration(delay):
+        sleeps.append(delay)
+        if len(sleeps) == 2:
+            raise StopDaemon
+
+    monkeypatch.setattr(collect.time, "sleep", stop_after_second_iteration)
+
+    with pytest.raises(StopDaemon):
+        collect.main()
+
+    assert len(attempts) == 2
+    assert written == [(output, {"tick": 2})]
+    assert "collection failed; no tick written: database is locked" in (
+        capsys.readouterr().err
+    )
 
 
 def test_state_lock_degrades_to_a_noop_where_fcntl_is_unavailable(tmp_path, monkeypatch):

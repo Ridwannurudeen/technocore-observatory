@@ -243,8 +243,8 @@ def embedded_data(source):
 
 def test_methodology_version_is_bumped_for_tracking_disclosure():
     result = derive_records([])
-    assert derive.METHODOLOGY_VERSION == "1.5.0"
-    assert result["methodology_version"] == "1.5.0"
+    assert tuple(map(int, derive.METHODOLOGY_VERSION.split("."))) > (1, 5, 0)
+    assert result["methodology_version"] == derive.METHODOLOGY_VERSION
     assert (
         "since collector 2.2.0 a sender without a nonce is never counted"
         in result["methodology"]["signer_funnel"]
@@ -949,7 +949,54 @@ def test_observed_signers_may_exceed_the_census():
     assert validated["signer_funnel"]["dids_observed_signing"] == 100
 
 
-def test_retired_tracking_cap_accepts_count_above_cap_and_legacy_cap_still_gates():
+def test_fresh_v3_state_accepts_count_above_retired_cap_without_cap_usage_claim():
+    current = funnel(
+        observed=201_365,
+        two_ticks=127_177,
+        two_collection_dates=65_515,
+        two_rooms=47_409,
+        counterparties=47_306,
+        cap_hit=True,
+    )
+    current["signer_state_version"] = 3
+
+    validated = validate_tick(
+        tick("2026-08-30T10:00:00Z", signer_funnel=current)
+    )
+    assert validated["signer_funnel"]["tracked_dids"] == 201_365
+    assert validated["signer_funnel"]["tracking_disclosure"] is None
+
+    result = derive_records(
+        [tick("2026-08-30T10:00:00Z", signer_funnel=current)]
+    )
+    tracked_text = ssr_values(result)["tracked-dids"]
+    assert tracked_text == (
+        "201,365 tracked DIDs · retired JSON-store cap 200,000 "
+        "(no longer gates insertion)"
+    )
+    assert "% of the state cap used" not in tracked_text
+
+
+def test_v2_state_above_its_cap_is_refused():
+    version_two = funnel(observed=200_001)
+    version_two["signer_state_version"] = 2
+
+    with pytest.raises(ValueError, match="tracked DID count exceeds its cap"):
+        validate_tick(
+            tick("2026-08-30T10:00:00Z", signer_funnel=version_two)
+        )
+
+
+def test_legacy_state_without_version_or_disclosure_remains_cap_gated():
+    legacy = funnel(observed=200_001)
+    assert "signer_state_version" not in legacy
+    assert "tracking_disclosure" not in legacy
+
+    with pytest.raises(ValueError, match="tracked DID count exceeds its cap"):
+        validate_tick(tick("2026-08-30T10:00:00Z", signer_funnel=legacy))
+
+
+def test_pre_version_disclosure_retains_uncapped_interpretation():
     disclosed = funnel(
         observed=201_365,
         two_ticks=127_177,
@@ -959,16 +1006,13 @@ def test_retired_tracking_cap_accepts_count_above_cap_and_legacy_cap_still_gates
         cap_hit=True,
         tracking_disclosure=saturation_disclosure(),
     )
+
     validated = validate_tick(
         tick("2026-08-30T10:00:00Z", signer_funnel=disclosed)
     )
     assert validated["signer_funnel"]["tracked_dids"] == 201_365
+    assert validated["signer_funnel"]["signer_state_version"] is None
     assert validated["signer_funnel"]["tracking_disclosure"] == saturation_disclosure()
-
-    legacy = deepcopy(disclosed)
-    legacy.pop("tracking_disclosure")
-    with pytest.raises(ValueError, match="tracked DID count exceeds its cap"):
-        validate_tick(tick("2026-08-30T10:00:00Z", signer_funnel=legacy))
 
     malformed = deepcopy(disclosed)
     malformed["tracking_disclosure"] = {"warning": "incomplete"}
@@ -1000,6 +1044,10 @@ def test_tracking_disclosure_reaches_shared_warning_and_methodology(tmp_path):
 
     assert display["warning"].endswith(disclosure["warning"])
     assert values["funnel-warning"] == display["warning"]
+    assert (
+        "DIDs first appearing during that interval and never re-observed were lost entirely."
+        in values["funnel-warning"]
+    )
     assert result["methodology"]["signer_funnel"].endswith(disclosure["methodology"])
     assert "admissions stopped" not in values["funnel-observed-context"]
     assert "new observed DIDs are no longer added" not in values["funnel-warning"]
@@ -1023,7 +1071,9 @@ def test_tracking_disclosure_reaches_shared_warning_and_methodology(tmp_path):
     legacy = derive_records(
         [tick("2026-08-30T10:00:00Z", signer_funnel=funnel())]
     )
-    legacy_warning = legacy["points"][0]["signer_funnel"]["display"]["warning"]
+    legacy_funnel_point = legacy["points"][0]["signer_funnel"]
+    legacy_warning = legacy_funnel_point["display"]["warning"]
+    assert legacy_funnel_point["tracking_disclosure"] is None
     assert legacy_warning == (
         "The sampling frame is the newest rooms, so this funnel is biased "
         "toward new and short-lived rooms."
@@ -1122,16 +1172,19 @@ def test_collector_assembled_current_and_legacy_ticks_validate(
     record = collect.collect_tick(StubClient(), signer_state_path, signer_cap=1)
     assert record["signer_funnel"]["tracked_dids"] == 2
     assert record["signer_funnel"]["tracked_cap"] == 1
+    assert record["signer_funnel"]["signer_state_version"] == 3
     assert record["signer_funnel"]["tracking_disclosure"] == (
         collect.tracking_disclosure(state)
     )
     validated = validate_tick(record)
     assert validated["signer_funnel"]["tracked_dids"] == 2
+    assert validated["signer_funnel"]["signer_state_version"] == 3
 
     legacy = deepcopy(record)
     legacy.pop("collector_version")
     legacy_funnel_value = legacy["signer_funnel"]
     legacy_funnel_value.pop("tracking_disclosure")
+    legacy_funnel_value.pop("signer_state_version")
     legacy_funnel_value["dids_observed_signing"] = 1
     legacy_funnel_value["tracked_dids"] = 1
     legacy_validated = validate_tick(legacy)

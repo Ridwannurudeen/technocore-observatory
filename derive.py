@@ -28,7 +28,7 @@ UUID_LIKE_RE = re.compile(
 )
 MIXED_TOKEN_RE = re.compile(r"^[a-z0-9]{12,}$", re.IGNORECASE)
 TRAILING_WINDOW_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.5.0"
+METHODOLOGY_VERSION = "1.6.0"
 ROOM_SAMPLING_STRUCTURAL_CEILING = 200
 # A fixed ten-minute honesty threshold. At the measured post-deploy cadence of
 # about 258 seconds per tick, this is about 2.3 collector intervals. The rebuild
@@ -319,12 +319,23 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     result["tracking_disclosure"] = validate_tracking_disclosure(
         value.get("tracking_disclosure")
     )
+    raw_signer_state_version = value.get("signer_state_version")
+    result["signer_state_version"] = (
+        None
+        if raw_signer_state_version is None
+        else integer(
+            raw_signer_state_version,
+            "signer_funnel.signer_state_version",
+            1,
+        )
+    )
     result["tracked_dids"] = integer(value.get("tracked_dids"), "tracked_dids")
     result["tracked_cap"] = integer(value.get("tracked_cap"), "tracked_cap", 1)
-    if (
-        result["tracking_disclosure"] is None
-        and result["tracked_dids"] > result["tracked_cap"]
-    ):
+    cap_gates = result["signer_state_version"] != 3 and not (
+        result["signer_state_version"] is None
+        and result["tracking_disclosure"] is not None
+    )
+    if cap_gates and result["tracked_dids"] > result["tracked_cap"]:
         raise ValueError("tracked DID count exceeds its cap")
     if not isinstance(value.get("cap_hit"), bool):
         raise ValueError("signer funnel cap_hit is not boolean")
@@ -633,7 +644,9 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     sustained = funnel["sustained_reciprocal_footprint"]
     date_count = funnel["persistence_collection_utc_dates_count"]
     tracking_disclosure = funnel["tracking_disclosure"]
-    cap_gates = tracking_disclosure is None
+    cap_gates = funnel["signer_state_version"] != 3 and not (
+        funnel["signer_state_version"] is None and tracking_disclosure is not None
+    )
 
     # Bars are proportions of the observed-signing cohort, the population the
     # later stages actually filter. The census is a separate population that
@@ -780,7 +793,7 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
                 f"{format_int(funnel['tracked_dids'])} tracked DIDs · retired JSON-store "
                 f"cap {format_int(funnel['tracked_cap'])} (no longer gates insertion)"
             )
-            if tracking_disclosure is not None
+            if not cap_gates
             else (
                 f"{format_int(funnel['tracked_dids'])} / "
                 f"{format_int(funnel['tracked_cap'])} tracked DIDs "
@@ -935,7 +948,13 @@ def methodology_definitions() -> dict[str, str]:
             "The newest-room sampling frame biases the result toward new and short-lived "
             "rooms. Funnel bars are drawn as proportions of the observed-signing cohort; "
             "the census count is published beside the funnel and is never a bar "
-            "denominator, because the two populations do not contain each other."
+            "denominator, because the two populations do not contain each other. "
+            "Signer-state version 3 stores observed DIDs in SQLite without an insertion "
+            "cap; tracked_cap and cap_hit retain the retired JSON-store metadata and do "
+            "not gate insertion. New ticks declare the signer-state version explicitly. "
+            "For unrecoverable pre-field ticks, an existing historical cap-release "
+            "disclosure retains the same uncapped interpretation; other missing-version "
+            "ticks remain subject to the recorded cap invariant."
         ),
         "service_engagement": (
             "The service publishes an engagement object on /rooms — nick_diversity, "

@@ -52,7 +52,7 @@ PREFIX_CLASSES = (
     ("e-", "ephemeral"),
 )
 ROOM_READ_BUDGET = 80
-COLLECTOR_VERSION = "2.4.0"
+COLLECTOR_VERSION = "2.5.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
 SIGNER_STATE_VERSION = 3
@@ -1079,9 +1079,13 @@ def tracking_disclosure(state: dict[str, Any]) -> dict[str, str] | None:
     return {
         "warning": (
             f"The tracked-DID cap was saturated from {started_at} to {released_at}. "
-            "DIDs first appearing during that interval were not recorded, so the undercount "
-            "is permanent; a DID active then but first re-observed afterward has a "
-            "first-observed timestamp no earlier than that later observation."
+            "DIDs first appearing during that interval and never re-observed were lost "
+            "entirely. DIDs first re-observed after release re-enter the observed count "
+            "with restarted persistence counters, so the two-tick and "
+            "two-collection-UTC-date stages, and every stage downstream of them, "
+            "understate that cohort until those counters rebuild; a DID active then but "
+            "first re-observed afterward has a first-observed timestamp no earlier than "
+            "that later observation."
         ),
         "methodology": (
             "Observed DIDs are now stored in SQLite without an insertion cap. tracked_cap and "
@@ -1114,6 +1118,7 @@ def aggregate_funnel(
         "tracked_dids": counts["observed"],
         "tracked_cap": state["tracked_cap"],
         "cap_hit": bool(state["cap_hit"]),
+        "signer_state_version": state["version"],
         "collection_started": state["collection_started"],
         "persistence_started_at": state["persistence_started_at"],
         "persistence_reset_at": state["persistence_reset_at"],
@@ -1281,7 +1286,7 @@ def main() -> int:
                     ),
                 ),
             )
-        except (CollectionError, OSError) as error:
+        except (CollectionError, OSError, sqlite3.Error) as error:
             print(f"{utc_now()} collection failed; no tick written: {error}", file=sys.stderr)
             if args.once or args.census:
                 return 1
