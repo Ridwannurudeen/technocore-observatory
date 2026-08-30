@@ -21,6 +21,14 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from verify_ledger import (
+    CHAIN_FIELD,
+    CHAIN_VERSION,
+    canonical_tick_bytes,
+    canonical_tick_hash_bytes,
+    verify_ledger,
+)
+
 ROOMS_HEADER_RE = re.compile(
     r"^#\s*(?P<shown>\d+)\s+of\s+(?P<total>\d+)\s+rooms\s+"
     r"\(cap\s+(?P<cap>\d+),\s+(?P<stored>[\d.]+[KMGT]?)\s+of\s+"
@@ -52,10 +60,11 @@ PREFIX_CLASSES = (
     ("e-", "ephemeral"),
 )
 ROOM_READ_BUDGET = 80
-COLLECTOR_VERSION = "2.6.0"
+COLLECTOR_VERSION = "2.7.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
 SIGNER_STATE_VERSION = 4
+LEDGER_LOCK_TIMEOUT = 15.0
 # The daemon fails closed and skips its tick if the signer state is locked; a
 # census invocation waits longer because losing its slot discards a completed
 # 256-shard walk (the next census run would reset and start over).
@@ -510,15 +519,56 @@ def parse_shard_count(body: str, shard: str) -> int:
 
 
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
-    payload = (
-        json.dumps(record, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
-    ).encode("utf-8")
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        os.write(descriptor, payload)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    if CHAIN_FIELD in record:
+        raise CollectionError(f"collector record already contains {CHAIN_FIELD}")
+
+    # Serialize the chain-tip read and append. Two collector processes that
+    # read the same tip must never append sibling records with the same link.
+    with exclusive_state_lock(path, LEDGER_LOCK_TIMEOUT):
+        verification = verify_ledger(path)
+        if not verification["ok"]:
+            location = (
+                f" at line {verification['first_break']}"
+                if verification["first_break"] is not None
+                else ""
+            )
+            raise CollectionError(
+                f"tick ledger hash chain is broken{location}: "
+                f"{verification['message']}"
+            )
+
+        if path.exists() and path.stat().st_size:
+            with path.open("rb") as source:
+                source.seek(-1, os.SEEK_END)
+                if source.read(1) != b"\n":
+                    raise CollectionError("tick ledger does not end with a newline")
+
+        previous_hash = (
+            verification["tip_sha256"]
+            if verification["genesis_line"] is not None
+            else None
+        )
+        chained = dict(record)
+        chained[CHAIN_FIELD] = {
+            "version": CHAIN_VERSION,
+            "previous_sha256": previous_hash,
+        }
+        chained[CHAIN_FIELD]["tick_sha256"] = hashlib.sha256(
+            canonical_tick_hash_bytes(chained)
+        ).hexdigest()
+        payload = canonical_tick_bytes(chained) + b"\n"
+
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written == 0:
+                    raise OSError("zero-byte write while appending tick ledger")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 @contextmanager

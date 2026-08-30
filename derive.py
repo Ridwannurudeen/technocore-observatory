@@ -8,7 +8,7 @@ import html
 import json
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,13 +22,19 @@ CLASSES = (
 )
 HEX_NAME_RE = re.compile(r"^[0-9a-f]{16}$", re.IGNORECASE)
 HASH16_RE = re.compile(r"^[0-9a-f]{16}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 UUID_LIKE_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
 MIXED_TOKEN_RE = re.compile(r"^[a-z0-9]{12,}$", re.IGNORECASE)
 TRAILING_WINDOW_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.7.0"
+RAW_RETENTION_SECONDS = 24 * 60 * 60
+HOURLY_RETENTION_SECONDS = 30 * 24 * 60 * 60
+DAILY_RETENTION_SECONDS = 365 * 24 * 60 * 60
+HOURLY_ROLLUP_SECONDS = 60 * 60
+DAILY_ROLLUP_SECONDS = 24 * 60 * 60
+METHODOLOGY_VERSION = "1.8.0"
 ROOM_SAMPLING_STRUCTURAL_CEILING = 200
 CENSUS_LONG_WALK_SECONDS = 60 * 60
 # A fixed ten-minute honesty threshold. At the measured post-deploy cadence of
@@ -99,6 +105,32 @@ def validate_tracking_disclosure(value: Any) -> dict[str, str] | None:
             raise ValueError(f"tracking_disclosure.{field} is not valid text")
         result[field] = text
     return result
+
+
+def validate_ledger_chain(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "previous_sha256",
+        "tick_sha256",
+    }:
+        raise ValueError("ledger_chain is not a complete version-1 chain object")
+    version = integer(value["version"], "ledger_chain.version", 1)
+    if version != 1:
+        raise ValueError("ledger_chain.version is not 1")
+    previous_hash = value["previous_sha256"]
+    if previous_hash is not None and (
+        not isinstance(previous_hash, str)
+        or SHA256_RE.fullmatch(previous_hash) is None
+    ):
+        raise ValueError("ledger_chain.previous_sha256 is not null or lowercase SHA-256")
+    tick_hash = value["tick_sha256"]
+    if not isinstance(tick_hash, str) or SHA256_RE.fullmatch(tick_hash) is None:
+        raise ValueError("ledger_chain.tick_sha256 is not lowercase SHA-256")
+    return {
+        "version": version,
+        "previous_sha256": previous_hash,
+        "tick_sha256": tick_hash,
+    }
 
 
 def validate_room_sampling(value: Any) -> dict[str, Any] | None:
@@ -425,6 +457,11 @@ def validate_tick(value: Any) -> dict[str, Any]:
             if raw_collector_version is None
             else version_string(raw_collector_version, "collector_version")
         ),
+        "ledger_chain": (
+            validate_ledger_chain(value["ledger_chain"])
+            if "ledger_chain" in value
+            else None
+        ),
         "ts": ts,
         "_datetime": parsed_ts,
         "rooms_total": integer(value.get("rooms_total"), "rooms_total"),
@@ -463,6 +500,318 @@ def rate(delta: int, seconds: float) -> dict[str, Any]:
 
 def empty_rate() -> dict[str, Any]:
     return {"value": None, "samples": 0, "seconds": None}
+
+
+ROLLUP_VALUE_FIELDS = (
+    "observed_public_rooms",
+    "lobby_last_seq",
+    "notes_total",
+)
+ROLLUP_RATE_FIELDS = (
+    "public_rooms_per_second",
+    "lobby_messages_per_second",
+    "rooms_total_per_second",
+    "notes_per_second",
+    "identities_per_second",
+)
+
+
+def utc_text(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def aligned_floor(value: datetime, seconds: int) -> datetime:
+    epoch = int(value.timestamp())
+    return datetime.fromtimestamp(epoch - epoch % seconds, timezone.utc)
+
+
+def aligned_end(value: datetime, seconds: int) -> datetime:
+    return aligned_floor(value, seconds) + timedelta(seconds=seconds)
+
+
+def rollup_snapshot(point: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ts": point["ts"],
+        **{field: point[field] for field in ROLLUP_VALUE_FIELDS},
+    }
+
+
+def aggregate_rollup_bucket(
+    points: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    gaps: list[dict[str, Any]],
+    expected_tick_seconds: float,
+) -> dict[str, Any] | None:
+    if not points:
+        return None
+
+    values = {
+        field: [point[field] for point in points]
+        for field in ROLLUP_VALUE_FIELDS
+    }
+    ratios: dict[str, dict[str, Any]] = {}
+    observed_seconds = 0.0
+    for point in points:
+        interval = point["rates"]["public_rooms_per_second"]
+        if interval["samples"] and interval["seconds"] is not None:
+            observed_seconds += interval["seconds"]
+
+    for field in ROLLUP_RATE_FIELDS:
+        numerator = 0.0
+        denominator = 0.0
+        observations = 0
+        for point in points:
+            rate_value = point["rates"][field]
+            if (
+                rate_value["samples"]
+                and rate_value["value"] is not None
+                and rate_value["seconds"] is not None
+            ):
+                numerator += rate_value["value"] * rate_value["seconds"]
+                denominator += rate_value["seconds"]
+                observations += 1
+        ratios[field] = {
+            "numerator": numerator,
+            "denominator": denominator,
+            "value": numerator / denominator if denominator else None,
+            "observation_count": observations,
+        }
+
+    expected = max(
+        len(points),
+        round((end - start).total_seconds() / expected_tick_seconds),
+    )
+    missing = max(0, expected - len(points))
+    has_gap = any(
+        parse_ts(gap["from"]) < end and parse_ts(gap["to"]) > start
+        for gap in gaps
+    )
+    return {
+        "start": utc_text(start),
+        "end": utc_text(end),
+        "first": rollup_snapshot(points[0]),
+        "last": rollup_snapshot(points[-1]),
+        "min": {field: min(field_values) for field, field_values in values.items()},
+        "max": {field: max(field_values) for field, field_values in values.items()},
+        "sum": {field: sum(field_values) for field, field_values in values.items()},
+        "ratios": ratios,
+        "observation_count": len(points),
+        "expected_tick_count": expected,
+        "missing_count": missing,
+        "observed_seconds": observed_seconds,
+        "complete": missing == 0 and not has_gap,
+        "has_gap": has_gap,
+    }
+
+
+def rollup_level(
+    points: list[dict[str, Any]],
+    gaps: list[dict[str, Any]],
+    resolution_seconds: int,
+    resolution_label: str,
+    expected_tick_seconds: float,
+) -> dict[str, Any] | None:
+    if not points:
+        return None
+
+    first_time = parse_ts(points[0]["ts"])
+    last_time = parse_ts(points[-1]["ts"])
+    start = aligned_floor(first_time, resolution_seconds)
+    end = aligned_end(last_time, resolution_seconds)
+    buckets: list[dict[str, Any] | None] = []
+    point_index = 0
+    bucket_start = start
+    while bucket_start < end:
+        bucket_end = bucket_start + timedelta(seconds=resolution_seconds)
+        bucket_points: list[dict[str, Any]] = []
+        while point_index < len(points):
+            point_time = parse_ts(points[point_index]["ts"])
+            if point_time >= bucket_end:
+                break
+            if point_time >= bucket_start:
+                bucket_points.append(points[point_index])
+            point_index += 1
+        buckets.append(
+            aggregate_rollup_bucket(
+                bucket_points,
+                bucket_start,
+                bucket_end,
+                gaps,
+                expected_tick_seconds,
+            )
+        )
+        bucket_start = bucket_end
+
+    return {
+        "resolution_seconds": resolution_seconds,
+        "resolution_label": resolution_label,
+        "start": utc_text(start),
+        "end": utc_text(end),
+        "buckets": buckets,
+    }
+
+
+def expected_tick_interval(
+    points: list[dict[str, Any]],
+    gap_seconds: float,
+) -> float:
+    intervals = [
+        (parse_ts(right["ts"]) - parse_ts(left["ts"])).total_seconds()
+        for left, right in zip(points, points[1:])
+    ]
+    usable = sorted(
+        interval
+        for interval in intervals
+        if 0 < interval <= gap_seconds
+    )
+    if not usable:
+        return gap_seconds
+    middle = len(usable) // 2
+    if len(usable) % 2:
+        return usable[middle]
+    return (usable[middle - 1] + usable[middle]) / 2
+
+
+def reduce_payload_history(
+    points: list[dict[str, Any]],
+    gaps: list[dict[str, Any]],
+    newest: datetime,
+    gap_seconds: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    raw_cutoff = newest - timedelta(seconds=RAW_RETENTION_SECONDS)
+    hourly_cutoff = newest - timedelta(seconds=HOURLY_RETENTION_SECONDS)
+    daily_cutoff = newest - timedelta(seconds=DAILY_RETENTION_SECONDS)
+
+    raw_points = [
+        point for point in points if parse_ts(point["ts"]) >= raw_cutoff
+    ]
+    hourly_points = [
+        point
+        for point in points
+        if hourly_cutoff <= parse_ts(point["ts"]) < raw_cutoff
+    ]
+    daily_points = [
+        point
+        for point in points
+        if daily_cutoff <= parse_ts(point["ts"]) < hourly_cutoff
+    ]
+    archive_points = [
+        point for point in points if parse_ts(point["ts"]) < daily_cutoff
+    ]
+
+    tick_seconds = expected_tick_interval(points, gap_seconds)
+    levels: list[dict[str, Any]] = []
+    if archive_points:
+        archive_start = aligned_floor(
+            parse_ts(archive_points[0]["ts"]),
+            DAILY_ROLLUP_SECONDS,
+        )
+        archive_end = aligned_end(
+            parse_ts(archive_points[-1]["ts"]),
+            DAILY_ROLLUP_SECONDS,
+        )
+        archive_bucket = aggregate_rollup_bucket(
+            archive_points,
+            archive_start,
+            archive_end,
+            gaps,
+            tick_seconds,
+        )
+        levels.append(
+            {
+                "resolution_seconds": None,
+                "resolution_label": "lifetime archive rollup",
+                "start": utc_text(archive_start),
+                "end": utc_text(archive_end),
+                "buckets": [archive_bucket],
+            }
+        )
+
+    for level in (
+        rollup_level(
+            daily_points,
+            gaps,
+            DAILY_ROLLUP_SECONDS,
+            "1-day rollup",
+            tick_seconds,
+        ),
+        rollup_level(
+            hourly_points,
+            gaps,
+            HOURLY_ROLLUP_SECONDS,
+            "1-hour rollup",
+            tick_seconds,
+        ),
+    ):
+        if level is not None:
+            levels.append(level)
+
+    recent_gaps = [
+        gap for gap in gaps if parse_ts(gap["to"]) >= raw_cutoff
+    ]
+    history = {
+        "raw_retention_seconds": RAW_RETENTION_SECONDS,
+        "raw_started_at": raw_points[0]["ts"] if raw_points else None,
+        "raw_resolution_label": "collector-tick raw · 24-hour retention",
+        "chart_resolution_label": (
+            "Chart: lifetime / 1-day / 1-hour rollups; "
+            "scrubber: collector-tick raw (24 hours)"
+        ),
+        "expected_tick_seconds": tick_seconds,
+        "rollup_levels": levels,
+    }
+    return raw_points, history, recent_gaps
+
+
+def ledger_chain_summary(ticks: list[dict[str, Any]]) -> dict[str, Any]:
+    genesis_index = next(
+        (
+            index
+            for index, tick in enumerate(ticks)
+            if tick["ledger_chain"] is not None
+            and tick["ledger_chain"]["previous_sha256"] is None
+        ),
+        None,
+    )
+    if genesis_index is None:
+        return {
+            "version": 1,
+            "algorithm": "sha256",
+            "genesis_ts": None,
+            "unchained_prefix_ticks": len(ticks),
+            "chained_ticks": 0,
+            "tip_tick_sha256": None,
+            "externally_anchored": False,
+            "display": (
+                f"Hash chain not started · {format_int(len(ticks))} ticks remain "
+                "unchained and rest on operator trust"
+            ),
+        }
+
+    chained = [
+        tick["ledger_chain"]
+        for tick in ticks[genesis_index:]
+        if tick["ledger_chain"] is not None
+    ]
+    return {
+        "version": 1,
+        "algorithm": "sha256",
+        "genesis_ts": ticks[genesis_index]["ts"],
+        "unchained_prefix_ticks": genesis_index,
+        "chained_ticks": len(chained),
+        "tip_tick_sha256": chained[-1]["tick_sha256"],
+        "externally_anchored": False,
+        "display": (
+            f"SHA-256 chain from {ticks[genesis_index]['ts']} · "
+            f"{format_int(len(chained))} chained ticks · "
+            f"{format_int(genesis_index)} pre-genesis ticks remain unchained · "
+            "internal consistency only; no proof of collection time without "
+            "an external anchor"
+        ),
+    }
 
 
 def read_jsonl(lines: Iterable[str]) -> tuple[list[dict[str, Any]], int]:
@@ -958,7 +1307,33 @@ def methodology_definitions() -> dict[str, str]:
     return {
         "history": (
             "Forward-collected only. No observation exists before collection_started; "
-            "missing intervals are recorded as gaps and are never interpolated."
+            "missing intervals are recorded as gaps and are never interpolated. The "
+            "embedded page and /data.json retain collector-tick raw points for the "
+            "newest 24 hours. Older points are numeric-only UTC-aligned rollups: one "
+            "hour through day 30, one day through day 365, then one lifetime archive "
+            "aggregate. Rollup ratios are recomputed from summed numerators and "
+            "denominators, never from averaged percentages or rates. Empty buckets are "
+            "null, partial buckets publish expected and missing counts, and chart lines "
+            "do not cross a bucket containing a recorded gap. Expected tick counts use "
+            "the median gap-free accepted interval in the complete input. The scrubber "
+            "addresses only the 24-hour raw window; older history is a derived chart "
+            "series, not raw observations."
+        ),
+        "ledger_integrity": (
+            "ticks.jsonl is explicitly unchained before the first tick whose "
+            "ledger_chain.previous_sha256 is null. That tick is the declared genesis. "
+            "From genesis onward, previous_sha256 is SHA-256 of the preceding tick's "
+            "complete canonical bytes, and tick_sha256 is SHA-256 of the current "
+            "tick's canonical bytes with only its own tick_sha256 member omitted. "
+            "Canonical bytes are UTF-8 JSON produced by Python 3.12 json.dumps with "
+            "ensure_ascii=False, allow_nan=False, separators=(',', ':') and "
+            "sort_keys=True, encoded without a trailing newline. The chain and "
+            "per-tick hashes establish internal consistency and make changed history "
+            "detectable to anyone holding an earlier copy. They do not prove when a "
+            "tick was collected: without an external anchor, the operator can rewrite "
+            "a suffix and recompute its hashes. The unchained prefix remains "
+            "unverifiable and rests on operator trust. verify_ledger.py reports the "
+            "first break."
         ),
         "room_growth": (
             "Numerator: change in /r/events latest sequence. Denominator: elapsed UTC "
@@ -1086,10 +1461,15 @@ def methodology_definitions() -> dict[str, str]:
             "missing events are excluded."
         ),
         "data_download": (
-            "/data.json is the downloadable derived observation ledger. It documents "
-            "accepted tick measurements, gaps, hashed sampling manifests and derived "
-            "values, not raw message content. The source rotates history away, so raw "
-            "bodies available now could not reproduce earlier metrics."
+            "/data.json is a bounded derived series. It carries collector-tick raw "
+            "observations only for the declared newest 24-hour retention window and "
+            "numeric UTC-aligned rollups for older history. It is not the unreduced "
+            "tick ledger. The complete local input remains ticks.jsonl; whether that "
+            "file is publicly served is a deployment property, not asserted here. "
+            "The series documents accepted measurements, gap completeness, hashed "
+            "sampling manifests and derived values, not raw message content. The "
+            "source rotates message bodies away, so bodies available now could not "
+            "reproduce earlier metrics."
         ),
     }
 
@@ -1178,7 +1558,7 @@ def derive_records(
     methodology = methodology_definitions()
     if not ticks:
         return {
-            "schema": 4,
+            "schema": 5,
             "collector_version": None,
             "methodology_version": METHODOLOGY_VERSION,
             "computed_at": computed_at,
@@ -1191,6 +1571,19 @@ def derive_records(
             "collection_phase": "Collecting since",
             "points": [],
             "gaps": [],
+            "gap_count": 0,
+            "history": {
+                "raw_retention_seconds": RAW_RETENTION_SECONDS,
+                "raw_started_at": None,
+                "raw_resolution_label": "collector-tick raw · 24-hour retention",
+                "chart_resolution_label": (
+                    "Chart: lifetime / 1-day / 1-hour rollups; "
+                    "scrubber: collector-tick raw (24 hours)"
+                ),
+                "expected_tick_seconds": None,
+                "rollup_levels": [],
+            },
+            "ledger_chain": ledger_chain_summary([]),
             "accepted_ticks": 0,
             "rejected_ticks": rejected_ticks,
             "methodology": methodology,
@@ -1413,6 +1806,13 @@ def derive_records(
 
         points.append(point)
 
+    raw_points, history, recent_gaps = reduce_payload_history(
+        points,
+        gaps,
+        ticks[-1]["_datetime"],
+        gap_seconds,
+    )
+
     # Stall detection: the rebuild cron runs independently of the collector,
     # so the age of the newest accepted tick at rebuild time is the collector
     # liveness signal. Clamped at zero in case computed_at precedes the tick.
@@ -1420,7 +1820,7 @@ def derive_records(
     stalled = age_seconds > STALL_THRESHOLD_SECONDS
 
     return {
-        "schema": 4,
+        "schema": 5,
         "collector_version": ticks[-1]["collector_version"],
         "methodology_version": METHODOLOGY_VERSION,
         "computed_at": computed_at,
@@ -1435,8 +1835,11 @@ def derive_records(
             else ""
         ),
         "collection_phase": "Collection began" if stalled else "Collecting since",
-        "points": points,
-        "gaps": gaps,
+        "points": raw_points,
+        "gaps": recent_gaps,
+        "gap_count": len(gaps),
+        "history": history,
+        "ledger_chain": ledger_chain_summary(ticks),
         "accepted_ticks": len(points),
         "rejected_ticks": rejected_ticks,
         "methodology": methodology,
@@ -1530,10 +1933,26 @@ def engagement_ssr(display: Any) -> dict[str, str]:
 
 
 def ssr_values(data: dict[str, Any]) -> dict[str, str]:
+    history = data.get("history")
+    resolution_label = (
+        history.get("chart_resolution_label")
+        if isinstance(history, dict)
+        else None
+    )
+    chain = data.get("ledger_chain")
+    chain_display = chain.get("display") if isinstance(chain, dict) else None
     versions = {
         "collector-version": str(data.get("collector_version") or "—"),
         "methodology-version": f"methodology {data.get('methodology_version') or '—'}",
         "computed-at": str(data.get("computed_at") or "—"),
+        "resolution-label": str(
+            resolution_label
+            or "Chart resolution unavailable; scrubber contains no raw observations"
+        ),
+        "ledger-integrity": str(
+            chain_display
+            or "Hash-chain state unavailable; no integrity claim is made"
+        ),
     }
     points = data.get("points")
     if not isinstance(points, list) or not points:
@@ -1605,9 +2024,10 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
     accepted = data.get("accepted_ticks", len(points))
     rejected = data.get("rejected_ticks", 0)
     gaps = data.get("gaps") if isinstance(data.get("gaps"), list) else []
+    gap_count = data.get("gap_count", len(gaps))
 
     values = {
-        "status": f"{format_int(len(points))} collected observations",
+        "status": f"{format_int(accepted)} collected observations",
         "hero-value": f"{format_int(point.get('observed_public_rooms'))} observed",
         "timestamp": str(point.get("ts", "invalid timestamp")),
         "room-rate": room_tile["value_text"],
@@ -1643,7 +2063,7 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
         "collection-start": str(data.get("collection_started")),
         "quality": (
             f" · {format_int(accepted)} accepted · {format_int(rejected)} rejected "
-            f"· {format_int(len(gaps))} recorded gaps"
+            f"· {format_int(gap_count)} recorded gaps"
         ),
         "empty-state": "",
         **sampling_ssr(point.get("room_sampling")),
@@ -1739,7 +2159,8 @@ def ssr_widths(data: dict[str, Any]) -> dict[str, float]:
 
 def description_text(data: dict[str, Any]) -> str:
     points = data.get("points")
-    count = len(points) if isinstance(points, list) else 0
+    raw_count = len(points) if isinstance(points, list) else 0
+    count = data.get("accepted_ticks", raw_count)
     if not count:
         return (
             "Technocore Observatory: 0 forward-collected observations; "

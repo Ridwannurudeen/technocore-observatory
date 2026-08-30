@@ -4,6 +4,7 @@ import json
 import re
 import textwrap
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -208,6 +209,8 @@ def html_template():
         "tracked-dids",
         "quality",
         "empty-state",
+        "resolution-label",
+        "ledger-integrity",
     )
     width_keys = (
         "funnel-observed",
@@ -1250,6 +1253,21 @@ def test_collector_assembled_current_and_legacy_ticks_validate(
         collect.SIGNER_STATE_VERSION
     )
 
+    ledger_path = tmp_path / "ticks.jsonl"
+    collect.append_jsonl(ledger_path, record)
+    chained_record = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert chained_record["ledger_chain"]["previous_sha256"] is None
+    assert re.fullmatch(
+        r"[0-9a-f]{64}",
+        chained_record["ledger_chain"]["tick_sha256"],
+    )
+    chained_validated = validate_tick(chained_record)
+    assert chained_validated["ledger_chain"] == chained_record["ledger_chain"]
+    chained_result = derive_records([chained_validated])
+    assert chained_result["ledger_chain"]["genesis_ts"] == tick_ts
+    assert chained_result["ledger_chain"]["unchained_prefix_ticks"] == 0
+    assert chained_result["ledger_chain"]["chained_ticks"] == 1
+
     legacy = deepcopy(record)
     legacy.pop("collector_version")
     legacy.pop("identity_census_started")
@@ -1444,6 +1462,163 @@ def test_short_series_stays_short():
     assert result["points"][0]["composition"]["samples"] == 0
     assert result["points"][0]["capacity"]["notes"]["trailing_rate"] is None
     assert result["points"][0]["capacity"]["notes"]["trailing_window"]["samples"] == 0
+
+
+def test_raw_points_are_retained_only_inside_the_declared_window():
+    start = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    records = [
+        tick(
+            (start + timedelta(hours=index)).isoformat().replace("+00:00", "Z"),
+            event_seq=30_000 + index,
+            lobby=5_000 + index,
+            notes=1_000 + index,
+        )
+        for index in range(73)
+    ]
+    result = derive_records(records, gap_seconds=4_000)
+    cutoff = start + timedelta(hours=48)
+
+    assert result["accepted_ticks"] == 73
+    assert result["history"]["raw_retention_seconds"] == 86_400
+    assert derive.parse_ts(result["points"][0]["ts"]) >= cutoff
+    assert result["points"][-1]["ts"] == records[-1]["ts"]
+    assert len(result["points"]) == 25
+    assert any(
+        level["resolution_label"] == "1-hour rollup"
+        for level in result["history"]["rollup_levels"]
+    )
+
+
+def test_rollup_ratio_uses_summed_primitives_not_averaged_rates():
+    records = [
+        tick(
+            "2026-08-01T08:00:00Z",
+            event_seq=30_000,
+            lobby=5_000,
+            notes=1_000,
+        ),
+        tick(
+            "2026-08-01T08:10:00Z",
+            event_seq=30_010,
+            lobby=5_010,
+            notes=1_010,
+        ),
+        tick(
+            "2026-08-01T08:30:00Z",
+            event_seq=30_050,
+            lobby=5_050,
+            notes=1_050,
+        ),
+        tick(
+            "2026-08-03T08:30:00Z",
+            event_seq=30_051,
+            lobby=5_051,
+            notes=1_051,
+        ),
+    ]
+    result = derive_records(records, gap_seconds=4_000)
+    bucket = next(
+        bucket
+        for level in result["history"]["rollup_levels"]
+        for bucket in level["buckets"]
+        if bucket is not None and bucket["observation_count"] == 3
+    )
+    ratio = bucket["ratios"]["public_rooms_per_second"]
+
+    assert ratio["numerator"] == pytest.approx(50)
+    assert ratio["denominator"] == pytest.approx(1_800)
+    assert ratio["value"] == pytest.approx(50 / 1_800)
+    assert ratio["value"] != pytest.approx(((10 / 600) + (40 / 1_200)) / 2)
+
+
+def test_rollup_preserves_empty_buckets_first_last_and_gap_boundaries():
+    records = [
+        tick("2026-08-01T08:00:00Z", event_seq=30_000),
+        tick(
+            "2026-08-01T08:05:00Z",
+            event_seq=30_001,
+            lobby=5_001,
+            notes=1_001,
+        ),
+        tick(
+            "2026-08-01T11:05:00Z",
+            event_seq=30_002,
+            lobby=5_002,
+            notes=1_002,
+        ),
+        tick(
+            "2026-08-03T11:05:00Z",
+            event_seq=30_003,
+            lobby=5_003,
+            notes=1_003,
+        ),
+    ]
+    result = derive_records(records, gap_seconds=600)
+    hourly = next(
+        level
+        for level in result["history"]["rollup_levels"]
+        if level["resolution_label"] == "1-hour rollup"
+    )
+    buckets = hourly["buckets"]
+    non_null = [bucket for bucket in buckets if bucket is not None]
+
+    assert any(bucket is None for bucket in buckets)
+    assert non_null[0]["first"]["ts"] == records[0]["ts"]
+    assert non_null[0]["last"]["ts"] == records[1]["ts"]
+    assert non_null[-1]["first"]["ts"] == records[2]["ts"]
+    assert non_null[-1]["last"]["ts"] == records[2]["ts"]
+    assert non_null[-1]["has_gap"] is True
+    assert non_null[-1]["complete"] is False
+    assert non_null[-1]["missing_count"] > 0
+
+
+def test_resolution_label_distinguishes_raw_scrubber_from_rollups():
+    result = derive_records(
+        [
+            tick("2026-08-01T08:00:00Z"),
+            tick(
+                "2026-08-03T08:00:00Z",
+                event_seq=30_001,
+                lobby=5_001,
+                notes=1_001,
+            ),
+        ]
+    )
+    label = result["history"]["chart_resolution_label"]
+
+    assert "rollup" in label
+    assert "collector-tick raw" in label
+    assert "24 hours" in label
+    assert ssr_values(result)["resolution-label"] == label
+
+
+def test_rollup_object_count_is_bounded_as_history_grows():
+    def records(days):
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        return [
+            tick(
+                (start + timedelta(days=index)).isoformat().replace("+00:00", "Z"),
+                event_seq=30_000 + index,
+                lobby=5_000 + index,
+                notes=1_000 + index,
+            )
+            for index in range(days)
+        ]
+
+    shorter = derive_records(records(400))
+    longer = derive_records(records(800))
+    shorter_buckets = sum(
+        len(level["buckets"])
+        for level in shorter["history"]["rollup_levels"]
+    )
+    longer_buckets = sum(
+        len(level["buckets"])
+        for level in longer["history"]["rollup_levels"]
+    )
+
+    assert shorter_buckets <= 1 + 365 + 30 * 24
+    assert longer_buckets <= 1 + 365 + 30 * 24
+    assert longer_buckets <= shorter_buckets + 2
 
 
 def test_malformed_tick_is_rejected():

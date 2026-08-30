@@ -249,7 +249,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     </div>
   </div>
   <div class="card-footer">
-    <span>Each position is one accepted collector tick</span>
+    <span id="resolution-label" data-ssr="resolution-label">Chart resolution unavailable; scrubber contains no raw observations</span>
     <a href="#methodology">Read methodology ↓</a>
   </div>
 </section>
@@ -343,6 +343,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <div><dt>Methodology</dt><dd id="methodology-version" data-ssr="methodology-version">methodology 1.3.0</dd></div>
       <div><dt>Computed at</dt><dd id="computed-at" data-ssr="computed-at">2026-08-29T21:24:13Z</dd></div>
       <div><dt>Tracked-DID state</dt><dd id="tracked-dids" data-ssr="tracked-dids">70,089 / 200,000 tracked DIDs (35.0% of the state cap used)</dd></div>
+      <div><dt>Tick-ledger integrity</dt><dd id="ledger-integrity" data-ssr="ledger-integrity">Hash-chain state unavailable; no integrity claim is made</dd></div>
     </dl>
     <div class="methodology-copy" id="methodology-copy">
       <article class="method-item"><h3>Methodology unavailable</h3><p>No versioned methodology definitions are present in this payload.</p></article>
@@ -356,7 +357,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
         <p><strong>First-message-only:</strong> First-message-only is a live signal, not a final 24-hour outcome.</p>
       </div>
     </div>
-    <p class="ledger-note"><a href="/data.json">Download the observation ledger</a>. It contains accepted tick measurements, gaps, hashed sampling manifests and derived values.</p>
+    <p class="ledger-note"><a href="/data.json">Download the derived observation series</a>. It contains collector-tick raw observations for the declared recent window and numeric rollups for older history. The hash-chain methodology below describes the separate unreduced tick ledger without asserting that it is served at this URL.</p>
   </div>
 </section>
 </main>
@@ -384,6 +385,54 @@ try{
   data=null
 }
 const points=dataValid?data.points:[];
+const recentGapEnds=new Set(
+  dataValid&&Array.isArray(data.gaps)
+    ?data.gaps.map(gap=>gap&&gap.to).filter(Boolean)
+    :[]
+);
+function appendChartRecord(target,record,breakBefore){
+  if(!record)return;
+  const previous=target.at(-1);
+  if(previous&&previous.ts===record.ts){
+    previous["_break_before"]=previous["_break_before"]||breakBefore;
+    return
+  }
+  target.push({...record,_break_before:Boolean(breakBefore)})
+}
+function historicalChartRecords(){
+  const records=[];
+  const history=dataValid&&data.history&&Array.isArray(data.history.rollup_levels)
+    ?data.history
+    :null;
+  if(!history)return records;
+  let pendingBreak=false;
+  history.rollup_levels.forEach(level=>{
+    if(!level||!Array.isArray(level.buckets))return;
+    level.buckets.forEach(bucket=>{
+      if(!bucket){
+        pendingBreak=true;
+        return
+      }
+      appendChartRecord(records,bucket.first,pendingBreak||bucket.has_gap);
+      appendChartRecord(
+        records,
+        bucket.last,
+        bucket.has_gap&&bucket.last.ts!==bucket.first.ts
+      );
+      pendingBreak=Boolean(bucket.has_gap)
+    })
+  });
+  return records
+}
+const historicalPoints=historicalChartRecords();
+const rawChartPoints=points.map((point,index)=>({
+  ...point,
+  _break_before:index===0
+    ?Boolean(historicalPoints.length)
+    :recentGapEnds.has(point.ts)
+}));
+const chartPoints=[...historicalPoints,...rawChartPoints];
+const seriesBaseline=chartPoints[0]||points[0]||null;
 let current=points.length?(reduceMotion?points.length-1:0):0;
 let timer=null;
 let selectedSeries="rooms";
@@ -412,11 +461,11 @@ function addSvg(tag,attributes,parent){
 }
 function seriesValue(point){
   if(selectedSeries==="lobby"){
-    const first=points[0]&&points[0].lobby_last_seq;
+    const first=seriesBaseline&&seriesBaseline.lobby_last_seq;
     return Number.isFinite(point.lobby_last_seq)&&Number.isFinite(first)?Math.max(0,point.lobby_last_seq-first):0
   }
   if(selectedSeries==="notes"){
-    const first=points[0]&&points[0].notes_total;
+    const first=seriesBaseline&&seriesBaseline.notes_total;
     return Number.isFinite(point.notes_total)&&Number.isFinite(first)?Math.max(0,point.notes_total-first):0
   }
   return Number(point.observed_public_rooms)||0
@@ -427,21 +476,25 @@ function seriesCopy(){
   return{title:"Forward-collected public room creation",description:"Cumulative public rooms observed since the first accepted observation.",suffix:" observed"}
 }
 function coordinates(limit){
-  const visible=points.slice(0,limit+1);
+  const visible=[
+    ...historicalPoints,
+    ...rawChartPoints.slice(0,limit+1)
+  ];
   if(!visible.length)return[];
-  const allTimes=points.map(point=>new Date(point.ts).valueOf());
+  const allTimes=chartPoints.map(point=>new Date(point.ts).valueOf());
   const minTime=allTimes[0];
   const maxTime=allTimes.length>1?allTimes[allTimes.length-1]:minTime+1;
-  const maxValue=Math.max(1,...points.map(seriesValue));
+  const maxValue=Math.max(1,...chartPoints.map(seriesValue));
   return visible.map(point=>({
     x:70+((new Date(point.ts).valueOf()-minTime)/(maxTime-minTime))*905,
-    y:365-(seriesValue(point)/maxValue)*340
+    y:365-(seriesValue(point)/maxValue)*340,
+    breakBefore:point["_break_before"]
   }))
 }
 function drawGrid(){
   const grid=byId("grid");
   grid.replaceChildren();
-  const maxValue=Math.max(1,...points.map(seriesValue));
+  const maxValue=Math.max(1,...chartPoints.map(seriesValue));
   for(let index=0;index<=4;index+=1){
     const y=25+340*index/4;
     addSvg("line",{x1:70,x2:975,y1:y,y2:y,class:"grid"},grid);
@@ -451,9 +504,19 @@ function drawGrid(){
 }
 function drawChart(index){
   const values=coordinates(index);
-  const line=values.map((point,offset)=>`${offset?"L":"M"}${point.x},${point.y}`).join(" ");
+  const segments=[];
+  values.forEach(point=>{
+    if(!segments.length||point.breakBefore)segments.push([]);
+    segments.at(-1).push(point)
+  });
+  const line=segments.map(segment=>segment.map((point,offset)=>`${offset?"L":"M"}${point.x},${point.y}`).join(" ")).join(" ");
+  const area=segments.map(segment=>{
+    if(!segment.length)return"";
+    const path=segment.map((point,offset)=>`${offset?"L":"M"}${point.x},${point.y}`).join(" ");
+    return`${path} L${segment.at(-1).x},365 L${segment[0].x},365 Z`
+  }).join(" ");
   byId("series-path").setAttribute("d",line);
-  byId("area-path").setAttribute("d",values.length?`${line} L${values.at(-1).x},365 L${values[0].x},365 Z`:"");
+  byId("area-path").setAttribute("d",area);
   const last=values.at(-1);
   if(last){
     byId("point").setAttribute("cx",last.x);
@@ -603,7 +666,10 @@ function renderMethodology(){
   byId("schema-version").textContent=dataValid&&data.schema!==null&&data.schema!==undefined?String(data.schema):"—";
   byId("collector-version").textContent=dataValid&&data.collector_version?String(data.collector_version):"—";
   byId("methodology-version").textContent=dataValid&&data.methodology_version?`methodology ${data.methodology_version}`:"methodology —";
-  byId("computed-at").textContent=dataValid&&data.computed_at?formatTime(data.computed_at):"—";
+  byId("computed-at").textContent=dataValid&&data.computed_at?String(data.computed_at):"—";
+  byId("ledger-integrity").textContent=dataValid&&data.ledger_chain&&typeof data.ledger_chain.display==="string"
+    ?data.ledger_chain.display
+    :"Hash-chain state unavailable; no integrity claim is made";
   const container=byId("methodology-copy");
   container.replaceChildren();
   const methodology=dataValid&&data.methodology&&typeof data.methodology==="object"&&!Array.isArray(data.methodology)?data.methodology:null;
@@ -729,16 +795,22 @@ function initialise(){
     byId("play").disabled=true;
     byId("scrubber").disabled=true;
     byId("status").textContent="0 collected observations";
-    byId("quality").textContent=` · 0 accepted · ${formatInt(data.rejected_ticks||0)} rejected · ${formatInt((data.gaps||[]).length)} recorded gaps`;
+    byId("quality").textContent=` · 0 accepted · ${formatInt(data.rejected_ticks||0)} rejected · ${formatInt(Number.isFinite(data.gap_count)?data.gap_count:(data.gaps||[]).length)} recorded gaps`;
+    if(data.history&&typeof data.history.chart_resolution_label==="string"){
+      byId("resolution-label").textContent=data.history.chart_resolution_label
+    }
     renderSampling(null);
     return
   }
   byId("empty").textContent="";
-  byId("status").textContent=`${formatInt(points.length)} collected observations`;
+  byId("status").textContent=`${formatInt(data.accepted_ticks)} collected observations`;
   byId("scrubber").max=String(points.length-1);
-  byId("collection-start").textContent=formatTime(data.collection_started);
-  byId("collection-label").textContent=`collection started ${formatTime(data.collection_started)}`;
-  byId("quality").textContent=` · ${formatInt(data.accepted_ticks)} accepted · ${formatInt(data.rejected_ticks)} rejected · ${formatInt((data.gaps||[]).length)} recorded gaps`;
+  byId("collection-start").textContent=String(data.collection_started);
+  byId("collection-label").textContent=`collection started ${String(data.collection_started)}`;
+  byId("quality").textContent=` · ${formatInt(data.accepted_ticks)} accepted · ${formatInt(data.rejected_ticks)} rejected · ${formatInt(Number.isFinite(data.gap_count)?data.gap_count:(data.gaps||[]).length)} recorded gaps`;
+  if(data.history&&typeof data.history.chart_resolution_label==="string"){
+    byId("resolution-label").textContent=data.history.chart_resolution_label
+  }
   drawGrid();
   renderBand();
   update(current);

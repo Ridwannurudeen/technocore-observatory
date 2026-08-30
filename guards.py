@@ -34,6 +34,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from verify_ledger import verify_ledger
+
 # Elements that asked for a size and got nothing are reported with this much context.
 PROBE = """
 () => {
@@ -131,6 +133,19 @@ def payload_has(payload: dict, points: list, path: str) -> bool:
     return False
 
 
+def guard_ledger_chain(ticks: Path) -> list[str]:
+    """The chained suffix must verify before its observations can be deployed."""
+    result = verify_ledger(ticks)
+    if result["ok"]:
+        return []
+    location = (
+        f" at line {result['first_break']}"
+        if result["first_break"] is not None
+        else ""
+    )
+    return [f"tick ledger hash chain breaks{location}: {result['message']}"]
+
+
 def guard_payload_contract(html: str, derive: Path, ticks: Path) -> list[str]:
     """Every field the page reads must exist in what the deriver actually emits."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -152,11 +167,28 @@ def guard_payload_contract(html: str, derive: Path, ticks: Path) -> list[str]:
         return ["the deriver produced no points; run this guard against real ticks"]
 
     # Paths the page synthesises itself rather than reading from the payload.
-    local = {"data.json", "point.x", "point.y"}
+    # `coordinates()` builds {x, y, breakBefore} objects and iterates them as
+    # `point`, so those three names never come from a tick.
+    local = {"data.json", "point.x", "point.y", "point.breakBefore"}
+
+    # A payload array is legitimately used as an array. Calling one of these on
+    # it does not mean the deriver owes us a field by that name.
+    builtins = {
+        "map", "filter", "forEach", "reduce", "slice", "join", "at", "push",
+        "length", "includes", "indexOf", "some", "every", "find", "sort",
+        "concat", "keys", "values", "entries", "toFixed", "valueOf", "toString",
+    }
+
+    def satisfied(path: str) -> bool:
+        if payload_has(payload, points, path):
+            return True
+        root, _, member = path.rpartition(".")
+        return bool(root) and member in builtins and payload_has(payload, points, root)
+
     return [
         f"the page reads `{path}` but the deriver never emits it (producer/consumer drift)"
         for path in sorted(read_paths(html) - local)
-        if not payload_has(payload, points, path)
+        if not satisfied(path)
     ]
 
 
@@ -183,10 +215,12 @@ def guard_no_js_state(html_path: Path, payload: dict) -> list[str]:
         ("hero-value", point.get("observed_public_rooms")),
         ("status", len(points)),
     ]
-    identity = None
-    for candidate in points:
-        if candidate.get("identity_total") is not None:
-            identity = candidate["identity_total"]
+    census_display = point.get("census_display")
+    identity = (
+        census_display.get("value")
+        if isinstance(census_display, dict)
+        else None
+    )
     expectations.append(("identity-total", identity))
     funnel = point.get("signer_funnel") or {}
     display = funnel.get("display") if isinstance(funnel, dict) else None
@@ -299,6 +333,7 @@ def main() -> int:
         built = build_page(args.html, args.derive, args.ticks, Path(tmp))
         payload = json.loads((Path(tmp) / "data.json").read_text(encoding="utf-8"))
         checks = (
+            ("tick ledger hash chain", guard_ledger_chain(args.ticks)),
             ("payload contract", guard_payload_contract(html, args.derive, args.ticks)),
             ("zero-width render", guard_zero_width_render(built)),
             ("no-JS honesty", guard_no_js_state(built, payload)),

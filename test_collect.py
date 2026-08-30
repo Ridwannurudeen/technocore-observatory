@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import sys
@@ -22,6 +23,11 @@ from collect import (
     update_signer_state,
 )
 from migrate_signers import migrate_signers
+from verify_ledger import (
+    canonical_tick_bytes,
+    canonical_tick_hash_bytes,
+    verify_ledger,
+)
 
 DID = "did:key:z6Mk" + "a" * 40
 OTHER_DID = "did:key:z6Mk" + "b" * 40
@@ -81,8 +87,77 @@ def insert_record(
     )
 
 
-def test_collector_version_is_bumped_for_reciprocal_alternation():
-    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 5, 0)
+def test_collector_version_is_bumped_for_hash_chained_ticks():
+    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 6, 0)
+
+
+def test_hash_chain_declares_genesis_after_unchained_prefix_and_verifies(tmp_path):
+    path = tmp_path / "ticks.jsonl"
+    path.write_text(
+        '{"legacy":"first"}\n{malformed legacy line}\n{"legacy":"second"}\n',
+        encoding="utf-8",
+    )
+
+    first = {"ts": "2026-08-30T10:00:00Z", "value": "alpha"}
+    second = {"ts": "2026-08-30T10:04:18Z", "value": "bravo"}
+    collect.append_jsonl(path, first)
+    collect.append_jsonl(path, second)
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    genesis = json.loads(lines[3])
+    successor = json.loads(lines[4])
+    assert genesis["ledger_chain"]["previous_sha256"] is None
+    assert genesis["ledger_chain"]["tick_sha256"] == hashlib.sha256(
+        canonical_tick_hash_bytes(genesis)
+    ).hexdigest()
+    assert successor["ledger_chain"]["previous_sha256"] == hashlib.sha256(
+        canonical_tick_bytes(genesis)
+    ).hexdigest()
+
+    result = verify_ledger(path)
+    assert result["ok"] is True
+    assert result["ticks"] == 5
+    assert result["unchained_prefix_ticks"] == 3
+    assert result["genesis_line"] == 4
+    assert result["genesis_ts"] == "2026-08-30T10:00:00Z"
+    assert result["first_break"] is None
+
+
+@pytest.mark.parametrize(
+    ("target", "before", "after"),
+    [
+        (0, '"value":"alpha"', '"value":"Alpha"'),
+        (1, '"value":"bravo"', '"value":"Bravo"'),
+        (2, '"value":"delta"', '"value":"Delta"'),
+    ],
+)
+def test_hash_chain_detects_single_byte_edit_anywhere_in_chained_suffix(
+    tmp_path,
+    target,
+    before,
+    after,
+):
+    path = tmp_path / "ticks.jsonl"
+    for index, value in enumerate(("alpha", "bravo", "delta")):
+        collect.append_jsonl(
+            path,
+            {
+                "ts": f"2026-08-30T10:{index:02d}:00Z",
+                "value": value,
+            },
+        )
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    changed = lines[target].replace(before, after, 1)
+    assert changed != lines[target]
+    assert len(changed.encode("utf-8")) == len(lines[target].encode("utf-8"))
+    lines[target] = changed
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = verify_ledger(path)
+    assert result["ok"] is False
+    assert result["first_break"] == target + 1
+    assert "tick_sha256 mismatch" in result["message"]
 
 
 def test_room_sampling_manifest_records_configured_read_budget():

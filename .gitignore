@@ -14,3 +14,4 @@ signers.json
 signers.sqlite3
 signers.sqlite3-wal
 signers.sqlite3-shm
+.playwright-mcp/
