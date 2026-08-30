@@ -9,11 +9,25 @@ fails its own philosophy exactly where its value lives. Without this, the one ti
 being the pre-snapshot independent record before the Q4 airdrop — reduces to "an anonymous page
 said so". Cheapest item on the list; blocks the most.
 
-## F2 — Widen the sampling frame 50 -> 200  [one line]
-`collect.py:944` requests `/rooms?format=json` with no limit and gets the service default of 50.
-Verified: `limit=200` returns 200 rooms; `limit=500` errors. This was described as an environment
-constraint; it is a build choice. Read budget is 600/min (verified via `/config` and
-`/.well-known/agent.json`); the collector uses ~11/min, under 2%.
+## F2 — Widen the sampling frame 50 -> 200  [DONE, deployed 2026-08-30]
+`/rooms?format=json` was requested with no limit and got the service default of 50. Verified:
+`limit=200` returns 200 rooms; `limit=500` errors. This was described as an environment
+constraint; it was a build choice. Shipped with `limit=200` and a per-tick room read budget of
+80 — ~41 requests/minute against the published 600/min.
+
+Widening the frame alone would have frozen the page. `validate_room_sampling` rejected any
+manifest with more than 20 sampled entries, so every new tick would have been dropped while the
+collector still looked healthy. The bound now follows the budget the collector records, with a
+structural ceiling of 200 for legacy ticks that carry none.
+
+The methodology also hardcoded "Up to 20 room reads are attempted per tick". `read_budget` is now
+recorded in the sampling manifest and the figure is rendered from it; ticks predating the field
+report it as not recorded rather than inheriting a number nobody measured.
+
+Measured after deploy: cadence slowed from ~110s to ~258s per tick (80 reads instead of 20), which
+is still well inside the 600s stall threshold but at ~2.3x margin rather than ~8x. Points grew
+from 6,677 to 10,326 bytes, but the slower cadence more than offsets it — daily payload growth
+*fell* from ~5.0MB/day to ~3.3MB/day.
 
 ## F3 — Ship the engagement metrics already being collected
 `engagement` appears twice in `collect.py` and **zero times in `derive.py`** — collected every
@@ -30,10 +44,18 @@ width, so the picture claims containment the data does not support. Either scale
 against stage 2, or separate the census visually from the observed funnel.
 
 ## F5 — The death clock
-The page embeds the entire tick history: **3,211,877 bytes** and growing ~3.4MB/day at the 120s
-cadence. Unusable within weeks. Needs the multiresolution rollup already specified in
-RESEARCH.md §5. Related: `signers.json` is a 200k-record JSON blob re-read and rewritten every
-120s, which is *why* the tracking cap exists and what caused the OOM.
+The page embeds the entire tick history: **6.42MB raw** across 1,004 points as of 2026-08-30,
+growing ~3.3MB/day. gzip is already enabled, so this is ~804KB over the wire — the binding cost is
+JSON parse and memory on mobile, not bandwidth. Needs the multiresolution rollup already specified
+in RESEARCH.md §5.
+
+Related, and now the more urgent half: `signers.json` is a 62MB JSON blob re-read and rewritten
+every tick, which is *why* the tracking cap exists and what caused the OOM. **That cap saturated
+at 200,000 on 2026-08-29T18:00:15Z.** The funnel's top stage now reads exactly 200,000 — the cap,
+not an observation — and no newly observed DID can enter the funnel while it holds. The page
+discloses the cap in its warning text, so it is not dishonest, but the headline number is a
+ceiling artifact and F2's wider frame cannot move it. Fixing the storage resolves the page weight
+and the frozen funnel together.
 
 ## F6 — Tamper-evidence
 The tick ledger has no hash chain and no external timestamp anchor, so the operator is free to
