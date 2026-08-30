@@ -43,19 +43,53 @@ contains the other — the fine print says so — but every density bar is scale
 width, so the picture claims containment the data does not support. Either scale stages 2-5
 against stage 2, or separate the census visually from the observed funnel.
 
-## F5 — The death clock
-The page embeds the entire tick history: **6.42MB raw** across 1,004 points as of 2026-08-30,
-growing ~3.3MB/day. gzip is already enabled, so this is ~804KB over the wire — the binding cost is
-JSON parse and memory on mobile, not bandwidth. Needs the multiresolution rollup already specified
-in RESEARCH.md §5.
+## F5a — SQLite DID store, cap released  [DONE, deployed 2026-08-30]
+`signers.json` was a 59MB JSON object read, mutated and rewritten in full every tick. It caused an
+OOM crash-loop (~7h of dead collection) and the 200,000-DID cap existed only to bound it. That cap
+saturated **2026-08-29T18:00:15Z**, after which stage 1 reported the cap rather than an observation
+and no new DID could enter the funnel at all.
 
-Related, and now the more urgent half: `signers.json` is a 62MB JSON blob re-read and rewritten
-every tick, which is *why* the tracking cap exists and what caused the OOM. **That cap saturated
-at 200,000 on 2026-08-29T18:00:15Z.** The funnel's top stage now reads exactly 200,000 — the cap,
-not an observation — and no newly observed DID can enter the funnel while it holds. The page
-discloses the cap in its warning text, so it is not dishonest, but the headline number is a
-ceiling artifact and F2's wider frame cannot move it. Fixing the storage resolves the page weight
-and the frozen funnel together.
+Observed DIDs now live in SQLite, updated per tick; the five funnel stages are SQL aggregates. The
+metadata still in JSON (selector state, persistence, census, retired cap fields) is **4.0KB**, down
+from 59MB. Migration of the live store reproduced all five funnel counts exactly, at a peak of 53MB
+against the old collector's 445MB. Live RSS is now ~25MB of the 512MB limit.
+
+Cap released **2026-08-30T09:49:03Z**. Stage 1 was pinned at exactly 200,000 for ~16 hours and is
+measuring again (202,610 at deploy). The saturation window is recorded in the state and published
+as a disclosure derived from those timestamps — DIDs first appearing in the window were never
+recorded and the undercount is permanent.
+
+`derive.py` refused the new ticks (`tracked DID count exceeds its cap`) because it asserted the
+tracked count never exceeds the cap. True while the cap gates insertion, wrong once retired: it now
+applies only to ticks that do not declare the cap retired, and a legacy over-cap tick is still
+refused. Rollback and the pre-migration store are at `/root/f5a-deploy-20260830-094808/`.
+
+**A collector change has now been rejected by an unrevised `derive.py` validator three times** —
+the 20-entry sampling bound, the read budget, and this. Each was caught by hand, never by the
+suite. `test_collector_assembled_current_and_legacy_ticks_validate` now asserts that what the
+collector emits is what the deriver accepts.
+
+Not covered: there is no test for the census round-trip through v3 state. The write path is
+unchanged and the live metadata carries the census correctly, but the `23 */6` cron is the first
+real exercise of it.
+
+## F5b — The death clock (payload)  [OPEN]
+The page embeds the entire tick history: **6.5MB raw** across ~1,034 points, ~854KB gzipped on the
+wire, growing ~3.3MB/day. gzip is already on, so the binding cost is JSON parse and memory on
+mobile, not bandwidth.
+
+Measured composition: **46% of the payload is rendered prose** that only the newest point needs —
+`signer_funnel.display` 1.69MB, `engagement_display` 1.11MB, `rate_display` 0.23MB. Interning is
+not the answer (only 1.7x; the strings embed each point's own numbers).
+
+Dropping prose for non-newest points is a one-time 46% cut that delays rather than solves; growth
+continues. Bounded retention is what actually fixes it: keep raw points for a declared recent
+window, aggregate older history into the multiresolution buckets specified in RESEARCH.md §5.
+
+**Design decision to carry into the brief:** make the scrubber's window equal the raw-retention
+window, and let older history feed charts only as aggregate buckets. Then no display prose is ever
+recomputed in JavaScript, and the derive.py-vs-JS duplication trap — the divergence class that has
+already shipped twice here — never opens.
 
 ## F6 — Tamper-evidence
 The tick ledger has no hash chain and no external timestamp anchor, so the operator is free to
