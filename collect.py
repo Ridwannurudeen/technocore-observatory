@@ -52,10 +52,10 @@ PREFIX_CLASSES = (
     ("e-", "ephemeral"),
 )
 ROOM_READ_BUDGET = 80
-COLLECTOR_VERSION = "2.5.0"
+COLLECTOR_VERSION = "2.6.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
-SIGNER_STATE_VERSION = 3
+SIGNER_STATE_VERSION = 4
 # The daemon fails closed and skips its tick if the signer state is locked; a
 # census invocation waits longer because losing its slot discards a completed
 # 256-shard walk (the next census run would reset and start over).
@@ -626,7 +626,7 @@ def signer_database_path(state_path: Path) -> Path:
 
 def initialize_signer_database(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, SIGNER_STATE_VERSION):
+    if version not in (0, 3, SIGNER_STATE_VERSION):
         raise CollectionError(f"signer database has unsupported schema version {version}")
 
     connection.executescript(
@@ -659,6 +659,35 @@ def initialize_signer_database(connection: sqlite3.Connection) -> None:
         );
         """
     )
+
+    if version == 3:
+        row = connection.execute(
+            "SELECT state_json FROM signer_metadata WHERE singleton = 1"
+        ).fetchone()
+        if row is not None:
+            try:
+                metadata = json.loads(row[0])
+            except json.JSONDecodeError as error:
+                raise CollectionError("signer database contains invalid metadata JSON") from error
+            if not isinstance(metadata, dict) or metadata.get("version") != 3:
+                raise CollectionError("signer database has inconsistent v3 metadata")
+            metadata["version"] = SIGNER_STATE_VERSION
+            connection.execute(
+                "UPDATE signer_metadata SET state_json = ? WHERE singleton = 1",
+                (
+                    json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                ),
+            )
+
+        # Version 3 credited mere signed co-occurrence. Those flags cannot be
+        # reinterpreted as A → B → A alternation, so the stage restarts empty.
+        connection.execute("UPDATE signer_dids SET has_counterparty = 0")
+
     connection.execute(f"PRAGMA user_version = {SIGNER_STATE_VERSION}")
     connection.commit()
 
@@ -905,20 +934,29 @@ def update_signer_state(
                 signed.append((index, message, shortened_did(sender)))
 
         counterparties: set[str] = set()
-        for left in range(len(signed)):
-            left_position, left_message, left_did = signed[left]
-            for right in range(left + 1, len(signed)):
-                right_position, right_message, right_did = signed[right]
-                if right_position - left_position > 10:
+        for first in range(len(signed)):
+            first_position, first_message, first_did = signed[first]
+            for middle in range(first + 1, len(signed)):
+                middle_position, _, middle_did = signed[middle]
+                if middle_position - first_position > 10:
                     break
-                if left_did == right_did:
+                if middle_did == first_did:
                     continue
-                seconds = abs(
-                    (right_message["_datetime"] - left_message["_datetime"]).total_seconds()
-                )
-                if seconds <= 900:
-                    counterparties.add(left_did)
-                    counterparties.add(right_did)
+                for last in range(middle + 1, len(signed)):
+                    last_position, last_message, last_did = signed[last]
+                    if last_position - first_position > 10:
+                        break
+                    if last_did != first_did:
+                        continue
+                    seconds = abs(
+                        (
+                            last_message["_datetime"] - first_message["_datetime"]
+                        ).total_seconds()
+                    )
+                    if seconds <= 900:
+                        counterparties.add(first_did)
+                        counterparties.add(middle_did)
+                        break
 
         for _, _, did in signed:
             observation = observed_this_tick.setdefault(
@@ -1105,12 +1143,13 @@ def aggregate_funnel(
     census = state.get("census")
     funnel = {
         "well_formed_did_notes": census["total"] if census else None,
+        "census_started_at": census["started_at"] if census else None,
         "census_completed_at": census["completed_at"] if census else None,
         "dids_observed_signing": counts["observed"],
         "seen_two_ticks": counts["two_ticks"],
         "two_collection_utc_dates": counts["two_collection_dates"],
         "two_rooms": counts["two_rooms"],
-        "signed_counterparty": counts["counterparties"],
+        "signed_reciprocal_alternation": counts["counterparties"],
         "coverage": {
             "sampled_rooms": sampled_rooms,
             "known_rooms": known_rooms,

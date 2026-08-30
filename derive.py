@@ -28,8 +28,9 @@ UUID_LIKE_RE = re.compile(
 )
 MIXED_TOKEN_RE = re.compile(r"^[a-z0-9]{12,}$", re.IGNORECASE)
 TRAILING_WINDOW_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.6.0"
+METHODOLOGY_VERSION = "1.7.0"
 ROOM_SAMPLING_STRUCTURAL_CEILING = 200
+CENSUS_LONG_WALK_SECONDS = 60 * 60
 # A fixed ten-minute honesty threshold. At the measured post-deploy cadence of
 # about 258 seconds per tick, this is about 2.3 collector intervals. The rebuild
 # cron runs independently of the collector, so a payload whose newest tick is
@@ -237,12 +238,24 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     for field in FUNNEL_BASE_FIELDS:
         result[field] = optional_integer(value.get(field), f"signer_funnel.{field}")
 
+    census_started_at = value.get("census_started_at")
+    census_completed_at = value.get("census_completed_at")
     if result["well_formed_did_notes"] is None:
-        if value.get("census_completed_at") is not None:
+        if census_started_at is not None or census_completed_at is not None:
             raise ValueError("funnel has a census timestamp without a census")
     else:
-        parse_ts(value.get("census_completed_at"))
-    result["census_completed_at"] = value.get("census_completed_at")
+        census_started_at = optional_timestamp(
+            census_started_at,
+            "signer_funnel.census_started_at",
+        )
+        parse_ts(census_completed_at)
+        if (
+            census_started_at is not None
+            and parse_ts(census_started_at) > parse_ts(census_completed_at)
+        ):
+            raise ValueError("funnel census starts after it completes")
+    result["census_started_at"] = census_started_at
+    result["census_completed_at"] = census_completed_at
 
     coverage = value.get("coverage")
     if not isinstance(coverage, dict):
@@ -260,9 +273,15 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
         f"signer_funnel.{persistence_field}",
     )
     raw_two_rooms = optional_integer(value.get("two_rooms"), "signer_funnel.two_rooms")
-    raw_counterparty = optional_integer(
-        value.get("signed_counterparty"),
-        "signer_funnel.signed_counterparty",
+    legacy_reciprocity = "signed_reciprocal_alternation" not in value
+    reciprocity_field = (
+        "signed_counterparty"
+        if legacy_reciprocity
+        else "signed_reciprocal_alternation"
+    )
+    raw_reciprocity = optional_integer(
+        value.get(reciprocity_field),
+        f"signer_funnel.{reciprocity_field}",
     )
 
     raw_observed_stages = [
@@ -270,7 +289,7 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
         result["seen_two_ticks"],
         raw_two_dates,
         raw_two_rooms,
-        raw_counterparty,
+        raw_reciprocity,
     ]
     if any(stage is None for stage in raw_observed_stages):
         raise ValueError("signer funnel has a missing observed stage")
@@ -283,14 +302,12 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     if legacy_persistence:
         result["two_collection_utc_dates"] = 0
         result["two_rooms"] = 0
-        result["signed_counterparty"] = 0
         result["persistence_started_at"] = None
         result["persistence_reset_at"] = None
         result["persistence_collection_utc_dates_count"] = 0
     else:
         result["two_collection_utc_dates"] = raw_two_dates
         result["two_rooms"] = raw_two_rooms
-        result["signed_counterparty"] = raw_counterparty
         result["persistence_started_at"] = optional_timestamp(
             value.get("persistence_started_at"),
             "signer_funnel.persistence_started_at",
@@ -304,18 +321,25 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
             "signer_funnel.persistence_collection_utc_dates_count",
         )
 
+    result["signed_reciprocal_alternation"] = (
+        None if legacy_reciprocity else raw_reciprocity
+    )
     corrected_stages = [
         result["dids_observed_signing"],
         result["seen_two_ticks"],
         result["two_collection_utc_dates"],
         result["two_rooms"],
-        result["signed_counterparty"],
     ]
+    if result["signed_reciprocal_alternation"] is not None:
+        corrected_stages.append(result["signed_reciprocal_alternation"])
     if any(right > left for left, right in zip(corrected_stages, corrected_stages[1:])):
         raise ValueError("corrected signer funnel stages are not monotonic")
 
     result["legacy_persistence_reset"] = legacy_persistence
-    result["sustained_reciprocal_footprint"] = result["signed_counterparty"]
+    result["legacy_reciprocity"] = legacy_reciprocity
+    result["sustained_reciprocal_footprint"] = result[
+        "signed_reciprocal_alternation"
+    ]
     result["tracking_disclosure"] = validate_tracking_disclosure(
         value.get("tracking_disclosure")
     )
@@ -331,7 +355,7 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     )
     result["tracked_dids"] = integer(value.get("tracked_dids"), "tracked_dids")
     result["tracked_cap"] = integer(value.get("tracked_cap"), "tracked_cap", 1)
-    cap_gates = result["signer_state_version"] != 3 and not (
+    cap_gates = result["signer_state_version"] not in (3, 4) and not (
         result["signer_state_version"] is None
         and result["tracking_disclosure"] is not None
     )
@@ -381,6 +405,19 @@ def validate_tick(value: Any) -> dict[str, Any]:
             raise ValueError("room has an invalid name, seq, or idle value")
         validated_rooms.append({"name": name, "seq": seq, "idle_seconds": float(idle)})
 
+    identity_total = optional_integer(value.get("identity_total"), "identity_total")
+    identity_census_started = optional_timestamp(
+        value.get("identity_census_started"),
+        "identity_census_started",
+    )
+    if identity_total is None and identity_census_started is not None:
+        raise ValueError("tick has a census start without a census")
+    if (
+        identity_census_started is not None
+        and parse_ts(identity_census_started) > parsed_ts
+    ):
+        raise ValueError("tick census starts after the tick timestamp")
+
     raw_collector_version = value.get("collector_version")
     result = {
         "collector_version": (
@@ -397,7 +434,8 @@ def validate_tick(value: Any) -> dict[str, Any]:
         "note_cap": integer(value.get("note_cap"), "note_cap", 1),
         "lobby_last_seq": integer(value.get("lobby_last_seq"), "lobby_last_seq"),
         "events_last_seq": integer(value.get("events_last_seq"), "events_last_seq"),
-        "identity_total": optional_integer(value.get("identity_total"), "identity_total"),
+        "identity_total": identity_total,
+        "identity_census_started": identity_census_started,
         "events_window": validated_events,
         "newest_rooms": validated_rooms,
         "room_sampling": validate_room_sampling(value.get("room_sampling")),
@@ -641,10 +679,11 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     observed = funnel["dids_observed_signing"]
     two_ticks = funnel["seen_two_ticks"]
     two_dates = funnel["two_collection_utc_dates"]
+    two_rooms = funnel["two_rooms"]
     sustained = funnel["sustained_reciprocal_footprint"]
     date_count = funnel["persistence_collection_utc_dates_count"]
     tracking_disclosure = funnel["tracking_disclosure"]
-    cap_gates = funnel["signer_state_version"] != 3 and not (
+    cap_gates = funnel["signer_state_version"] not in (3, 4) and not (
         funnel["signer_state_version"] is None and tracking_disclosure is not None
     )
 
@@ -661,10 +700,14 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
             return 0.0
         return max(1.0, value / bar_denominator * 100)
 
-    census_context = (
-        f"last completed census · {funnel['census_completed_at']}"
+    census_measurement = census_display(
+        (
+            census,
+            funnel["census_started_at"],
+            funnel["census_completed_at"],
+        )
         if census is not None
-        else "No completed census yet"
+        else None
     )
     observed_context = (
         f"{format_int(observed)} distinct did:key signers observed in sampled rooms · "
@@ -707,12 +750,19 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
         )
     else:
         two_dates_context = "Collection-date observation unavailable"
-    sustained_context = (
-        f"{format_percent(sustained / two_dates)} of {format_int(two_dates)} "
-        "observed on ≥2 distinct collection UTC dates"
-        if two_dates > 0
-        else "Collection-day-qualified cohort denominator unavailable"
-    )
+    if funnel["legacy_reciprocity"]:
+        sustained_context = (
+            "not recorded · this tick predates signed A → B → A alternation "
+            "measurement; legacy co-occurrence is not reinterpreted"
+        )
+    elif two_rooms > 0:
+        sustained_context = (
+            f"{format_percent(sustained / two_rooms)} of {format_int(two_rooms)} "
+            "observed in ≥2 sampled rooms also observed in a signed "
+            "A → B → A sequence"
+        )
+    else:
+        sustained_context = "Two-room-qualified cohort denominator unavailable"
 
     warning = (
         "The sampling frame is the newest rooms, so this funnel is biased "
@@ -771,11 +821,7 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
         ("sustained", sustained, sustained_context),
     ]
     return {
-        "census": {
-            "value": census,
-            "value_text": format_int(census),
-            "context": census_context,
-        },
+        "census": census_measurement,
         "stages": [
             {
                 "key": key,
@@ -804,12 +850,45 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def census_display(
+    latest_census: tuple[int, str | None, str] | None,
+) -> dict[str, Any]:
+    if latest_census is None:
+        return {
+            "value": None,
+            "value_text": "—",
+            "context": "No completed census yet",
+        }
+
+    total, started_at, completed_at = latest_census
+    if started_at is None:
+        context = (
+            f"census walk start not recorded · completed {completed_at} · "
+            "the assembly window is unknown, not a point-in-time count; "
+            "no start is inferred"
+        )
+    else:
+        duration = (parse_ts(completed_at) - parse_ts(started_at)).total_seconds()
+        context = (
+            f"census walk {started_at} → {completed_at} · assembled while "
+            "the namespace changed; not a point-in-time count"
+        )
+        if duration >= CENSUS_LONG_WALK_SECONDS:
+            context += f" · LONG CENSUS WALK ({stall_duration_text(duration)})"
+
+    return {
+        "value": total,
+        "value_text": format_int(total),
+        "context": context,
+    }
+
+
 def display_funnel(
     funnel: dict[str, Any] | None,
     newest_listing_rooms: int,
     rooms_total: int,
     room_sampling: dict[str, Any] | None,
-    latest_census: tuple[int, str] | None = None,
+    latest_census: tuple[int, str | None, str] | None = None,
 ) -> dict[str, Any] | None:
     if funnel is None:
         return None
@@ -850,13 +929,25 @@ def display_funnel(
     # hours staler than a measured identity_total in the very same ledger.
     superseded = False
     if latest_census is not None:
-        latest_total, latest_at = latest_census
-        if result["census_completed_at"] is None or parse_ts(latest_at) > parse_ts(
-            result["census_completed_at"]
-        ):
-            superseded = result["well_formed_did_notes"] is not None
+        latest_total, latest_started_at, latest_completed_at = latest_census
+        current_completed_at = result["census_completed_at"]
+        replace_census = (
+            current_completed_at is None
+            or parse_ts(latest_completed_at) > parse_ts(current_completed_at)
+            or (
+                latest_completed_at == current_completed_at
+                and result["census_started_at"] is None
+                and latest_started_at is not None
+            )
+        )
+        if replace_census:
+            superseded = (
+                result["well_formed_did_notes"] is not None
+                and current_completed_at != latest_completed_at
+            )
             result["well_formed_did_notes"] = latest_total
-            result["census_completed_at"] = latest_at
+            result["census_started_at"] = latest_started_at
+            result["census_completed_at"] = latest_completed_at
     result["census_superseded"] = superseded
 
     result["display"] = funnel_display(result)
@@ -883,12 +974,17 @@ def methodology_definitions() -> dict[str, str]:
             "is a forward sample; missing is null, never zero."
         ),
         "identity_census": (
-            "Numerator: well-formed published DID-note keys across all 256 did-00 "
-            "through did-ff shards. Denominator: none for the count; census-to-census "
-            "rates divide count change by elapsed UTC seconds. Endpoint: /kv/did-XX. "
-            "Deduplication key: published key. This is a complete shard census only "
-            "when all shards succeed; incomplete censuses publish no count. It counts "
-            "neither people, agents nor users."
+            "Numerator: well-formed published DID-note keys assembled by walking all "
+            "256 did-00 through did-ff shards. Denominator: none for the count; "
+            "census-to-census rates divide count change by elapsed UTC seconds. "
+            "Endpoint: /kv/did-XX. Deduplication key: published key. The published "
+            "start and completion timestamps are the census-walk window: shards are "
+            "read at different times while the namespace changes underneath, so the "
+            "result is a walk, not a point-in-time count. Walks lasting at least one "
+            "hour are labelled LONG CENSUS WALK. A legacy census without a recorded "
+            "start says so explicitly and no start is inferred. A count publishes "
+            "only when all shards succeed; incomplete censuses publish no count. It "
+            "counts neither people, agents nor users."
         ),
         "first_message_only": (
             "Numerator: captured new-room events whose same-tick newest-room record has "
@@ -938,8 +1034,13 @@ def methodology_definitions() -> dict[str, str]:
             "Later stages filter the captured observed-signing cohort in order: at least "
             "two collector ticks, observed on at least two distinct UTC dates determined "
             "from collector tick timestamps, observed in at least two sampled rooms, "
-            "then observed with at least one distinct signed counterparty within 10 "
-            "messages and 900 seconds. Deduplication key: shortened did:key value. "
+            "then observed in at least one signed A → B → A sequence between two "
+            "distinct DIDs in the same sampled room, contained within 10 message "
+            "positions and 900 seconds. Mere adjacency or co-occurrence does not "
+            "qualify. Pre-field ticks retain their historical co-occurrence value only "
+            "for input validation; the reciprocal-alternation stage is published as "
+            "not recorded and that value is never reinterpreted. Deduplication key: "
+            "shortened did:key value. "
             "Window: persistence_started_at through the displayed tick. Legacy "
             "message-timestamp date fields are not reinterpreted as collection dates; "
             "legacy persistence and all downstream stages are reset to zero. Endpoints: "
@@ -949,9 +1050,11 @@ def methodology_definitions() -> dict[str, str]:
             "rooms. Funnel bars are drawn as proportions of the observed-signing cohort; "
             "the census count is published beside the funnel and is never a bar "
             "denominator, because the two populations do not contain each other. "
-            "Signer-state version 3 stores observed DIDs in SQLite without an insertion "
-            "cap; tracked_cap and cap_hit retain the retired JSON-store metadata and do "
-            "not gate insertion. New ticks declare the signer-state version explicitly. "
+            "Signer-state versions 3 and 4 store observed DIDs in SQLite without an "
+            "insertion cap; version 4 resets the old co-occurrence flags and rebuilds "
+            "them only from signed reciprocal alternation. tracked_cap and cap_hit "
+            "retain the retired JSON-store metadata and do not gate insertion. New "
+            "ticks declare the signer-state version explicitly. "
             "For unrecoverable pre-field ticks, an existing historical cap-release "
             "disclosure retains the same uncapped interpretation; other missing-version "
             "ticks remain subject to the recorded cap invariant."
@@ -1107,23 +1210,41 @@ def derive_records(
     coverage_by_frame: dict[tuple[Any, ...], dict[str, Any]] = {}
     # The newest completed census known at each point, from measured
     # identity_total ticks and from funnel-recorded census results alike.
-    latest_census: tuple[int, str] | None = None
+    latest_census: tuple[int, str | None, str] | None = None
     # The most recent computed interval rate per headline tile, carried
     # forward with its sample count, window and measurement time so a
     # gap-suppressed interval still shows an honestly stamped value.
     carried_rates: dict[str, dict[str, Any]] = {}
 
     for index, tick in enumerate(ticks):
-        census_candidates: list[tuple[int, str]] = []
+        census_candidates: list[tuple[int, str | None, str]] = []
         if tick["identity_total"] is not None:
-            census_candidates.append((tick["identity_total"], tick["ts"]))
+            census_candidates.append(
+                (
+                    tick["identity_total"],
+                    tick["identity_census_started"],
+                    tick["ts"],
+                )
+            )
         raw_funnel = tick["signer_funnel"]
         if raw_funnel is not None and raw_funnel["well_formed_did_notes"] is not None:
             census_candidates.append(
-                (raw_funnel["well_formed_did_notes"], raw_funnel["census_completed_at"])
+                (
+                    raw_funnel["well_formed_did_notes"],
+                    raw_funnel["census_started_at"],
+                    raw_funnel["census_completed_at"],
+                )
             )
         for candidate in census_candidates:
-            if latest_census is None or parse_ts(candidate[1]) > parse_ts(latest_census[1]):
+            if (
+                latest_census is None
+                or parse_ts(candidate[2]) > parse_ts(latest_census[2])
+                or (
+                    candidate[2] == latest_census[2]
+                    and latest_census[1] is None
+                    and candidate[1] is not None
+                )
+            ):
                 latest_census = candidate
 
         room_sampling = derived_room_sampling(tick["room_sampling"], coverage_by_frame)
@@ -1137,6 +1258,8 @@ def derive_records(
             "lobby_last_seq": tick["lobby_last_seq"],
             "events_last_seq": tick["events_last_seq"],
             "identity_total": tick["identity_total"],
+            "identity_census_started": tick["identity_census_started"],
+            "census_display": census_display(latest_census),
             "observed_public_rooms": max(0, tick["events_last_seq"] - first_event_seq),
             "room_sampling": room_sampling,
             "rates": {
@@ -1352,13 +1475,6 @@ def capacity_rate_context(metric: Any) -> str:
     )
 
 
-def latest_identity(points: list[dict[str, Any]]) -> tuple[int | None, str | None]:
-    for point in reversed(points):
-        if point.get("identity_total") is not None:
-            return point["identity_total"], point["ts"]
-    return None, None
-
-
 def sampling_ssr(sample: Any) -> dict[str, str]:
     if not isinstance(sample, dict):
         unavailable = "Unavailable for this legacy tick"
@@ -1478,8 +1594,9 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
     unavailable_rate = {"value_text": "—", "context": "Needs two gap-free observations"}
     room_tile = rate_display.get("public_rooms_per_second") or unavailable_rate
     lobby_tile = rate_display.get("lobby_messages_per_second") or unavailable_rate
-    census, census_at = latest_identity(points)
-    identity_rate = rates.get("identities_per_second") or {}
+    census_tile = point.get("census_display")
+    if not isinstance(census_tile, dict):
+        census_tile = census_display(None)
     stillborn = point.get("stillborn_signal") or {}
     capacity = point.get("capacity") or {}
     notes = capacity.get("notes") or {}
@@ -1489,16 +1606,6 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
     rejected = data.get("rejected_ticks", 0)
     gaps = data.get("gaps") if isinstance(data.get("gaps"), list) else []
 
-    if census is None:
-        identity_context = "No complete census yet"
-    elif identity_rate.get("samples"):
-        identity_context = (
-            f"{format_rate(identity_rate.get('value'))} · "
-            f"{format_int(identity_rate['samples'])} censuses"
-        )
-    else:
-        identity_context = f"well-formed published DID notes · measured {census_at}"
-
     values = {
         "status": f"{format_int(len(points))} collected observations",
         "hero-value": f"{format_int(point.get('observed_public_rooms'))} observed",
@@ -1507,8 +1614,8 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
         "room-rate-samples": room_tile["context"],
         "lobby-rate": lobby_tile["value_text"],
         "lobby-rate-samples": lobby_tile["context"],
-        "identity-total": format_int(census),
-        "identity-rate": identity_context,
+        "identity-total": str(census_tile.get("value_text", "—")),
+        "identity-rate": str(census_tile.get("context", "No completed census yet")),
         "stillborn": format_percent(stillborn.get("fraction")),
         "stillborn-samples": (
             f"{format_int(stillborn.get('first_message_only'))}/"

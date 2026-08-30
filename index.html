@@ -299,7 +299,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <li><span class="rank">01</span><span class="funnel-label">Observed signing</span><span class="density"><span class="density-fill" data-ssr-width="funnel-observed" style="width:100.0000%"></span></span><span class="funnel-value"><span data-ssr="funnel-observed">70,089</span><span class="conversion" data-ssr="funnel-observed-context">70,089 distinct did:key signers observed in sampled rooms · a lower bound on signers, since sampling covers a fraction of rooms · a separate population from the census: neither contains the other</span></span></li>
       <li><span class="rank">02</span><span class="funnel-label">Observed on ≥2 ticks</span><span class="density"><span class="density-fill" data-ssr-width="funnel-two-ticks" style="width:56.5410%"></span></span><span class="funnel-value"><span data-ssr="funnel-two-ticks">39,629</span><span class="conversion" data-ssr="funnel-two-ticks-context">56.5% of 70,089 in the captured observed-signing cohort</span></span></li>
       <li><span class="rank">03</span><span class="funnel-label">Observed on ≥2 distinct collection UTC dates</span><span class="density"><span class="density-fill" data-ssr-width="funnel-two-dates" style="width:1.0000%"></span></span><span class="funnel-value"><span data-ssr="funnel-two-dates">0</span><span class="conversion" data-ssr="funnel-two-dates-context">0 qualify · collection has observed 1 distinct collection UTC date; collection has not yet crossed a UTC day boundary, so no key can yet qualify</span></span></li>
-      <li><span class="rank">04</span><span class="funnel-label">Observed sustained reciprocal footprint<span class="predicates">≥2 distinct collection UTC dates · ≥2 rooms · ≥1 distinct signed counterparty</span></span><span class="density"><span class="density-fill" data-ssr-width="funnel-sustained" style="width:1.0000%"></span></span><span class="funnel-value"><span data-ssr="funnel-sustained">0</span><span class="conversion" data-ssr="funnel-sustained-context">Collection-day-qualified cohort denominator unavailable</span></span></li>
+      <li><span class="rank">04</span><span class="funnel-label">Observed signed reciprocal alternation<span class="predicates">≥2 distinct collection UTC dates · ≥2 rooms · signed A → B → A within 10 message positions and 900 seconds</span></span><span class="density"><span class="density-fill" data-ssr-width="funnel-sustained" style="width:1.0000%"></span></span><span class="funnel-value"><span data-ssr="funnel-sustained">0</span><span class="conversion" data-ssr="funnel-sustained-context">Collection-day-qualified cohort denominator unavailable</span></span></li>
     </ol>
     <p class="funnel-warning" id="funnel-warning" data-ssr="funnel-warning">The sampling frame is the newest rooms, so this funnel is biased toward new and short-lived rooms. Earlier message-derived date values were discarded rather than reinterpreted because the persistence chain could not be recovered honestly. Persistence restarted at 2026-08-28T17:55:29Z.</p>
     <p class="sampling-intro" id="funnel-coverage" data-ssr="funnel-coverage">The current selector frame contains 50 rooms: 49 newest-listing rooms plus lobby. 50 / 50 distinct room hashes observed; 12 selected this tick; 0 cumulative failed reads and 2 repeated selections in this frame epoch. Selector version 1. 34,036 rooms exist, but that total is not the sampling denominator. Room identifiers are hashes of attacker-controlled names.</p>
@@ -570,8 +570,8 @@ function renderSampling(coverage){
   byId("coverage-newest").textContent=coverage&&Number.isFinite(coverage.newest_listing_rooms)?`${formatInt(coverage.newest_listing_rooms)} returned in the newest listing`:"Not recorded";
   byId("coverage-total").textContent=coverage&&Number.isFinite(coverage.rooms_total)?`${formatInt(coverage.rooms_total)} exist · not reachable for sampling`:"Not recorded"
 }
-const STAGE_LABELS={observed:"Observed signing",two_ticks:"Observed on ≥2 ticks",two_dates:"Observed on ≥2 distinct collection UTC dates",sustained:"Observed sustained reciprocal footprint"};
-const STAGE_PREDICATES={sustained:"≥2 distinct collection UTC dates · ≥2 rooms · ≥1 distinct signed counterparty"};
+const STAGE_LABELS={observed:"Observed signing",two_ticks:"Observed on ≥2 ticks",two_dates:"Observed on ≥2 distinct collection UTC dates",sustained:"Observed signed reciprocal alternation"};
+const STAGE_PREDICATES={sustained:"≥2 distinct collection UTC dates · ≥2 rooms · signed A → B → A within 10 message positions and 900 seconds"};
 function renderFunnel(funnel,point){
   // Every funnel value, context and warning string comes verbatim from the
   // deriver's per-point display contract, the same source the server-rendered
@@ -674,24 +674,13 @@ function update(index){
   setRate(point,"public_rooms_per_second","room-rate","room-rate-samples");
   setRate(point,"lobby_messages_per_second","lobby-rate","lobby-rate-samples");
 
-  let censusValue=point.identity_total;
-  let censusAt=point.ts;
-  if(censusValue===null||censusValue===undefined){
-    for(let index=current;index>=0;index-=1){
-      if(points[index].identity_total!==null&&points[index].identity_total!==undefined){
-        censusValue=points[index].identity_total;
-        censusAt=points[index].ts;
-        break
-      }
-    }
-  }
-  byId("identity-total").textContent=formatInt(censusValue);
-  const identityRate=point.rates&&point.rates.identities_per_second;
-  byId("identity-rate").textContent=censusValue===null||censusValue===undefined
-    ?"No complete census yet"
-    :identityRate&&identityRate.samples&&Number.isFinite(identityRate.seconds)
-      ?`${formatRate(identityRate.value)} · ${formatInt(identityRate.samples)} censuses over ${formatDuration(identityRate.seconds)}`
-      :`well-formed published DID notes · measured ${formatTime(censusAt)}`;
+  const censusDisplay=point.census_display;
+  byId("identity-total").textContent=censusDisplay
+    ?censusDisplay.value_text
+    :"—";
+  byId("identity-rate").textContent=censusDisplay
+    ?censusDisplay.context
+    :"No completed census yet";
 
   const stillborn=point.stillborn_signal||{};
   byId("stillborn").textContent=formatPercent(stillborn.fraction);

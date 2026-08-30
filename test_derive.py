@@ -27,17 +27,19 @@ def funnel(
     persistence_started_at="2026-08-28T08:00:00Z",
     persistence_reset_at=None,
     cap_hit=False,
+    census_started_at="2026-08-28T07:55:00Z",
     census_completed_at="2026-08-28T07:59:00Z",
     tracking_disclosure=None,
 ):
     value = {
         "well_formed_did_notes": census,
+        "census_started_at": (census_started_at if census is not None else None),
         "census_completed_at": (census_completed_at if census is not None else None),
         "dids_observed_signing": observed,
         "seen_two_ticks": two_ticks,
         "two_collection_utc_dates": two_collection_dates,
         "two_rooms": two_rooms,
-        "signed_counterparty": counterparties,
+        "signed_reciprocal_alternation": counterparties,
         "persistence_started_at": persistence_started_at,
         "persistence_reset_at": persistence_reset_at,
         "persistence_collection_utc_dates_count": persistence_dates_count,
@@ -55,6 +57,8 @@ def funnel(
 def legacy_funnel(**overrides):
     value = funnel(**overrides)
     value["two_utc_dates"] = value.pop("two_collection_utc_dates")
+    value["signed_counterparty"] = value.pop("signed_reciprocal_alternation")
+    value.pop("census_started_at")
     value.pop("persistence_started_at")
     value.pop("persistence_reset_at")
     value.pop("persistence_collection_utc_dates_count")
@@ -119,6 +123,7 @@ def tick(
     signer_funnel=None,
     room_sampling=None,
     collector_version="2.0.0",
+    identity_census_started=None,
 ):
     return {
         "collector_version": collector_version,
@@ -131,6 +136,7 @@ def tick(
         "lobby_last_seq": lobby,
         "events_last_seq": event_seq,
         "identity_total": identity,
+        "identity_census_started": identity_census_started,
         "events_window": (
             events
             if events is not None
@@ -241,9 +247,9 @@ def embedded_data(source):
     return json.loads(match.group(1))
 
 
-def test_methodology_version_is_bumped_for_tracking_disclosure():
+def test_methodology_version_is_bumped_for_census_window_and_reciprocity():
     result = derive_records([])
-    assert tuple(map(int, derive.METHODOLOGY_VERSION.split("."))) > (1, 5, 0)
+    assert tuple(map(int, derive.METHODOLOGY_VERSION.split("."))) > (1, 6, 0)
     assert result["methodology_version"] == derive.METHODOLOGY_VERSION
     assert (
         "since collector 2.2.0 a sender without a nonce is never counted"
@@ -789,8 +795,8 @@ def test_legacy_message_derived_dates_do_not_inflate_persistence_stage():
     derived = derive_records([record])["points"][0]["signer_funnel"]
     assert derived["two_collection_utc_dates"] == 0
     assert derived["two_rooms"] == 0
-    assert derived["signed_counterparty"] == 0
-    assert derived["sustained_reciprocal_footprint"] == 0
+    assert derived["signed_reciprocal_alternation"] is None
+    assert derived["sustained_reciprocal_footprint"] is None
     assert derived["persistence_collection_utc_dates_count"] == 0
     assert derived["legacy_persistence_reset"] is True
     assert "two_utc_dates" not in derived
@@ -815,7 +821,7 @@ def test_funnel_stages_are_monotonic_after_collapse():
         derived["seen_two_ticks"],
         derived["two_collection_utc_dates"],
         derived["two_rooms"],
-        derived["signed_counterparty"],
+        derived["signed_reciprocal_alternation"],
         derived["sustained_reciprocal_footprint"],
     ]
     assert all(right <= left for left, right in zip(stages, stages[1:]))
@@ -867,11 +873,60 @@ def test_funnel_census_is_never_older_than_newest_census_in_payload():
     assert derived["census_superseded"] is True
     values = ssr_values(result)
     assert values["funnel-census"] == "608,600"
-    assert values["funnel-census-context"] == ("last completed census · 2026-08-28T08:02:00Z")
+    assert values["funnel-census-context"] == (
+        "census walk start not recorded · completed 2026-08-28T08:02:00Z · "
+        "the assembly window is unknown, not a point-in-time count; "
+        "no start is inferred"
+    )
     # The first point predates the newer census and keeps its own.
     earlier = result["points"][0]["signer_funnel"]
     assert earlier["well_formed_did_notes"] == 556_973
     assert earlier["census_superseded"] is False
+
+
+def test_census_window_and_long_walk_warning_reach_shared_display():
+    record = tick(
+        "2026-08-30T10:35:00Z",
+        identity=795_918,
+        identity_census_started="2026-08-29T10:23:01Z",
+        signer_funnel=funnel(
+            census=795_918,
+            census_started_at="2026-08-29T10:23:01Z",
+            census_completed_at="2026-08-30T10:35:00Z",
+        ),
+    )
+    result = derive_records([record])
+    point = result["points"][0]
+    census = point["census_display"]
+
+    assert "2026-08-29T10:23:01Z" in census["context"]
+    assert "2026-08-30T10:35:00Z" in census["context"]
+    assert "LONG CENSUS WALK" in census["context"]
+    assert "not a point-in-time count" in census["context"]
+    assert point["signer_funnel"]["display"]["census"] == census
+    assert ssr_values(result)["identity-rate"] == census["context"]
+    assert ssr_values(result)["funnel-census-context"] == census["context"]
+
+
+def test_legacy_census_without_start_is_explicitly_not_recorded():
+    record = tick(
+        "2026-08-28T08:00:00Z",
+        identity=435_006,
+        signer_funnel=funnel(
+            census=435_006,
+            census_started_at=None,
+            census_completed_at="2026-08-28T08:00:00Z",
+        ),
+    )
+    record.pop("identity_census_started")
+    result = derive_records([record])
+    context = result["points"][0]["census_display"]["context"]
+
+    assert "census walk start not recorded" in context
+    assert "no start is inferred" in context
+    assert "→" not in context
+    assert ssr_values(result)["identity-rate"] == context
+    assert ssr_values(result)["funnel-census-context"] == context
 
 
 def test_ssr_reads_the_shared_display_contract_verbatim():
@@ -894,7 +949,8 @@ def test_ssr_reads_the_shared_display_contract_verbatim():
     stages = {stage["key"]: stage for stage in display["stages"]}
     assert values["funnel-sustained-context"] == stages["sustained"]["context"]
     assert values["funnel-sustained-context"] == (
-        "66.7% of 30 observed on ≥2 distinct collection UTC dates"
+        "80.0% of 25 observed in ≥2 sampled rooms also observed in a signed "
+        "A → B → A sequence"
     )
     assert values["funnel-warning"] == display["warning"]
     assert values["funnel-coverage"] == display["coverage_text"]
@@ -1169,26 +1225,48 @@ def test_collector_assembled_current_and_legacy_ticks_validate(
         def get(self, path):
             return responses[path]
 
-    record = collect.collect_tick(StubClient(), signer_state_path, signer_cap=1)
+    record = collect.collect_tick(
+        StubClient(),
+        signer_state_path,
+        signer_cap=1,
+        identity_total=795_918,
+        census_started="2026-08-29T10:23:01Z",
+    )
+    assert record["identity_census_started"] == "2026-08-29T10:23:01Z"
+    assert record["signer_funnel"]["census_started_at"] == "2026-08-29T10:23:01Z"
     assert record["signer_funnel"]["tracked_dids"] == 2
     assert record["signer_funnel"]["tracked_cap"] == 1
-    assert record["signer_funnel"]["signer_state_version"] == 3
+    assert record["signer_funnel"]["signer_state_version"] == collect.SIGNER_STATE_VERSION
     assert record["signer_funnel"]["tracking_disclosure"] == (
         collect.tracking_disclosure(state)
     )
     validated = validate_tick(record)
+    assert validated["identity_census_started"] == "2026-08-29T10:23:01Z"
+    assert validated["signer_funnel"]["census_started_at"] == (
+        "2026-08-29T10:23:01Z"
+    )
     assert validated["signer_funnel"]["tracked_dids"] == 2
-    assert validated["signer_funnel"]["signer_state_version"] == 3
+    assert validated["signer_funnel"]["signer_state_version"] == (
+        collect.SIGNER_STATE_VERSION
+    )
 
     legacy = deepcopy(record)
     legacy.pop("collector_version")
+    legacy.pop("identity_census_started")
     legacy_funnel_value = legacy["signer_funnel"]
+    legacy_funnel_value.pop("census_started_at")
+    legacy_funnel_value["signed_counterparty"] = legacy_funnel_value.pop(
+        "signed_reciprocal_alternation"
+    )
     legacy_funnel_value.pop("tracking_disclosure")
     legacy_funnel_value.pop("signer_state_version")
     legacy_funnel_value["dids_observed_signing"] = 1
     legacy_funnel_value["tracked_dids"] = 1
     legacy_validated = validate_tick(legacy)
     assert legacy_validated["collector_version"] == "legacy"
+    assert legacy_validated["identity_census_started"] is None
+    assert legacy_validated["signer_funnel"]["census_started_at"] is None
+    assert legacy_validated["signer_funnel"]["signed_reciprocal_alternation"] is None
     assert legacy_validated["signer_funnel"]["tracked_dids"] == 1
 
     legacy_over_cap = deepcopy(legacy)
@@ -1319,7 +1397,8 @@ def test_legacy_tick_without_manifest_or_collection_dates_is_accepted():
     point = derive_records(accepted)["points"][0]
     assert point["room_sampling"] is None
     assert point["signer_funnel"]["two_collection_utc_dates"] == 0
-    assert point["signer_funnel"]["sustained_reciprocal_footprint"] == 0
+    assert point["signer_funnel"]["sustained_reciprocal_footprint"] is None
+    assert point["signer_funnel"]["legacy_reciprocity"] is True
 
 
 def test_gap_suppresses_interval_rates_and_is_explicit():

@@ -81,8 +81,8 @@ def insert_record(
     )
 
 
-def test_collector_version_is_bumped_for_sqlite_signer_storage():
-    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 4, 0)
+def test_collector_version_is_bumped_for_reciprocal_alternation():
+    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 5, 0)
 
 
 def test_room_sampling_manifest_records_configured_read_budget():
@@ -173,6 +173,80 @@ def test_unsigned_messages_never_join_counterparty_detection(signer_store):
     )
 
 
+def test_signed_reciprocal_alternation_marks_both_participants(signer_store):
+    body = room_body(
+        {
+            "seq": 1,
+            "ts": "2026-08-28T08:00:00Z",
+            "from": DID,
+            "text": "x",
+            "nonce": "1",
+        },
+        {
+            "seq": 2,
+            "ts": "2026-08-28T08:00:01Z",
+            "from": OTHER_DID,
+            "text": "x",
+            "nonce": "2",
+        },
+        {
+            "seq": 3,
+            "ts": "2026-08-28T08:00:02Z",
+            "from": DID,
+            "text": "x",
+            "nonce": "3",
+        },
+    )
+    state = new_signer_state(100)
+    update_signer_state(
+        signer_store,
+        state,
+        [("test", parse_room_messages(body, "/r/test"))],
+        "2026-08-28T08:00:03Z",
+    )
+
+    rows = signer_store.execute(
+        "SELECT did, has_counterparty FROM signer_dids ORDER BY did"
+    ).fetchall()
+    assert rows == [
+        (DID[len("did:key:z6Mk") :], 1),
+        (OTHER_DID[len("did:key:z6Mk") :], 1),
+    ]
+
+
+def test_signed_adjacency_without_return_does_not_count_as_reciprocity(signer_store):
+    body = room_body(
+        {
+            "seq": 1,
+            "ts": "2026-08-28T08:00:00Z",
+            "from": DID,
+            "text": "x",
+            "nonce": "1",
+        },
+        {
+            "seq": 2,
+            "ts": "2026-08-28T08:00:01Z",
+            "from": OTHER_DID,
+            "text": "x",
+            "nonce": "2",
+        },
+    )
+    state = new_signer_state(100)
+    update_signer_state(
+        signer_store,
+        state,
+        [("test", parse_room_messages(body, "/r/test"))],
+        "2026-08-28T08:00:02Z",
+    )
+
+    assert signer_store.execute(
+        "SELECT did, has_counterparty FROM signer_dids ORDER BY did"
+    ).fetchall() == [
+        (DID[len("did:key:z6Mk") :], 0),
+        (OTHER_DID[len("did:key:z6Mk") :], 0),
+    ]
+
+
 def test_five_sql_funnel_aggregates_match_hand_computed_fixture(signer_store):
     insert_record(signer_store, "one", 1, 1, ["a"], 0)
     insert_record(signer_store, "two", 2, 1, ["a"], 0)
@@ -187,6 +261,43 @@ def test_five_sql_funnel_aggregates_match_hand_computed_fixture(signer_store):
         "two_rooms": 2,
         "counterparties": 1,
     }
+
+
+def test_v3_counterparty_flags_are_reset_during_v4_migration(tmp_path):
+    path = tmp_path / "signers.sqlite3"
+    connection = connect_signer_database(path)
+    state = new_signer_state(100)
+    state["version"] = 3
+    insert_record(connection, "legacy-cooccurrence", 2, 2, ["a", "b"], 1)
+    connection.execute(
+        "INSERT INTO signer_metadata (singleton, state_json) VALUES (1, ?)",
+        (
+            json.dumps(
+                state,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        ),
+    )
+    connection.execute("PRAGMA user_version = 3")
+    connection.commit()
+    connection.close()
+
+    migrated = connect_signer_database(path)
+    try:
+        assert migrated.execute(
+            "SELECT has_counterparty FROM signer_dids WHERE did = ?",
+            ("legacy-cooccurrence",),
+        ).fetchone() == (0,)
+        metadata = json.loads(
+            migrated.execute(
+                "SELECT state_json FROM signer_metadata WHERE singleton = 1"
+            ).fetchone()[0]
+        )
+        assert metadata["version"] == collect.SIGNER_STATE_VERSION
+    finally:
+        migrated.close()
 
 
 def test_observing_a_did_twice_updates_one_row(signer_store):
@@ -386,7 +497,7 @@ def test_v2_migration_preserves_all_funnel_counts(tmp_path):
         "counterparties": 1,
     }
     migrated_metadata = json.loads(metadata.read_text(encoding="utf-8"))
-    assert migrated_metadata["version"] == 3
+    assert migrated_metadata["version"] == collect.SIGNER_STATE_VERSION
     assert "dids" not in migrated_metadata
     assert migrated_metadata["selector_seed"] == state["selector_seed"]
     assert migrated_metadata["selector_epoch"] == state["selector_epoch"]
