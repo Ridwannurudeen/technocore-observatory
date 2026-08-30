@@ -63,9 +63,10 @@ def manifest(
     epoch=0,
     frame_id="0123456789abcdef",
     frame_size=4,
+    read_budget=None,
 ):
     outcomes = success if success is not None else [True] * len(ids)
-    return {
+    value = {
         "selector_version": 1,
         "seed": "0123456789abcdef0123456789abcdef",
         "epoch": epoch,
@@ -76,6 +77,9 @@ def manifest(
             for room_id, outcome in zip(ids, outcomes, strict=True)
         ],
     }
+    if read_budget is not None:
+        value["read_budget"] = read_budget
+    return value
 
 
 def tick(
@@ -347,17 +351,140 @@ def test_sampling_manifest_survives_validation_and_derive_round_trip():
     )
     record = tick("2026-08-28T08:00:00Z", room_sampling=value)
     validated = validate_tick(record)
-    assert validated["room_sampling"] == value
+    assert validated["room_sampling"] == {**value, "read_budget": None}
     accepted, rejected = read_jsonl([json.dumps(record)])
     assert rejected == 0
     derived = derive_records(accepted)["points"][0]["room_sampling"]
     assert derived["seed"] == value["seed"]
+    assert derived["read_budget"] is None
+    assert derived["read_budget"] != 0
+    assert derived["read_budget"] != 20
     assert derived["sampled"] == value["sampled"]
     assert derived["sampled_rooms"] == 2
     assert derived["cumulative_unique_rooms"] == 2
     assert derived["repeat_count"] == 0
     assert derived["failed_reads"] == 1
     assert derived["failed_reads_this_tick"] == 1
+
+
+def test_recorded_read_budget_validates_and_reaches_funnel_coverage():
+    value = manifest(
+        "aaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbb",
+        frame_size=200,
+        read_budget=80,
+    )
+    record = tick(
+        "2026-08-28T08:00:00Z",
+        room_sampling=value,
+        signer_funnel=funnel(),
+    )
+    validated = validate_tick(record)
+    assert validated["room_sampling"]["read_budget"] == 80
+
+    point = derive_records([validated])["points"][0]
+    assert point["room_sampling"]["read_budget"] == 80
+    assert point["signer_funnel"]["coverage"]["read_budget"] == 80
+
+
+def test_sampling_manifest_rejects_more_entries_than_recorded_budget():
+    value = manifest(
+        "aaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbb",
+        read_budget=1,
+    )
+    with pytest.raises(
+        ValueError,
+        match="room_sampling.sampled is not a non-empty list within its read limit",
+    ):
+        validate_tick(tick("2026-08-28T08:00:00Z", room_sampling=value))
+
+
+def test_sampling_manifest_rejects_budget_above_structural_ceiling():
+    value = manifest(
+        "aaaaaaaaaaaaaaaa",
+        read_budget=derive.ROOM_SAMPLING_STRUCTURAL_CEILING + 1,
+    )
+    with pytest.raises(
+        ValueError,
+        match="room_sampling.read_budget exceeds the structural ceiling",
+    ):
+        validate_tick(tick("2026-08-28T08:00:00Z", room_sampling=value))
+
+
+def test_legacy_sampling_manifest_is_not_bounded_to_twenty_entries():
+    room_ids = [f"{index:016x}" for index in range(21)]
+    value = manifest(*room_ids, frame_size=200)
+    validated = validate_tick(tick("2026-08-28T08:00:00Z", room_sampling=value))
+    assert validated["room_sampling"]["read_budget"] is None
+    assert len(validated["room_sampling"]["sampled"]) == 21
+
+
+def test_legacy_sampling_manifest_remains_structurally_bounded():
+    room_ids = [
+        f"{index:016x}"
+        for index in range(derive.ROOM_SAMPLING_STRUCTURAL_CEILING + 1)
+    ]
+    value = manifest(*room_ids, frame_size=len(room_ids))
+    with pytest.raises(
+        ValueError,
+        match="room_sampling.sampled is not a non-empty list within its read limit",
+    ):
+        validate_tick(tick("2026-08-28T08:00:00Z", room_sampling=value))
+
+
+def test_sampling_manifest_cannot_sample_more_rooms_than_its_frame():
+    value = manifest(
+        "aaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbb",
+        frame_size=1,
+    )
+    with pytest.raises(
+        ValueError,
+        match="room_sampling samples more rooms than its frame",
+    ):
+        validate_tick(tick("2026-08-28T08:00:00Z", room_sampling=value))
+
+
+def test_room_sampling_prose_distinguishes_recorded_and_legacy_budgets():
+    recorded = derive_records(
+        [
+            tick(
+                "2026-08-28T08:00:00Z",
+                room_sampling=manifest(
+                    "aaaaaaaaaaaaaaaa",
+                    frame_size=200,
+                    read_budget=80,
+                ),
+                signer_funnel=funnel(),
+            )
+        ]
+    )
+    legacy = derive_records(
+        [
+            tick(
+                "2026-08-28T08:00:00Z",
+                room_sampling=manifest(
+                    "aaaaaaaaaaaaaaaa",
+                    frame_size=200,
+                ),
+                signer_funnel=funnel(),
+            )
+        ]
+    )
+
+    recorded_coverage = recorded["points"][0]["signer_funnel"]["display"]["coverage_text"]
+    legacy_coverage = legacy["points"][0]["signer_funnel"]["display"]["coverage_text"]
+    methodology = recorded["methodology"]["room_sampling"]
+
+    assert "The recorded room-read budget for this tick is 80." in recorded_coverage
+    assert (
+        "The room-read budget for this tick was not recorded; no value is inferred."
+        in legacy_coverage
+    )
+    assert "when absent on legacy ticks it is reported as not recorded" in methodology
+    for prose in (recorded_coverage, legacy_coverage, methodology):
+        assert "20 room reads" not in prose
 
 
 def test_cumulative_unique_room_coverage_and_repeats_are_frame_scoped():

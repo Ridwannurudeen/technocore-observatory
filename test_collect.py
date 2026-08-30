@@ -6,10 +6,12 @@ import types
 import pytest
 
 from collect import (
+    ROOM_READ_BUDGET,
     CollectionError,
     exclusive_state_lock,
     new_signer_state,
     parse_room_messages,
+    room_sample_names,
     update_signer_state,
 )
 
@@ -23,6 +25,17 @@ def room_body(*messages):
 
 def message(seq, sender, **extra):
     return {"seq": seq, "ts": "2026-08-28T08:00:00Z", "from": sender, "text": "x", **extra}
+
+
+def test_room_sampling_manifest_records_configured_read_budget():
+    state = new_signer_state(100)
+    newest_rooms = [{"name": f"room-{index}"} for index in range(100)]
+    names, manifest = room_sample_names(newest_rooms, state)
+
+    assert len(names) == ROOM_READ_BUDGET
+    assert manifest["read_budget"] == ROOM_READ_BUDGET
+    assert manifest["frame_size"] == 101
+    assert manifest["sampled"] == []
 
 
 def test_did_shaped_sender_without_nonce_is_not_counted_as_a_signer():

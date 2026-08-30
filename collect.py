@@ -50,7 +50,7 @@ PREFIX_CLASSES = (
     ("d-", "ownable"),
     ("e-", "ephemeral"),
 )
-ROOM_READ_BUDGET = 20
+ROOM_READ_BUDGET = 80
 COLLECTOR_VERSION = "2.2.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
@@ -792,6 +792,7 @@ def room_sample_names(
         "epoch": state["selector_epoch"],
         "frame_id": selector_frame_id(state),
         "frame_size": len(state["selector_frame"]) + 1,
+        "read_budget": ROOM_READ_BUDGET,
         "sampled": [],
     }
 
@@ -941,7 +942,7 @@ def collect_tick(
     census_started: str | None = None,
     lock_timeout: float = SIGNER_LOCK_TIMEOUT,
 ) -> dict[str, Any]:
-    rooms = parse_rooms(client.get("/rooms?format=json"))
+    rooms = parse_rooms(client.get("/rooms?format=json&limit=200"))
     # The whole load-modify-save cycle on the signer state runs under one
     # exclusive lock: an unlocked cycle here let the daemon clobber a census
     # result the cron invocation had just recorded.

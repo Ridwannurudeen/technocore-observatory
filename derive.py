@@ -29,6 +29,7 @@ UUID_LIKE_RE = re.compile(
 MIXED_TOKEN_RE = re.compile(r"^[a-z0-9]{12,}$", re.IGNORECASE)
 TRAILING_WINDOW_SECONDS = 24 * 60 * 60
 METHODOLOGY_VERSION = "1.3.0"
+ROOM_SAMPLING_STRUCTURAL_CEILING = 200
 # Five 120-second collector intervals. The rebuild cron runs independently of
 # the collector, so a payload whose newest tick is older than this at rebuild
 # time means collection has stalled; age exactly at the threshold is not yet a
@@ -98,14 +99,27 @@ def validate_room_sampling(value: Any) -> dict[str, Any] | None:
     epoch = integer(value.get("epoch"), "room_sampling.epoch")
     frame_id = value.get("frame_id")
     frame_size = integer(value.get("frame_size"), "room_sampling.frame_size", 1)
+    if "read_budget" in value:
+        read_budget = integer(
+            value["read_budget"],
+            "room_sampling.read_budget",
+            1,
+        )
+        if read_budget > ROOM_SAMPLING_STRUCTURAL_CEILING:
+            raise ValueError("room_sampling.read_budget exceeds the structural ceiling")
+    else:
+        read_budget = None
     sampled = value.get("sampled")
 
     if not isinstance(seed, str) or re.fullmatch(r"[0-9a-f]{32}", seed) is None:
         raise ValueError("room_sampling.seed is not a 32-hex seed")
     if not isinstance(frame_id, str) or HASH16_RE.fullmatch(frame_id) is None:
         raise ValueError("room_sampling.frame_id is not a 16-hex identifier")
-    if not isinstance(sampled, list) or not 1 <= len(sampled) <= 20:
-        raise ValueError("room_sampling.sampled is not a 1-to-20 entry list")
+    sampled_ceiling = (
+        read_budget if read_budget is not None else ROOM_SAMPLING_STRUCTURAL_CEILING
+    )
+    if not isinstance(sampled, list) or not 1 <= len(sampled) <= sampled_ceiling:
+        raise ValueError("room_sampling.sampled is not a non-empty list within its read limit")
 
     rooms: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -132,6 +146,7 @@ def validate_room_sampling(value: Any) -> dict[str, Any] | None:
         "epoch": epoch,
         "frame_id": frame_id,
         "frame_size": frame_size,
+        "read_budget": read_budget,
         "sampled": rooms,
     }
 
@@ -476,6 +491,7 @@ def derived_room_sampling(
         manifest["epoch"],
         manifest["frame_id"],
         manifest["frame_size"],
+        manifest["read_budget"],
     )
     state = coverage_by_frame.setdefault(
         key,
@@ -680,9 +696,18 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     coverage = funnel["coverage"]
     if coverage["frame_size"] is not None:
         frame_size = coverage["frame_size"]
+        read_budget_text = (
+            "The room-read budget for this tick was not recorded; no value is inferred. "
+            if coverage["read_budget"] is None
+            else (
+                f"The recorded room-read budget for this tick is "
+                f"{format_int(coverage['read_budget'])}. "
+            )
+        )
         coverage_text = (
             f"The current selector frame contains {format_int(frame_size)} rooms: "
             f"{format_int(max(0, frame_size - 1))} newest-listing rooms plus lobby. "
+            f"{read_budget_text}"
             f"{format_int(coverage['cumulative_unique_rooms'])} / "
             f"{format_int(frame_size)} distinct room hashes observed; "
             f"{format_int(coverage['sampled_rooms'])} selected this tick; "
@@ -746,6 +771,7 @@ def display_funnel(
         "newest_listing_rooms": newest_listing_rooms,
         "rooms_total": rooms_total,
         "frame_size": None,
+        "read_budget": None,
         "cumulative_unique_rooms": None,
         "repeat_count": None,
         "failed_reads": None,
@@ -758,6 +784,7 @@ def display_funnel(
         for key in (
             "sampled_rooms",
             "frame_size",
+            "read_budget",
             "cumulative_unique_rooms",
             "repeat_count",
             "failed_reads",
@@ -834,9 +861,11 @@ def methodology_definitions() -> dict[str, str]:
             "forecast. A cap change starts a new rate window."
         ),
         "room_sampling": (
-            "Frame: the deduplicated newest-room listing plus lobby. Up to 20 room reads "
-            "are attempted per tick. A seeded permutation is walked without replacement "
-            "within each epoch. Published room identifiers are the first 16 hexadecimal "
+            "Frame: the deduplicated newest-room listing plus lobby. The per-tick "
+            "room-read budget is recorded in each new sampling manifest; when absent on "
+            "legacy ticks it is reported as not recorded and no value is inferred. A "
+            "seeded permutation is walked without replacement within each epoch. "
+            "Published room identifiers are the first 16 hexadecimal "
             "characters of SHA-256(room name), so attacker-controlled names are not "
             "republished. Cumulative unique rooms, repeats and failed reads are counted "
             "only within the exact selector version, seed, epoch, frame identifier and "
