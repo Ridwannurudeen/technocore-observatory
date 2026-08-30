@@ -17,7 +17,10 @@ from collect import (
     exclusive_state_lock,
     new_signer_state,
     parse_room_messages,
+    read_budget_summary,
+    record_created_rooms,
     room_sample_names,
+    select_due_room_revisits,
     signer_funnel_counts,
     tracking_disclosure,
     update_signer_state,
@@ -87,8 +90,8 @@ def insert_record(
     )
 
 
-def test_collector_version_is_bumped_for_hash_chained_ticks():
-    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 6, 0)
+def test_collector_version_is_bumped_for_wall_clock_bounded_revisits():
+    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 8, 0)
 
 
 def test_hash_chain_declares_genesis_after_unchained_prefix_and_verifies(tmp_path):
@@ -169,6 +172,316 @@ def test_room_sampling_manifest_records_configured_read_budget():
     assert manifest["read_budget"] == ROOM_READ_BUDGET
     assert manifest["frame_size"] == 101
     assert manifest["sampled"] == []
+
+
+def created_event(seq, ts, name):
+    return {
+        "seq": seq,
+        "ts": ts,
+        "name": name,
+        "classes": [],
+        "primary_class": "human_or_other",
+        "base_name": name,
+    }
+
+
+def test_created_room_enters_the_sqlite_ledger_exactly_once(signer_store):
+    event = created_event(10, "2026-08-30T08:00:00Z", "attacker-controlled-room")
+
+    assert record_created_rooms(
+        signer_store,
+        [event],
+        "2026-08-30T08:00:01Z",
+    ) == 1
+    assert record_created_rooms(
+        signer_store,
+        [event],
+        "2026-08-30T08:04:00Z",
+    ) == 0
+    assert signer_store.execute("SELECT COUNT(*) FROM room_ledger").fetchone() == (1,)
+    assert signer_store.execute("SELECT COUNT(*) FROM room_revisits").fetchone() == (3,)
+
+
+def test_room_revisit_schedule_selects_only_due_stages(signer_store):
+    record_created_rooms(
+        signer_store,
+        [created_event(10, "2026-08-30T08:00:00Z", "scheduled-room")],
+        "2026-08-30T08:00:01Z",
+    )
+
+    due, selected = select_due_room_revisits(
+        signer_store,
+        "2026-08-30T08:04:59Z",
+    )
+    assert due == 0
+    assert selected == []
+
+    due, selected = select_due_room_revisits(
+        signer_store,
+        "2026-08-30T08:05:00Z",
+    )
+    assert due == 1
+    assert selected == [
+        {
+            "name": "scheduled-room",
+            "stage_seconds": 300,
+            "created_at": "2026-08-30T08:00:00Z",
+        }
+    ]
+
+
+def test_read_budget_ceiling_is_enforced_in_selection_and_arithmetic(signer_store):
+    events = [
+        created_event(
+            index,
+            "2026-08-30T08:00:00Z",
+            f"due-room-{index}",
+        )
+        for index in range(collect.ROOM_REVISIT_READ_BUDGET + 1)
+    ]
+    record_created_rooms(
+        signer_store,
+        events,
+        "2026-08-30T08:00:01Z",
+    )
+    due, selected = select_due_room_revisits(
+        signer_store,
+        "2026-08-30T08:05:00Z",
+    )
+
+    assert collect.ROOM_REVISIT_READ_BUDGET == 8
+    assert due == collect.ROOM_REVISIT_READ_BUDGET + 1
+    assert len(selected) == collect.ROOM_REVISIT_READ_BUDGET
+    budget = read_budget_summary(
+        ROOM_READ_BUDGET,
+        len(selected),
+    )
+    assert budget["total_reads"] == collect.TOTAL_READ_BUDGET == 90
+    assert budget["rate_window_seconds"] == 60
+    assert budget["tick_revisit_deadline_seconds"] == 300
+    assert budget["reads_per_minute"] == pytest.approx(90.0)
+    assert budget["share"] == pytest.approx(0.15)
+    with pytest.raises(CollectionError, match="exceeds its enforced read budget"):
+        select_due_room_revisits(
+            signer_store,
+            "2026-08-30T08:05:00Z",
+            collect.ROOM_REVISIT_READ_BUDGET + 1,
+        )
+
+
+def test_failed_revisit_is_failure_not_absence_of_activity(
+    signer_store,
+    monkeypatch,
+):
+    record_created_rooms(
+        signer_store,
+        [created_event(10, "2026-08-30T08:00:00Z", "failed-room")],
+        "2026-08-30T08:00:01Z",
+    )
+    monkeypatch.setattr(collect, "utc_now", lambda: "2026-08-30T08:05:00Z")
+
+    class FailingClient:
+        def get(self, path, deadline=None):
+            raise CollectionError(f"failed {path}")
+
+    lifecycle = collect.collect_room_revisits(
+        FailingClient(),
+        signer_store,
+        "2026-08-30T08:05:00Z",
+        sampled_room_reads=1,
+        deadline=time.monotonic() + 1,
+    )
+
+    assert lifecycle["reads_failed"] == 1
+    assert lifecycle["rooms_successfully_revisited"] == 0
+    assert lifecycle["rooms_with_second_message"] == 0
+    assert lifecycle["deferred_due_to_read_budget"] == 0
+    assert lifecycle["deferred_due_to_deadline"] == 0
+    assert lifecycle["revisits"] == [
+        {
+            "id": collect.room_identifier("failed-room"),
+            "stage_seconds": 300,
+            "elapsed_since_creation_seconds": 300,
+            "success": False,
+            "message_count": None,
+            "has_second_message": None,
+            "second_sender_class": None,
+        }
+    ]
+    assert signer_store.execute(
+        """
+        SELECT success, message_count, has_second_message
+        FROM room_revisits
+        WHERE room_name = ? AND stage_seconds = ?
+        """,
+        ("failed-room", 300),
+    ).fetchone() == (0, None, None)
+
+
+def test_deadline_defers_remainder_without_conflating_outcomes(
+    signer_store,
+    monkeypatch,
+):
+    events = [
+        created_event(10, "2026-08-30T08:00:00Z", "a-failed"),
+        created_event(11, "2026-08-30T08:00:00Z", "b-no-second"),
+        created_event(12, "2026-08-30T08:00:00Z", "c-deferred"),
+    ]
+    record_created_rooms(
+        signer_store,
+        events,
+        "2026-08-30T08:00:01Z",
+    )
+    monkeypatch.setattr(collect, "utc_now", lambda: "2026-08-30T08:07:30Z")
+    clock = iter((0.0, 1.0, 2.0))
+    monkeypatch.setattr(collect.time, "monotonic", lambda: next(clock))
+
+    calls = []
+
+    class MixedClient:
+        def get(self, path, deadline=None):
+            calls.append(path)
+            if "a-failed" in path:
+                raise CollectionError("failed read")
+            return room_body(message(1, "server"))
+
+    lifecycle = collect.collect_room_revisits(
+        MixedClient(),
+        signer_store,
+        "2026-08-30T08:07:30Z",
+        sampled_room_reads=1,
+        deadline=2.0,
+    )
+
+    assert lifecycle["due_this_tick"] == 3
+    assert lifecycle["attempted_this_tick"] == 2
+    assert lifecycle["deferred_due_to_read_budget"] == 0
+    assert lifecycle["deferred_due_to_deadline"] == 1
+    assert lifecycle["deferred_due_to_budget"] == 1
+    assert len(calls) == 2
+
+    failed, no_second = lifecycle["revisits"]
+    assert failed["success"] is False
+    assert failed["message_count"] is None
+    assert failed["has_second_message"] is None
+    assert no_second["success"] is True
+    assert no_second["message_count"] == 1
+    assert no_second["has_second_message"] is False
+    assert no_second["second_sender_class"] is None
+    assert failed["elapsed_since_creation_seconds"] == 450
+    assert no_second["elapsed_since_creation_seconds"] == 450
+
+    assert signer_store.execute(
+        """
+        SELECT attempted_at, success, message_count, has_second_message
+        FROM room_revisits
+        WHERE room_name = ? AND stage_seconds = ?
+        """,
+        ("c-deferred", 300),
+    ).fetchone() == (None, None, None, None)
+
+
+def test_slow_base_phase_issues_no_room_revisits(signer_store, monkeypatch):
+    record_created_rooms(
+        signer_store,
+        [created_event(10, "2026-08-30T08:00:00Z", "deferred-room")],
+        "2026-08-30T08:00:01Z",
+    )
+    monkeypatch.setattr(collect.time, "monotonic", lambda: 300.0)
+
+    calls = []
+
+    class RecordingClient:
+        def get(self, path, deadline=None):
+            calls.append(path)
+            return room_body(message(1, "server"))
+
+    lifecycle = collect.collect_room_revisits(
+        RecordingClient(),
+        signer_store,
+        "2026-08-30T08:05:00Z",
+        sampled_room_reads=1,
+        deadline=300.0,
+    )
+
+    assert calls == []
+    assert lifecycle["attempted_this_tick"] == 0
+    assert lifecycle["deferred_due_to_read_budget"] == 0
+    assert lifecycle["deferred_due_to_deadline"] == 1
+    assert lifecycle["deferred_due_to_budget"] == 1
+
+
+def test_revisit_read_cap_deferral_count_is_exact(signer_store, monkeypatch):
+    events = [
+        created_event(
+            index,
+            "2026-08-30T08:00:00Z",
+            f"due-room-{index:02d}",
+        )
+        for index in range(collect.ROOM_REVISIT_READ_BUDGET + 2)
+    ]
+    record_created_rooms(
+        signer_store,
+        events,
+        "2026-08-30T08:00:01Z",
+    )
+    monkeypatch.setattr(collect, "utc_now", lambda: "2026-08-30T08:05:00Z")
+    monkeypatch.setattr(collect.time, "monotonic", lambda: 0.0)
+
+    calls = []
+
+    class SuccessfulClient:
+        def get(self, path, deadline=None):
+            calls.append(path)
+            return room_body(message(1, "server"))
+
+    lifecycle = collect.collect_room_revisits(
+        SuccessfulClient(),
+        signer_store,
+        "2026-08-30T08:05:00Z",
+        sampled_room_reads=ROOM_READ_BUDGET,
+        deadline=1.0,
+    )
+
+    assert lifecycle["due_this_tick"] == 10
+    assert lifecycle["attempted_this_tick"] == 8
+    assert lifecycle["deferred_due_to_read_budget"] == 2
+    assert lifecycle["deferred_due_to_deadline"] == 0
+    assert lifecycle["deferred_due_to_budget"] == 2
+    assert len(calls) == 8
+
+
+def test_read_budget_is_enforced_before_first_revisit_read(
+    signer_store,
+    monkeypatch,
+):
+    record_created_rooms(
+        signer_store,
+        [created_event(10, "2026-08-30T08:00:00Z", "due-room")],
+        "2026-08-30T08:00:01Z",
+    )
+    calls = []
+
+    class RecordingClient:
+        def get(self, path, deadline=None):
+            calls.append(path)
+            return room_body(message(1, "server"))
+
+    def reject_budget(sampled_room_reads, revisit_reads):
+        raise CollectionError("preflight budget rejected")
+
+    monkeypatch.setattr(collect, "read_budget_summary", reject_budget)
+
+    with pytest.raises(CollectionError, match="preflight budget rejected"):
+        collect.collect_room_revisits(
+            RecordingClient(),
+            signer_store,
+            "2026-08-30T08:05:00Z",
+            sampled_room_reads=1,
+            deadline=time.monotonic() + 1,
+        )
+
+    assert calls == []
 
 
 def test_did_shaped_sender_without_nonce_is_not_counted_as_a_signer(signer_store):
@@ -592,7 +905,7 @@ def test_sqlite_error_skips_tick_and_daemon_loop_continues(
             "--output",
             str(output),
             "--interval",
-            "1",
+            "60",
         ],
     )
 

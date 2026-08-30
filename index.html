@@ -119,6 +119,8 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .assumption,.sampling-intro{max-width:940px;margin:22px 0 0;color:var(--muted)}
 .census-ref{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px;margin-bottom:14px;border:1px solid var(--line);background:var(--surface-subtle)}
 .engagement-grid{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--line)}
+.lifecycle-grid{grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line)}
+.lifecycle-coverage{margin:18px 0 0;color:var(--muted)}
 .funnel{list-style:none;padding:0;margin:0;border:1px solid var(--line)}
 .funnel li{
   display:grid;grid-template-columns:44px minmax(230px,1.4fr) minmax(120px,1fr) minmax(210px,.9fr);
@@ -193,6 +195,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     <a href="#measurements">Measurements</a>
     <a href="#capacity">Capacity</a>
     <a href="#activity">Activity funnel</a>
+    <a href="#lifecycle">Room lifecycle</a>
     <a href="#engagement">Engagement</a>
     <a href="#methodology">Methodology</a>
   </nav>
@@ -314,6 +317,22 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <div><dt>Rooms in existence</dt><dd id="coverage-total">Not recorded</dd></div>
     </dl>
     <p class="method">The sampling frame is the newest-listing rooms plus lobby, not every room in existence. Published room identifiers are hashes of room names so attacker-controlled names are not republished.</p>
+  </div>
+</section>
+
+<section class="card" id="lifecycle" aria-labelledby="lifecycle-title">
+  <div class="card-header"><h2 id="lifecycle-title">Forward room lifecycle ledger</h2><div class="meta">Created since ledger start · scheduled 5m / 1h / 24h revisits</div></div>
+  <div class="card-body">
+    <div class="stats lifecycle-grid">
+      <div class="stat"><div class="label">Created rooms in ledger</div><div class="number" id="lifecycle-ledger" data-ssr="lifecycle-ledger">—</div><div class="samples" id="lifecycle-ledger-context" data-ssr="lifecycle-ledger-context">not recorded</div></div>
+      <div class="stat"><div class="label">Distinct rooms revisited</div><div class="number" id="lifecycle-revisited" data-ssr="lifecycle-revisited">—</div><div class="samples" id="lifecycle-revisited-context" data-ssr="lifecycle-revisited-context">not recorded</div></div>
+      <div class="stat"><div class="label">Reached a second message</div><div class="number" id="lifecycle-conversion" data-ssr="lifecycle-conversion">—</div><div class="samples" id="lifecycle-conversion-context" data-ssr="lifecycle-conversion-context">not recorded</div></div>
+      <div class="stat"><div class="label">Failed scheduled reads</div><div class="number" id="lifecycle-failures" data-ssr="lifecycle-failures">—</div><div class="samples" id="lifecycle-failures-context" data-ssr="lifecycle-failures-context">not recorded</div></div>
+      <div class="stat"><div class="label">Logical read rate</div><div class="number" id="lifecycle-budget" data-ssr="lifecycle-budget">—</div><div class="samples" id="lifecycle-budget-context" data-ssr="lifecycle-budget-context">not recorded</div></div>
+      <div class="stat"><div class="label">Second-sender denominator</div><div class="number" id="lifecycle-senders" data-ssr="lifecycle-senders">—</div><div class="samples" id="lifecycle-senders-context" data-ssr="lifecycle-senders-context">not recorded</div></div>
+    </div>
+    <p class="lifecycle-coverage" id="lifecycle-coverage" data-ssr="lifecycle-coverage">Room lifecycle has not been recorded.</p>
+    <p class="assumption">This panel covers only rooms whose creation events entered the forward SQLite ledger. It cannot describe rooms created before that boundary. Failed reads remain unknown outcomes. Exact room names never leave the collector; published identifiers are 16-hex SHA-256 prefixes.</p>
   </div>
 </section>
 
@@ -544,6 +563,25 @@ function setEngagement(point,key,valueId,contextId){
   byId(valueId).textContent=display?display.value_text:"—";
   byId(contextId).textContent=display?display.context:"No engagement display recorded"
 }
+function renderRoomLifecycle(point){
+  const display=point.room_lifecycle_display;
+  const entries={
+    ledger:["lifecycle-ledger","lifecycle-ledger-context"],
+    revisited:["lifecycle-revisited","lifecycle-revisited-context"],
+    conversion:["lifecycle-conversion","lifecycle-conversion-context"],
+    failures:["lifecycle-failures","lifecycle-failures-context"],
+    budget:["lifecycle-budget","lifecycle-budget-context"],
+    senders:["lifecycle-senders","lifecycle-senders-context"]
+  };
+  Object.entries(entries).forEach(([key,ids])=>{
+    const entry=display&&display[key];
+    byId(ids[0]).textContent=entry?entry.value_text:"—";
+    byId(ids[1]).textContent=entry?entry.context:"No room-lifecycle display recorded"
+  });
+  byId("lifecycle-coverage").textContent=display&&typeof display.coverage_text==="string"
+    ?display.coverage_text
+    :"Room lifecycle has not been recorded."
+}
 function renderCapacityMetric(metric,prefix){
   const progress=byId(prefix+"-progress");
   const fill=byId(prefix+"-fill");
@@ -757,6 +795,7 @@ function update(index){
   setEngagement(point,"ratio","engagement-ratio","engagement-ratio-context");
   setEngagement(point,"zero_response","engagement-zero","engagement-zero-context");
   setEngagement(point,"nick_diversity","engagement-nick","engagement-nick-context");
+  renderRoomLifecycle(point);
 
   const capacity=point.capacity||{};
   renderCapacityMetric(capacity.notes,"notes");

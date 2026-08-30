@@ -34,8 +34,10 @@ HOURLY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DAILY_RETENTION_SECONDS = 365 * 24 * 60 * 60
 HOURLY_ROLLUP_SECONDS = 60 * 60
 DAILY_ROLLUP_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.8.0"
+METHODOLOGY_VERSION = "1.10.0"
 ROOM_SAMPLING_STRUCTURAL_CEILING = 200
+ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
+ROOM_REVISIT_STRUCTURAL_CEILING = 305
 CENSUS_LONG_WALK_SECONDS = 60 * 60
 # A fixed ten-minute honesty threshold. At the measured post-deploy cadence of
 # about 258 seconds per tick, this is about 2.3 collector intervals. The rebuild
@@ -260,6 +262,308 @@ def validate_event(value: Any) -> dict[str, Any]:
     }
 
 
+def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("room_lifecycle is not an object")
+
+    ledger_started_at = optional_timestamp(
+        value.get("ledger_started_at"),
+        "room_lifecycle.ledger_started_at",
+    )
+    result = {
+        "ledger_started_at": ledger_started_at,
+        "rooms_in_ledger": integer(
+            value.get("rooms_in_ledger"),
+            "room_lifecycle.rooms_in_ledger",
+        ),
+        "rooms_revisited": integer(
+            value.get("rooms_revisited"),
+            "room_lifecycle.rooms_revisited",
+        ),
+        "rooms_successfully_revisited": integer(
+            value.get("rooms_successfully_revisited"),
+            "room_lifecycle.rooms_successfully_revisited",
+        ),
+        "rooms_with_second_message": integer(
+            value.get("rooms_with_second_message"),
+            "room_lifecycle.rooms_with_second_message",
+        ),
+        "reads_attempted": integer(
+            value.get("reads_attempted"),
+            "room_lifecycle.reads_attempted",
+        ),
+        "reads_failed": integer(
+            value.get("reads_failed"),
+            "room_lifecycle.reads_failed",
+        ),
+        "created_rooms_observed_this_tick": integer(
+            value.get("created_rooms_observed_this_tick"),
+            "room_lifecycle.created_rooms_observed_this_tick",
+        ),
+        "due_this_tick": integer(
+            value.get("due_this_tick"),
+            "room_lifecycle.due_this_tick",
+        ),
+        "attempted_this_tick": integer(
+            value.get("attempted_this_tick"),
+            "room_lifecycle.attempted_this_tick",
+        ),
+        "deferred_due_to_budget": integer(
+            value.get("deferred_due_to_budget"),
+            "room_lifecycle.deferred_due_to_budget",
+        ),
+    }
+
+    deferred_due_to_read_budget = value.get("deferred_due_to_read_budget")
+    deferred_due_to_deadline = value.get("deferred_due_to_deadline")
+    if deferred_due_to_read_budget is None and deferred_due_to_deadline is None:
+        result["deferred_due_to_read_budget"] = None
+        result["deferred_due_to_deadline"] = None
+        has_wall_clock_contract = False
+    elif deferred_due_to_read_budget is None or deferred_due_to_deadline is None:
+        raise ValueError("room_lifecycle deferral reasons are incomplete")
+    else:
+        result["deferred_due_to_read_budget"] = integer(
+            deferred_due_to_read_budget,
+            "room_lifecycle.deferred_due_to_read_budget",
+        )
+        result["deferred_due_to_deadline"] = integer(
+            deferred_due_to_deadline,
+            "room_lifecycle.deferred_due_to_deadline",
+        )
+        has_wall_clock_contract = True
+
+    if not (
+        result["rooms_with_second_message"]
+        <= result["rooms_successfully_revisited"]
+        <= result["rooms_revisited"]
+        <= result["rooms_in_ledger"]
+    ):
+        raise ValueError("room_lifecycle room denominators are inconsistent")
+    if result["reads_failed"] > result["reads_attempted"]:
+        raise ValueError("room_lifecycle failed reads exceed attempted reads")
+    if (
+        result["attempted_this_tick"] > result["due_this_tick"]
+        or result["deferred_due_to_budget"]
+        != result["due_this_tick"] - result["attempted_this_tick"]
+    ):
+        raise ValueError("room_lifecycle due-read accounting is inconsistent")
+    if (
+        has_wall_clock_contract
+        and result["deferred_due_to_read_budget"]
+        + result["deferred_due_to_deadline"]
+        != result["deferred_due_to_budget"]
+    ):
+        raise ValueError("room_lifecycle deferral reasons do not partition deferred work")
+    if result["rooms_in_ledger"] == 0 and ledger_started_at is not None:
+        raise ValueError("empty room ledger has a start timestamp")
+    if result["rooms_in_ledger"] > 0 and ledger_started_at is None:
+        raise ValueError("non-empty room ledger has no start timestamp")
+
+    sender_classes = value.get("second_sender_classes")
+    expected_sender_classes = {
+        "signed_did",
+        "unsigned_did",
+        "server",
+        "other",
+        "not_observed",
+    }
+    if not isinstance(sender_classes, dict) or set(sender_classes) != expected_sender_classes:
+        raise ValueError("room_lifecycle second-sender classes are incomplete")
+    result["second_sender_classes"] = {
+        key: integer(
+            sender_classes[key],
+            f"room_lifecycle.second_sender_classes.{key}",
+        )
+        for key in sorted(expected_sender_classes)
+    }
+    if sum(result["second_sender_classes"].values()) > result["rooms_with_second_message"]:
+        raise ValueError("room_lifecycle sender classes exceed their room denominator")
+
+    revisits = value.get("revisits")
+    if (
+        not isinstance(revisits, list)
+        or len(revisits) > ROOM_REVISIT_STRUCTURAL_CEILING
+        or len(revisits) != result["attempted_this_tick"]
+    ):
+        raise ValueError("room_lifecycle revisits exceed their recorded bounds")
+    validated_revisits: list[dict[str, Any]] = []
+    for revisit in revisits:
+        if not isinstance(revisit, dict):
+            raise ValueError("room_lifecycle revisit is not an object")
+        room_id = revisit.get("id")
+        stage_seconds = revisit.get("stage_seconds")
+        success = revisit.get("success")
+        if (
+            not isinstance(room_id, str)
+            or HASH16_RE.fullmatch(room_id) is None
+            or stage_seconds not in ROOM_REVISIT_STAGES_SECONDS
+            or not isinstance(success, bool)
+        ):
+            raise ValueError("room_lifecycle revisit has an invalid identity or stage")
+
+        elapsed_since_creation_seconds = revisit.get(
+            "elapsed_since_creation_seconds"
+        )
+        if elapsed_since_creation_seconds is None:
+            if has_wall_clock_contract:
+                raise ValueError("new-format room revisit lacks its actual elapsed time")
+        else:
+            elapsed_since_creation_seconds = integer(
+                elapsed_since_creation_seconds,
+                "room_lifecycle.revisit.elapsed_since_creation_seconds",
+            )
+            if elapsed_since_creation_seconds < stage_seconds:
+                raise ValueError("room revisit occurred before its nominal due stage")
+
+        message_count = revisit.get("message_count")
+        has_second_message = revisit.get("has_second_message")
+        second_sender_class = revisit.get("second_sender_class")
+        if not success:
+            if (
+                message_count is not None
+                or has_second_message is not None
+                or second_sender_class is not None
+            ):
+                raise ValueError("failed room revisit contains an activity result")
+        else:
+            message_count = integer(
+                message_count,
+                "room_lifecycle.revisit.message_count",
+            )
+            if not isinstance(has_second_message, bool):
+                raise ValueError("successful room revisit lacks its second-message result")
+            if has_second_message:
+                if second_sender_class not in expected_sender_classes:
+                    raise ValueError("room revisit has an invalid second-sender class")
+            elif second_sender_class is not None:
+                raise ValueError("room without a second message has a sender class")
+        validated_revisits.append(
+            {
+                "id": room_id,
+                "stage_seconds": stage_seconds,
+                "elapsed_since_creation_seconds": elapsed_since_creation_seconds,
+                "success": success,
+                "message_count": message_count,
+                "has_second_message": has_second_message,
+                "second_sender_class": second_sender_class,
+            }
+        )
+    result["revisits"] = validated_revisits
+
+    budget = value.get("read_budget")
+    if not isinstance(budget, dict):
+        raise ValueError("room_lifecycle has no read-budget accounting")
+    assumed_tick_seconds = budget.get("assumed_tick_seconds")
+    rate_window_seconds = budget.get("rate_window_seconds")
+    tick_revisit_deadline_seconds = budget.get(
+        "tick_revisit_deadline_seconds"
+    )
+    if (
+        rate_window_seconds is None
+        and tick_revisit_deadline_seconds is None
+    ):
+        assumed_tick_seconds = integer(
+            assumed_tick_seconds,
+            "read_budget.assumed_tick_seconds",
+            1,
+        )
+        normalization_seconds = assumed_tick_seconds
+    elif (
+        rate_window_seconds is None
+        or tick_revisit_deadline_seconds is None
+        or assumed_tick_seconds is not None
+    ):
+        raise ValueError("read_budget wall-clock accounting is incomplete")
+    else:
+        rate_window_seconds = integer(
+            rate_window_seconds,
+            "read_budget.rate_window_seconds",
+            1,
+        )
+        tick_revisit_deadline_seconds = integer(
+            tick_revisit_deadline_seconds,
+            "read_budget.tick_revisit_deadline_seconds",
+            1,
+        )
+        normalization_seconds = rate_window_seconds
+
+    validated_budget = {
+        "base_reads": integer(budget.get("base_reads"), "read_budget.base_reads"),
+        "revisit_reads": integer(
+            budget.get("revisit_reads"),
+            "read_budget.revisit_reads",
+        ),
+        "total_reads": integer(budget.get("total_reads"), "read_budget.total_reads"),
+        "total_read_budget": integer(
+            budget.get("total_read_budget"),
+            "read_budget.total_read_budget",
+            1,
+        ),
+        "revisit_read_budget": integer(
+            budget.get("revisit_read_budget"),
+            "read_budget.revisit_read_budget",
+        ),
+        "assumed_tick_seconds": assumed_tick_seconds,
+        "rate_window_seconds": rate_window_seconds,
+        "tick_revisit_deadline_seconds": tick_revisit_deadline_seconds,
+        "published_reads_per_minute": integer(
+            budget.get("published_reads_per_minute"),
+            "read_budget.published_reads_per_minute",
+            1,
+        ),
+    }
+    for field in ("reads_per_minute", "share", "maximum_share"):
+        raw = budget.get(field)
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, (int, float))
+            or not math.isfinite(raw)
+            or raw < 0
+        ):
+            raise ValueError(f"read_budget.{field} is not a valid number")
+        validated_budget[field] = float(raw)
+    expected_rate = (
+        validated_budget["total_reads"]
+        * 60
+        / normalization_seconds
+    )
+    expected_share = (
+        expected_rate / validated_budget["published_reads_per_minute"]
+    )
+    if (
+        validated_budget["total_reads"]
+        != validated_budget["base_reads"] + validated_budget["revisit_reads"]
+        or validated_budget["revisit_reads"] != result["attempted_this_tick"]
+        or validated_budget["total_reads"] > validated_budget["total_read_budget"]
+        or validated_budget["revisit_reads"]
+        > validated_budget["revisit_read_budget"]
+        or not math.isclose(
+            validated_budget["reads_per_minute"],
+            expected_rate,
+        )
+        or not math.isclose(validated_budget["share"], expected_share)
+        or validated_budget["share"] > validated_budget["maximum_share"]
+    ):
+        raise ValueError("room_lifecycle read-budget accounting is inconsistent")
+    if has_wall_clock_contract != (rate_window_seconds is not None):
+        raise ValueError("room_lifecycle wall-clock fields are incomplete")
+    if has_wall_clock_contract and (
+        tick_revisit_deadline_seconds >= STALL_THRESHOLD_SECONDS
+        or result["deferred_due_to_read_budget"]
+        != max(
+            0,
+            result["due_this_tick"]
+            - validated_budget["revisit_read_budget"],
+        )
+    ):
+        raise ValueError("room_lifecycle wall-clock budget is inconsistent")
+    result["read_budget"] = validated_budget
+    return result
+
+
 def validate_funnel(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
@@ -387,7 +691,7 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     )
     result["tracked_dids"] = integer(value.get("tracked_dids"), "tracked_dids")
     result["tracked_cap"] = integer(value.get("tracked_cap"), "tracked_cap", 1)
-    cap_gates = result["signer_state_version"] not in (3, 4) and not (
+    cap_gates = result["signer_state_version"] not in (3, 4, 5) and not (
         result["signer_state_version"] is None
         and result["tracking_disclosure"] is not None
     )
@@ -477,6 +781,7 @@ def validate_tick(value: Any) -> dict[str, Any]:
         "newest_rooms": validated_rooms,
         "room_sampling": validate_room_sampling(value.get("room_sampling")),
         "signer_funnel": validate_funnel(value.get("signer_funnel")),
+        "room_lifecycle": validate_room_lifecycle(value.get("room_lifecycle")),
         "engagement": validate_engagement(value.get("engagement")),
     }
     if validated_events and validated_events[-1]["seq"] != result["events_last_seq"]:
@@ -932,6 +1237,184 @@ def derived_room_sampling(
     }
 
 
+def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
+    if lifecycle is None:
+        missing = {
+            "value_text": "—",
+            "context": (
+                "not recorded · this tick predates the forward room-name ledger; "
+                "absence never means zero"
+            ),
+        }
+        return {
+            "ledger": dict(missing),
+            "revisited": dict(missing),
+            "conversion": dict(missing),
+            "failures": dict(missing),
+            "budget": dict(missing),
+            "senders": dict(missing),
+            "coverage_text": (
+                "Room lifecycle was not recorded for this tick. No value is "
+                "inferred from later ledger state."
+            ),
+        }
+
+    rooms = lifecycle["rooms_in_ledger"]
+    revisited = lifecycle["rooms_revisited"]
+    successful = lifecycle["rooms_successfully_revisited"]
+    second = lifecycle["rooms_with_second_message"]
+    attempts = lifecycle["reads_attempted"]
+    failed = lifecycle["reads_failed"]
+    budget = lifecycle["read_budget"]
+    senders = lifecycle["second_sender_classes"]
+
+    revisit_context = (
+        f"{format_percent(revisited / rooms)} of {format_int(rooms)} rooms created "
+        "since the ledger began have reached at least one scheduled revisit"
+        if rooms
+        else "No created-room denominator has entered the ledger yet"
+    )
+    conversion = (
+        {
+            "value_text": format_percent(second / successful),
+            "context": (
+                f"{format_int(second)} / {format_int(successful)} rooms with at least "
+                "one successful scheduled revisit had reached sequence 2 or later"
+            ),
+        }
+        if successful
+        else {
+            "value_text": "—",
+            "context": (
+                "No successful scheduled room-read denominator yet; failed reads "
+                "are unknown outcomes, never absence of a second message"
+            ),
+        }
+    )
+    failure_display = (
+        {
+            "value_text": format_int(failed),
+            "context": (
+                f"{format_percent(failed / attempts)} of {format_int(attempts)} "
+                "attempted scheduled reads failed · failures remain unknown outcomes"
+            ),
+        }
+        if attempts
+        else {
+            "value_text": "—",
+            "context": "No scheduled room reads have been attempted yet",
+        }
+    )
+    sender_denominator = second
+    sender_context = (
+        (
+            f"Of {format_int(sender_denominator)} rooms known to have a second "
+            f"message: {format_int(senders['signed_did'])} signed did:key, "
+            f"{format_int(senders['unsigned_did'])} unsigned did:key, "
+            f"{format_int(senders['server'])} server, "
+            f"{format_int(senders['other'])} other, and "
+            f"{format_int(senders['not_observed'])} whose exact sequence-2 sender "
+            "was no longer in the returned window"
+        )
+        if sender_denominator
+        else "No room with a second message has been observed yet"
+    )
+
+    if lifecycle["deferred_due_to_deadline"] is None:
+        deferral_text = (
+            f"{format_int(lifecycle['deferred_due_to_budget'])} deferred by the "
+            "recorded aggregate budget; the reason split was not recorded"
+        )
+    else:
+        deferral_text = (
+            f"{format_int(lifecycle['deferred_due_to_budget'])} deferred: "
+            f"{format_int(lifecycle['deferred_due_to_read_budget'])} by the "
+            f"per-tick read cap and "
+            f"{format_int(lifecycle['deferred_due_to_deadline'])} because the "
+            "wall-clock deadline was reached"
+        )
+
+    actual_delays = [
+        revisit["elapsed_since_creation_seconds"]
+        for revisit in lifecycle["revisits"]
+        if revisit["elapsed_since_creation_seconds"] is not None
+    ]
+    if actual_delays:
+        delay_text = (
+            f"actual creation-to-attempt delay this tick "
+            f"{format_int(min(actual_delays))}s"
+            if len(actual_delays) == 1
+            else (
+                f"actual creation-to-attempt delays this tick "
+                f"{format_int(min(actual_delays))}s to "
+                f"{format_int(max(actual_delays))}s"
+            )
+        )
+    elif lifecycle["attempted_this_tick"]:
+        delay_text = (
+            "actual creation-to-attempt delay was not recorded for this legacy tick"
+        )
+    else:
+        delay_text = "no revisit was attempted this tick"
+
+    return {
+        "ledger": {
+            "value_text": format_int(rooms),
+            "context": (
+                f"exact created-room names retained privately in SQLite since "
+                f"{lifecycle['ledger_started_at']} · only 16-hex SHA-256 prefixes "
+                "leave the collector"
+            ),
+        },
+        "revisited": {
+            "value_text": format_int(revisited),
+            "context": revisit_context,
+        },
+        "conversion": conversion,
+        "failures": failure_display,
+        "budget": {
+            "value_text": f"{budget['reads_per_minute']:.2f}/min",
+            "context": (
+                (
+                    f"{format_int(budget['total_reads'])} logical reads this tick · "
+                    f"normalized to the enforced "
+                    f"{format_int(budget['rate_window_seconds'])}s minimum scheduling "
+                    f"window · {format_percent(budget['share'])} of the published "
+                    f"{format_int(budget['published_reads_per_minute'])}/min budget · "
+                    f"enforced ceiling {format_percent(budget['maximum_share'])} · "
+                    f"revisit issue deadline "
+                    f"{format_int(budget['tick_revisit_deadline_seconds'])}s from "
+                    "tick start"
+                )
+                if budget["rate_window_seconds"] is not None
+                else (
+                    f"{format_int(budget['total_reads'])} logical reads this tick over "
+                    f"the legacy assumed "
+                    f"{format_int(budget['assumed_tick_seconds'])}s cadence · "
+                    f"{format_percent(budget['share'])} of the published "
+                    f"{format_int(budget['published_reads_per_minute'])}/min budget · "
+                    f"enforced ceiling {format_percent(budget['maximum_share'])} · "
+                    "wall-clock deadline not recorded"
+                )
+            ),
+        },
+        "senders": {
+            "value_text": format_int(sender_denominator),
+            "context": sender_context,
+        },
+        "coverage_text": (
+            f"{format_int(lifecycle['created_rooms_observed_this_tick'])} new ledger "
+            f"entries this tick · {format_int(lifecycle['due_this_tick'])} scheduled "
+            f"revisits due · {format_int(lifecycle['attempted_this_tick'])} attempted · "
+            f"{deferral_text}. Deferred revisits were not attempted and are neither "
+            "failed reads nor evidence that a room had no second message. Nominal due "
+            "targets are 5 minutes, 1 hour and 24 hours after creation; they are "
+            f"scheduling targets, not measured delays · {delay_text}. Coverage begins "
+            "when this ledger begins and says nothing about older rooms."
+        ),
+    }
+
+
 def engagement_display(engagement: dict[str, Any] | None) -> dict[str, dict[str, str]]:
     """One source of truth for every engagement string the page shows.
 
@@ -1032,7 +1515,7 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     sustained = funnel["sustained_reciprocal_footprint"]
     date_count = funnel["persistence_collection_utc_dates_count"]
     tracking_disclosure = funnel["tracking_disclosure"]
-    cap_gates = funnel["signer_state_version"] not in (3, 4) and not (
+    cap_gates = funnel["signer_state_version"] not in (3, 4, 5) and not (
         funnel["signer_state_version"] is None and tracking_disclosure is not None
     )
 
@@ -1425,14 +1908,50 @@ def methodology_definitions() -> dict[str, str]:
             "rooms. Funnel bars are drawn as proportions of the observed-signing cohort; "
             "the census count is published beside the funnel and is never a bar "
             "denominator, because the two populations do not contain each other. "
-            "Signer-state versions 3 and 4 store observed DIDs in SQLite without an "
-            "insertion cap; version 4 resets the old co-occurrence flags and rebuilds "
-            "them only from signed reciprocal alternation. tracked_cap and cap_hit "
+            "Signer-state versions 3 through 5 store observed DIDs in SQLite without "
+            "an insertion cap; version 4 resets the old co-occurrence flags and "
+            "rebuilds them only from signed reciprocal alternation, while version 5 "
+            "adds the separate room-lifecycle ledger. tracked_cap and cap_hit "
             "retain the retired JSON-store metadata and do not gate insertion. New "
             "ticks declare the signer-state version explicitly. "
             "For unrecoverable pre-field ticks, an existing historical cap-release "
             "disclosure retains the same uncapped interpretation; other missing-version "
             "ticks remain subject to the recorded cap invariant."
+        ),
+        "room_lifecycle": (
+            "Frame: exact room names observed in server-authored created events from "
+            "/r/events?format=json&limit=200, beginning only when the SQLite ledger "
+            "starts. Rooms older than that boundary are outside the measurement and "
+            "nothing is inferred about them. Deduplication keys are exact room name "
+            "and creation-event sequence; SQL values are parameter-bound. Each newly "
+            "observed room is scheduled for one read at approximately 5 minutes, "
+            "1 hour and 24 hours after its creation timestamp. Endpoint: "
+            "/r/<exact-name>?format=json&limit=200. A successful read records whether "
+            "the returned sequence reached 2 or later. The exact sequence-2 sender is "
+            "classified as signed did:key, unsigned did:key, server or other; if "
+            "sequence 2 has rotated out of the returned window, the room still counts "
+            "as having a second message but its exact second sender is reported as not "
+            "observed. A failed read is recorded as a failure with null activity "
+            "fields and never becomes evidence of no response. Published denominators "
+            "include rooms in the ledger, distinct rooms revisited, distinct rooms "
+            "successfully revisited and failed reads. Raw room names remain only in "
+            "SQLite; tick manifests publish the first 16 hexadecimal characters of "
+            "SHA-256(room name). The three stages are nominal scheduling targets, not "
+            "claims about actual revisit age. New-format attempted revisits publish "
+            "actual elapsed seconds from creation to the read attempt; legacy ticks "
+            "without that field report it as not recorded and no delay is inferred. "
+            "New ticks permit at most 8 revisit reads. With 82 base logical reads, the "
+            "maximum is 90 reads in the enforced minimum 60-second scheduling window: "
+            "90.0 reads/minute, or 15.0% of the published 600-read/minute/IP budget. "
+            "This rate accounting no longer uses tick duration as its denominator. "
+            "Revisit reads may be issued only during the first 300 seconds from tick "
+            "start, leaving 300 seconds below the published 600-second stall threshold. "
+            "A base phase that reaches that deadline receives no revisit work, so due "
+            "work yields rather than extending the tick. Due work excluded by the "
+            "eight-read cap and due work skipped because the wall-clock deadline was "
+            "reached are published separately; their sum is the aggregate deferred "
+            "count. Deferred work is not attempted, is not a failed read, and is never "
+            "evidence of absent room activity."
         ),
         "service_engagement": (
             "The service publishes an engagement object on /rooms — nick_diversity, "
@@ -1558,7 +2077,7 @@ def derive_records(
     methodology = methodology_definitions()
     if not ticks:
         return {
-            "schema": 5,
+            "schema": 6,
             "collector_version": None,
             "methodology_version": METHODOLOGY_VERSION,
             "computed_at": computed_at,
@@ -1672,6 +2191,10 @@ def derive_records(
                 tick["rooms_total"],
                 room_sampling,
                 latest_census,
+            ),
+            "room_lifecycle": tick["room_lifecycle"],
+            "room_lifecycle_display": room_lifecycle_display(
+                tick["room_lifecycle"]
             ),
             "engagement": tick["engagement"],
             "engagement_display": engagement_display(tick["engagement"]),
@@ -1820,7 +2343,7 @@ def derive_records(
     stalled = age_seconds > STALL_THRESHOLD_SECONDS
 
     return {
-        "schema": 5,
+        "schema": 6,
         "collector_version": ticks[-1]["collector_version"],
         "methodology_version": METHODOLOGY_VERSION,
         "computed_at": computed_at,
@@ -1911,6 +2434,34 @@ def sampling_ssr(sample: Any) -> dict[str, str]:
     }
 
 
+def room_lifecycle_ssr(display: Any) -> dict[str, str]:
+    entries = {
+        "ledger": ("lifecycle-ledger", "lifecycle-ledger-context"),
+        "revisited": ("lifecycle-revisited", "lifecycle-revisited-context"),
+        "conversion": ("lifecycle-conversion", "lifecycle-conversion-context"),
+        "failures": ("lifecycle-failures", "lifecycle-failures-context"),
+        "budget": ("lifecycle-budget", "lifecycle-budget-context"),
+        "senders": ("lifecycle-senders", "lifecycle-senders-context"),
+    }
+    values: dict[str, str] = {}
+    for key, (value_key, context_key) in entries.items():
+        entry = display.get(key) if isinstance(display, dict) else None
+        if isinstance(entry, dict):
+            values[value_key] = str(entry.get("value_text", "—"))
+            values[context_key] = str(
+                entry.get("context", "No room-lifecycle display recorded")
+            )
+        else:
+            values[value_key] = "—"
+            values[context_key] = "No room-lifecycle display recorded"
+    values["lifecycle-coverage"] = (
+        str(display.get("coverage_text"))
+        if isinstance(display, dict) and isinstance(display.get("coverage_text"), str)
+        else "Room lifecycle has not been recorded."
+    )
+    return values
+
+
 def engagement_ssr(display: Any) -> dict[str, str]:
     """Server-rendered engagement tiles, read verbatim from the shared display
     contract. The fallback strings match the page JavaScript's fallbacks
@@ -1974,6 +2525,7 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
             "engagement-zero-context": "No engagement observation yet",
             "engagement-nick": "—",
             "engagement-nick-context": "No engagement observation yet",
+            **room_lifecycle_ssr(None),
             "notes-cap-count": "—",
             "notes-headroom": "—",
             "notes-rate": "Observed net-change rate needs at least two gap-free samples under the current cap",
@@ -2044,6 +2596,7 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
             else "No matched new rooms"
         ),
         **engagement_ssr(point.get("engagement_display")),
+        **room_lifecycle_ssr(point.get("room_lifecycle_display")),
         "notes-cap-count": f"{format_int(notes.get('total'))} / {format_int(notes.get('cap'))}",
         "notes-headroom": (
             f"{format_int(notes.get('headroom'))} headroom "

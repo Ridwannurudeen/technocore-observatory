@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterator
@@ -60,10 +60,23 @@ PREFIX_CLASSES = (
     ("e-", "ephemeral"),
 )
 ROOM_READ_BUDGET = 80
-COLLECTOR_VERSION = "2.7.0"
+PUBLISHED_READS_PER_MINUTE = 600
+MAX_READ_SHARE = 0.15
+RATE_BUDGET_WINDOW_SECONDS = 60
+BASE_READ_BUDGET = ROOM_READ_BUDGET + 2
+TOTAL_READ_BUDGET = int(
+    PUBLISHED_READS_PER_MINUTE
+    * MAX_READ_SHARE
+    * RATE_BUDGET_WINDOW_SECONDS
+    / 60
+)
+ROOM_REVISIT_READ_BUDGET = TOTAL_READ_BUDGET - BASE_READ_BUDGET
+TICK_REVISIT_DEADLINE_SECONDS = 300
+ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
+COLLECTOR_VERSION = "2.9.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
-SIGNER_STATE_VERSION = 4
+SIGNER_STATE_VERSION = 5
 LEDGER_LOCK_TIMEOUT = 15.0
 # The daemon fails closed and skips its tick if the signer state is locked; a
 # census invocation waits longer because losing its slot discards a completed
@@ -128,9 +141,13 @@ class Client:
         self.timeout = timeout
         self.retries = retries
 
-    def get(self, path: str) -> str:
+    def get(self, path: str, deadline: float | None = None) -> str:
         url = self.base_url + path
         for attempt in range(self.retries + 1):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise CollectionError(f"GET {path} exceeded its deadline")
+
             request = urllib.request.Request(
                 url,
                 headers={
@@ -140,7 +157,8 @@ class Client:
                 method="GET",
             )
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                timeout = self.timeout if remaining is None else min(self.timeout, remaining)
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     body = response.read()
                     if not body:
                         raise CollectionError(f"empty response from {path}")
@@ -150,11 +168,17 @@ class Client:
                 retryable = error.code == 429 or 500 <= error.code <= 599
                 if not retryable or attempt >= self.retries:
                     raise CollectionError(f"GET {path} failed with HTTP {error.code}") from error
-                time.sleep(retry_delay(error, body, attempt))
+                delay = retry_delay(error, body, attempt)
             except (urllib.error.URLError, TimeoutError, UnicodeDecodeError) as error:
                 if attempt >= self.retries:
                     raise CollectionError(f"GET {path} failed: {error}") from error
-                time.sleep(min(30.0, 2.0**attempt))
+                delay = min(30.0, 2.0**attempt)
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or delay >= remaining:
+                    raise CollectionError(f"GET {path} exceeded its deadline")
+            time.sleep(delay)
         raise AssertionError("retry loop exhausted unexpectedly")
 
 
@@ -676,7 +700,7 @@ def signer_database_path(state_path: Path) -> Path:
 
 def initialize_signer_database(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 3, SIGNER_STATE_VERSION):
+    if version not in (0, 3, 4, SIGNER_STATE_VERSION):
         raise CollectionError(f"signer database has unsupported schema version {version}")
 
     connection.executescript(
@@ -707,10 +731,42 @@ def initialize_signer_database(connection: sqlite3.Connection) -> None:
             room_count,
             has_counterparty
         );
+
+        CREATE TABLE IF NOT EXISTS room_ledger (
+            name TEXT PRIMARY KEY,
+            room_id TEXT NOT NULL,
+            created_seq INTEGER NOT NULL UNIQUE CHECK (created_seq >= 0),
+            created_at TEXT NOT NULL,
+            first_observed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS room_revisits (
+            room_name TEXT NOT NULL,
+            stage_seconds INTEGER NOT NULL,
+            due_at TEXT NOT NULL,
+            attempted_at TEXT,
+            success INTEGER CHECK (success IN (0, 1)),
+            message_count INTEGER CHECK (message_count >= 0),
+            has_second_message INTEGER CHECK (has_second_message IN (0, 1)),
+            second_sender_class TEXT CHECK (
+                second_sender_class IN (
+                    'signed_did',
+                    'unsigned_did',
+                    'server',
+                    'other',
+                    'not_observed'
+                )
+            ),
+            PRIMARY KEY (room_name, stage_seconds),
+            FOREIGN KEY (room_name) REFERENCES room_ledger(name)
+        );
+
+        CREATE INDEX IF NOT EXISTS room_revisits_due
+        ON room_revisits (attempted_at, due_at);
         """
     )
 
-    if version == 3:
+    if version in (3, 4):
         row = connection.execute(
             "SELECT state_json FROM signer_metadata WHERE singleton = 1"
         ).fetchone()
@@ -719,8 +775,10 @@ def initialize_signer_database(connection: sqlite3.Connection) -> None:
                 metadata = json.loads(row[0])
             except json.JSONDecodeError as error:
                 raise CollectionError("signer database contains invalid metadata JSON") from error
-            if not isinstance(metadata, dict) or metadata.get("version") != 3:
-                raise CollectionError("signer database has inconsistent v3 metadata")
+            if not isinstance(metadata, dict) or metadata.get("version") != version:
+                raise CollectionError(
+                    f"signer database has inconsistent v{version} metadata"
+                )
             metadata["version"] = SIGNER_STATE_VERSION
             connection.execute(
                 "UPDATE signer_metadata SET state_json = ? WHERE singleton = 1",
@@ -734,9 +792,11 @@ def initialize_signer_database(connection: sqlite3.Connection) -> None:
                 ),
             )
 
-        # Version 3 credited mere signed co-occurrence. Those flags cannot be
-        # reinterpreted as A → B → A alternation, so the stage restarts empty.
-        connection.execute("UPDATE signer_dids SET has_counterparty = 0")
+        if version == 3:
+            # Version 3 credited mere signed co-occurrence. Those flags cannot
+            # be reinterpreted as A → B → A alternation, so the stage restarts
+            # empty.
+            connection.execute("UPDATE signer_dids SET has_counterparty = 0")
 
     connection.execute(f"PRAGMA user_version = {SIGNER_STATE_VERSION}")
     connection.commit()
@@ -747,6 +807,7 @@ def connect_signer_database(path: Path) -> sqlite3.Connection:
     try:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA foreign_keys = ON")
         initialize_signer_database(connection)
     except Exception:
         connection.close()
@@ -893,6 +954,325 @@ def shortened_did(value: str) -> str:
 
 def room_identifier(name: str) -> str:
     return hashlib.sha256(name.encode("utf-8")).hexdigest()[:ROOM_ID_HEX_LENGTH]
+
+
+def timestamp_text(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def record_created_rooms(
+    connection: sqlite3.Connection,
+    events: list[dict[str, Any]],
+    observed_at: str,
+) -> int:
+    inserted = 0
+    for event in events:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO room_ledger (
+                name,
+                room_id,
+                created_seq,
+                created_at,
+                first_observed_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                event["name"],
+                room_identifier(event["name"]),
+                event["seq"],
+                event["ts"],
+                observed_at,
+            ),
+        )
+        if cursor.rowcount != 1:
+            continue
+        inserted += 1
+        created_at = parse_timestamp(event["ts"])
+        connection.executemany(
+            """
+            INSERT INTO room_revisits (
+                room_name,
+                stage_seconds,
+                due_at
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                (
+                    event["name"],
+                    stage_seconds,
+                    timestamp_text(created_at + timedelta(seconds=stage_seconds)),
+                )
+                for stage_seconds in ROOM_REVISIT_STAGES_SECONDS
+            ),
+        )
+    return inserted
+
+
+def select_due_room_revisits(
+    connection: sqlite3.Connection,
+    now: str,
+    limit: int = ROOM_REVISIT_READ_BUDGET,
+) -> tuple[int, list[dict[str, Any]]]:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or limit < 0
+        or limit > ROOM_REVISIT_READ_BUDGET
+    ):
+        raise CollectionError("room-revisit selection exceeds its enforced read budget")
+
+    due = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM room_revisits
+        WHERE attempted_at IS NULL AND due_at <= ?
+        """,
+        (now,),
+    ).fetchone()[0]
+    rows = connection.execute(
+        """
+        SELECT
+            room_revisits.room_name,
+            room_revisits.stage_seconds,
+            room_ledger.created_at
+        FROM room_revisits
+        JOIN room_ledger ON room_ledger.name = room_revisits.room_name
+        WHERE room_revisits.attempted_at IS NULL AND room_revisits.due_at <= ?
+        ORDER BY
+            room_revisits.due_at,
+            room_revisits.room_name,
+            room_revisits.stage_seconds
+        LIMIT ?
+        """,
+        (now, limit),
+    ).fetchall()
+    return int(due), [
+        {
+            "name": name,
+            "stage_seconds": int(stage_seconds),
+            "created_at": created_at,
+        }
+        for name, stage_seconds, created_at in rows
+    ]
+
+
+def classify_second_sender(message: dict[str, Any]) -> str:
+    sender = message["from"]
+    if sender == "server":
+        return "server"
+    if SIGNED_DID_RE.fullmatch(sender):
+        return "signed_did" if message.get("nonce") is not None else "unsigned_did"
+    return "other"
+
+
+def read_budget_summary(
+    sampled_room_reads: int,
+    revisit_reads: int,
+) -> dict[str, Any]:
+    base_reads = 2 + sampled_room_reads
+    total_reads = base_reads + revisit_reads
+    if revisit_reads > ROOM_REVISIT_READ_BUDGET:
+        raise CollectionError("collector room revisits exceed the enforced per-tick budget")
+    if total_reads > TOTAL_READ_BUDGET:
+        raise CollectionError("collector logical reads exceed the enforced per-tick budget")
+    reads_per_minute = total_reads * 60 / RATE_BUDGET_WINDOW_SECONDS
+    share = reads_per_minute / PUBLISHED_READS_PER_MINUTE
+    if share > MAX_READ_SHARE:
+        raise CollectionError("collector logical read rate exceeds the 15% ceiling")
+    return {
+        "base_reads": base_reads,
+        "revisit_reads": revisit_reads,
+        "total_reads": total_reads,
+        "total_read_budget": TOTAL_READ_BUDGET,
+        "revisit_read_budget": ROOM_REVISIT_READ_BUDGET,
+        "rate_window_seconds": RATE_BUDGET_WINDOW_SECONDS,
+        "tick_revisit_deadline_seconds": TICK_REVISIT_DEADLINE_SECONDS,
+        "reads_per_minute": reads_per_minute,
+        "published_reads_per_minute": PUBLISHED_READS_PER_MINUTE,
+        "share": share,
+        "maximum_share": MAX_READ_SHARE,
+    }
+
+
+def room_lifecycle_summary(
+    connection: sqlite3.Connection,
+    *,
+    created_this_tick: int,
+    due_this_tick: int,
+    selected_this_tick: int,
+    revisits: list[dict[str, Any]],
+) -> dict[str, Any]:
+    counts = connection.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM room_ledger),
+            COUNT(DISTINCT CASE WHEN attempted_at IS NOT NULL THEN room_name END),
+            COUNT(DISTINCT CASE WHEN success = 1 THEN room_name END),
+            COUNT(DISTINCT CASE
+                WHEN success = 1 AND has_second_message = 1 THEN room_name
+            END),
+            COUNT(CASE WHEN attempted_at IS NOT NULL THEN 1 END),
+            COUNT(CASE WHEN success = 0 THEN 1 END)
+        FROM room_revisits
+        """
+    ).fetchone()
+    ledger_started_at = connection.execute(
+        "SELECT MIN(first_observed_at) FROM room_ledger"
+    ).fetchone()[0]
+    sender_counts = {
+        "signed_did": 0,
+        "unsigned_did": 0,
+        "server": 0,
+        "other": 0,
+        "not_observed": 0,
+    }
+    for sender_class, count in connection.execute(
+        """
+        SELECT second_sender_class, COUNT(DISTINCT room_name)
+        FROM room_revisits
+        WHERE
+            success = 1
+            AND has_second_message = 1
+            AND second_sender_class IS NOT NULL
+        GROUP BY second_sender_class
+        """
+    ):
+        sender_counts[sender_class] = int(count)
+
+    deferred_due_to_read_budget = due_this_tick - selected_this_tick
+    deferred_due_to_deadline = selected_this_tick - len(revisits)
+
+    return {
+        "ledger_started_at": ledger_started_at,
+        "rooms_in_ledger": int(counts[0]),
+        "rooms_revisited": int(counts[1]),
+        "rooms_successfully_revisited": int(counts[2]),
+        "rooms_with_second_message": int(counts[3]),
+        "reads_attempted": int(counts[4]),
+        "reads_failed": int(counts[5]),
+        "second_sender_classes": sender_counts,
+        "created_rooms_observed_this_tick": created_this_tick,
+        "due_this_tick": due_this_tick,
+        "attempted_this_tick": len(revisits),
+        "deferred_due_to_read_budget": deferred_due_to_read_budget,
+        "deferred_due_to_deadline": deferred_due_to_deadline,
+        "deferred_due_to_budget": (
+            deferred_due_to_read_budget + deferred_due_to_deadline
+        ),
+        "revisits": revisits,
+    }
+
+
+def collect_room_revisits(
+    client: Client,
+    connection: sqlite3.Connection,
+    tick_ts: str,
+    *,
+    sampled_room_reads: int,
+    deadline: float,
+) -> dict[str, Any]:
+    due, selected = select_due_room_revisits(connection, tick_ts)
+
+    # Enforce the maximum selected work before the first revisit read. The
+    # final summary is recomputed from the reads that were actually issued.
+    read_budget_summary(sampled_room_reads, len(selected))
+
+    published: list[dict[str, Any]] = []
+    for revisit in selected:
+        if time.monotonic() >= deadline:
+            break
+
+        name = revisit["name"]
+        stage_seconds = revisit["stage_seconds"]
+        attempted_at = utc_now()
+        elapsed_since_creation_seconds = int(
+            (
+                parse_timestamp(attempted_at)
+                - parse_timestamp(revisit["created_at"])
+            ).total_seconds()
+        )
+        if elapsed_since_creation_seconds < stage_seconds:
+            raise CollectionError("room revisit attempt precedes its nominal due stage")
+
+        path = f"/r/{urllib.parse.quote(name, safe='')}?format=json&limit=200"
+        public_result = {
+            "id": room_identifier(name),
+            "stage_seconds": stage_seconds,
+            "elapsed_since_creation_seconds": elapsed_since_creation_seconds,
+            "success": False,
+            "message_count": None,
+            "has_second_message": None,
+            "second_sender_class": None,
+        }
+        try:
+            messages = parse_room_messages(
+                client.get(path, deadline=deadline),
+                path,
+            )
+        except CollectionError:
+            connection.execute(
+                """
+                UPDATE room_revisits
+                SET attempted_at = ?, success = 0
+                WHERE room_name = ? AND stage_seconds = ?
+                """,
+                (attempted_at, name, stage_seconds),
+            )
+            published.append(public_result)
+            continue
+
+        has_second_message = any(message["seq"] >= 2 for message in messages)
+        exact_second = next(
+            (message for message in messages if message["seq"] == 2),
+            None,
+        )
+        second_sender_class = (
+            classify_second_sender(exact_second)
+            if exact_second is not None
+            else ("not_observed" if has_second_message else None)
+        )
+        connection.execute(
+            """
+            UPDATE room_revisits
+            SET
+                attempted_at = ?,
+                success = 1,
+                message_count = ?,
+                has_second_message = ?,
+                second_sender_class = ?
+            WHERE room_name = ? AND stage_seconds = ?
+            """,
+            (
+                attempted_at,
+                len(messages),
+                int(has_second_message),
+                second_sender_class,
+                name,
+                stage_seconds,
+            ),
+        )
+        public_result.update(
+            {
+                "success": True,
+                "message_count": len(messages),
+                "has_second_message": has_second_message,
+                "second_sender_class": second_sender_class,
+            }
+        )
+        published.append(public_result)
+
+    return room_lifecycle_summary(
+        connection,
+        created_this_tick=0,
+        due_this_tick=due,
+        selected_this_tick=len(selected),
+        revisits=published,
+    )
 
 
 def selector_frame_id(state: dict[str, Any]) -> str:
@@ -1227,6 +1607,7 @@ def collect_tick(
     census_started: str | None = None,
     lock_timeout: float = SIGNER_LOCK_TIMEOUT,
 ) -> dict[str, Any]:
+    tick_started = time.monotonic()
     rooms = parse_rooms(client.get("/rooms?format=json&limit=200"))
     # The whole load-modify-save cycle on the signer state runs under one
     # exclusive lock: an unlocked cycle here let the daemon clobber a census
@@ -1269,6 +1650,23 @@ def collect_tick(
                 client.get("/r/events?format=json&limit=200")
             )
             tick_ts = utc_now()
+            created_this_tick = record_created_rooms(
+                connection,
+                events,
+                tick_ts,
+            )
+            room_lifecycle = collect_room_revisits(
+                client,
+                connection,
+                tick_ts,
+                sampled_room_reads=len(names),
+                deadline=tick_started + TICK_REVISIT_DEADLINE_SECONDS,
+            )
+            room_lifecycle["created_rooms_observed_this_tick"] = created_this_tick
+            room_lifecycle["read_budget"] = read_budget_summary(
+                len(names),
+                room_lifecycle["attempted_this_tick"],
+            )
             if identity_total is not None:
                 state["census"] = {
                     "total": identity_total,
@@ -1305,6 +1703,7 @@ def collect_tick(
         "identity_total": identity_total,
         "identity_census_started": census_started,
         "signer_funnel": funnel,
+        "room_lifecycle": room_lifecycle,
     }
 
 
@@ -1336,14 +1735,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     if (
-        args.interval <= 0
+        args.interval < RATE_BUDGET_WINDOW_SECONDS
         or args.timeout <= 0
         or args.retries < 0
         or args.census_pace < 0
         or args.signer_cap <= 0
     ):
         raise SystemExit(
-            "interval, timeout, and signer cap must be positive; retries and pace cannot be negative"
+            "interval must be at least 60 seconds; timeout and signer cap must be "
+            "positive; retries and pace cannot be negative"
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
