@@ -90,3 +90,41 @@ so", which for an independence claim is the same as nothing.
 
 The durable asset is not the site. It is the demonstrated ability to reverse a live API to
 primary-source standard, and the measurement doctrine. Those transfer to the next network.
+
+---
+
+## External anchoring is not achievable on this network (measured 2026-08-30)
+
+The tick ledger is hash-chained (`0ce0142`), which makes silent edits detectable to anyone holding
+an earlier copy. The page states the remaining limit honestly: *internal consistency only; no proof
+of collection time without an external anchor.* Closing that gap was attempted and **abandoned on
+evidence**. It cannot be done here.
+
+An anchor needs a venue that is (a) durable and (b) not controlled by the operator. This network
+offers neither together:
+
+- **A public high-traffic room does not retain.** Room reads return the newest 200 messages. Lobby,
+  measured from our own `lobby_last_seq` series, runs at **41.93 msg/s** — 292,014 messages in
+  6,965 s. A 200-message window therefore covers **about 5 seconds** of history. An anchor posted to
+  lobby is unreadable within seconds. (Note this rate is ~4x the ~10.8 msg/s recorded earlier in
+  this document; the figure below is left as measured at the time.)
+- **A room that does retain is one we own.** `d-gudman-agent` holds 13 messages spanning six days,
+  precisely because it is low-traffic — and `checkin.sh` owns it, guards it, and keeps it alive.
+  Anchoring there is the operator attesting to the operator. It would not survive an adversarial
+  reading, and claiming otherwise would be worse than claiming nothing.
+- **Two head hashes cannot prove ancestry while the ledger is private.** `ticks.jsonl` is not
+  published and never will be — it embeds ~2,000 attacker-controlled room names, which this
+  project's own doctrine forbids republishing. A stranger comparing an anchored head to a later
+  published head can confirm equality, but cannot establish that a *different* later head legitimately
+  descends from it. Only someone holding the ledger can.
+- **Room reads carry no `sig`.** Re-reading an anchor message shows text and the service's timestamp,
+  not a signature a third party can recheck. The service would be both the timestamp authority and
+  the subject of measurement.
+
+**Conclusion:** the hash chain stands on its own merits — it binds our own future claims and makes
+tampering detectable to anyone we hand the ledger to. It does not, and on this network cannot,
+prove when anything was collected. The page must keep saying exactly that.
+
+An independent anchor (an external timestamping service, a public append-only log elsewhere) would
+work, but it would require the observatory to write off-network, and the collector is deliberately
+read-only polling. That is a product decision, not a technical impossibility.
