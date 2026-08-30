@@ -73,7 +73,9 @@ TOTAL_READ_BUDGET = int(
 ROOM_REVISIT_READ_BUDGET = TOTAL_READ_BUDGET - BASE_READ_BUDGET
 TICK_REVISIT_DEADLINE_SECONDS = 300
 ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
-COLLECTOR_VERSION = "2.9.0"
+CENSUS_MAX_PASSES = 5
+CENSUS_DEADLINE_SECONDS = 30 * 60
+COLLECTOR_VERSION = "2.10.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
 SIGNER_STATE_VERSION = 5
@@ -669,7 +671,23 @@ def save_census_state(path: Path, state: dict[str, Any]) -> None:
     save_atomic_json(path, state)
 
 
-def run_census(client: Client, state_path: Path, pace: float) -> tuple[int, str]:
+def census_failure_cause(error: CollectionError) -> str:
+    message = str(error)
+    status_match = re.search(r"\bHTTP (\d{3})$", message)
+    if status_match:
+        return f"http_{status_match.group(1)}"
+    if "exceeded its deadline" in message:
+        return "deadline"
+    if message.startswith("GET "):
+        return "transport_or_decode"
+    return "invalid_shard_response"
+
+
+def run_census(
+    client: Client,
+    state_path: Path,
+    pace: float,
+) -> tuple[int | None, str, dict[str, Any]]:
     with exclusive_state_lock(state_path, CENSUS_STATE_LOCK_TIMEOUT):
         state = load_census_state(state_path)
         counts: dict[str, int] = state["counts"]
@@ -679,19 +697,70 @@ def run_census(client: Client, state_path: Path, pace: float) -> tuple[int, str]
             counts = state["counts"]
             save_census_state(state_path, state)
 
-        for index in range(256):
-            shard = f"did-{index:02x}"
-            if shard in counts:
-                continue
-            body = client.get(f"/kv/{shard}")
-            counts[shard] = parse_shard_count(body, shard)
-            save_census_state(state_path, state)
-            if pace:
-                time.sleep(pace)
+        outstanding_at_start = 256 - len(counts)
+        deadline = time.monotonic() + CENSUS_DEADLINE_SECONDS
+        passes_attempted = 0
+        shard_reads_attempted = 0
+        shard_read_failures = 0
+        failure_causes: dict[str, int] = {}
+        deadline_reached = False
 
-        if len(counts) != 256:
-            raise CollectionError("identity census ended without all 256 shards")
-        return sum(counts.values()), state["started_at"]
+        for _ in range(CENSUS_MAX_PASSES):
+            missing = [
+                f"did-{index:02x}"
+                for index in range(256)
+                if f"did-{index:02x}" not in counts
+            ]
+            if not missing:
+                break
+            passes_attempted += 1
+
+            for shard in missing:
+                if time.monotonic() >= deadline:
+                    deadline_reached = True
+                    break
+
+                shard_reads_attempted += 1
+                try:
+                    body = client.get(f"/kv/{shard}", deadline=deadline)
+                    count = parse_shard_count(body, shard)
+                except CollectionError as error:
+                    shard_read_failures += 1
+                    cause = census_failure_cause(error)
+                    failure_causes[cause] = failure_causes.get(cause, 0) + 1
+                else:
+                    counts[shard] = count
+                    save_census_state(state_path, state)
+
+                if time.monotonic() >= deadline:
+                    deadline_reached = True
+                    break
+                if pace:
+                    time.sleep(min(pace, deadline - time.monotonic()))
+
+            if deadline_reached:
+                break
+
+        completed = len(counts) == 256
+        census_run = {
+            "walk_started_at": state["started_at"],
+            "shards_outstanding_at_start": outstanding_at_start,
+            "shards_collected": len(counts),
+            "shards_outstanding": 256 - len(counts),
+            "passes_attempted": passes_attempted,
+            "maximum_passes": CENSUS_MAX_PASSES,
+            "deadline_seconds": CENSUS_DEADLINE_SECONDS,
+            "shard_reads_attempted": shard_reads_attempted,
+            "shard_read_failures": shard_read_failures,
+            "failure_causes": dict(sorted(failure_causes.items())),
+            "stop_reason": (
+                "complete"
+                if completed
+                else ("deadline" if deadline_reached else "maximum_passes")
+            ),
+        }
+        total = sum(counts.values()) if completed else None
+        return total, state["started_at"], census_run
 
 
 def signer_database_path(state_path: Path) -> Path:
@@ -1605,6 +1674,7 @@ def collect_tick(
     signer_cap: int,
     identity_total: int | None = None,
     census_started: str | None = None,
+    census_run: dict[str, Any] | None = None,
     lock_timeout: float = SIGNER_LOCK_TIMEOUT,
 ) -> dict[str, Any]:
     tick_started = time.monotonic()
@@ -1702,6 +1772,7 @@ def collect_tick(
         "event_primary_class_counts": primary_counts,
         "identity_total": identity_total,
         "identity_census_started": census_started,
+        "identity_census_run": census_run,
         "signer_funnel": funnel,
         "room_lifecycle": room_lifecycle,
     }
@@ -1756,12 +1827,27 @@ def main() -> int:
         try:
             identity_total = None
             census_started = None
+            census_run = None
             if args.census:
-                identity_total, census_started = run_census(
+                identity_total, census_started, census_run = run_census(
                     client,
                     census_state_path,
                     args.census_pace,
                 )
+                if census_run["shard_read_failures"] or identity_total is None:
+                    publication = (
+                        f"published total {identity_total}"
+                        if identity_total is not None
+                        else "no count published"
+                    )
+                    print(
+                        f"{utc_now()} identity census {census_run['stop_reason']}; "
+                        f"{publication}; "
+                        f"{census_run['shards_outstanding']} shards outstanding; "
+                        f"{census_run['shard_read_failures']} shard reads failed; "
+                        f"causes={json.dumps(census_run['failure_causes'], sort_keys=True)}",
+                        file=sys.stderr,
+                    )
             append_jsonl(
                 args.output,
                 collect_tick(
@@ -1770,6 +1856,7 @@ def main() -> int:
                     args.signer_cap,
                     identity_total,
                     census_started,
+                    census_run,
                     lock_timeout=(
                         CENSUS_SIGNER_LOCK_TIMEOUT if args.census else SIGNER_LOCK_TIMEOUT
                     ),

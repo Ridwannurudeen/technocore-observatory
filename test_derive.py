@@ -5,6 +5,7 @@ import re
 import textwrap
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -126,6 +127,7 @@ def tick(
     room_lifecycle=None,
     collector_version="2.0.0",
     identity_census_started=None,
+    identity_census_run=None,
 ):
     return {
         "collector_version": collector_version,
@@ -139,6 +141,7 @@ def tick(
         "events_last_seq": event_seq,
         "identity_total": identity,
         "identity_census_started": identity_census_started,
+        "identity_census_run": identity_census_run,
         "events_window": (
             events
             if events is not None
@@ -156,6 +159,35 @@ def tick(
         "room_sampling": room_sampling,
         "signer_funnel": signer_funnel,
         "room_lifecycle": room_lifecycle,
+    }
+
+
+def census_run(
+    *,
+    walk_started_at="2026-08-30T16:23:00Z",
+    outstanding_at_start=256,
+    collected=256,
+    outstanding=0,
+    passes=1,
+    maximum_passes=5,
+    deadline_seconds=1800,
+    reads_attempted=256,
+    read_failures=0,
+    failure_causes=None,
+    stop_reason="complete",
+):
+    return {
+        "walk_started_at": walk_started_at,
+        "shards_outstanding_at_start": outstanding_at_start,
+        "shards_collected": collected,
+        "shards_outstanding": outstanding,
+        "passes_attempted": passes,
+        "maximum_passes": maximum_passes,
+        "deadline_seconds": deadline_seconds,
+        "shard_reads_attempted": reads_attempted,
+        "shard_read_failures": read_failures,
+        "failure_causes": failure_causes or {},
+        "stop_reason": stop_reason,
     }
 
 
@@ -222,6 +254,7 @@ def html_template():
         "lobby-rate-samples",
         "identity-total",
         "identity-rate",
+        "identity-census-run",
         "stillborn",
         "stillborn-samples",
         "engagement-ratio",
@@ -319,7 +352,7 @@ def embedded_data(source):
 
 def test_methodology_version_is_bumped_for_wall_clock_bounded_revisits():
     result = derive_records([])
-    assert tuple(map(int, derive.METHODOLOGY_VERSION.split("."))) > (1, 9, 0)
+    assert derive.METHODOLOGY_VERSION == "1.11.0"
     assert result["methodology_version"] == derive.METHODOLOGY_VERSION
     assert (
         "since collector 2.2.0 a sender without a nonce is never counted"
@@ -1127,6 +1160,9 @@ def test_census_window_and_long_walk_warning_reach_shared_display():
         "2026-08-30T10:35:00Z",
         identity=795_918,
         identity_census_started="2026-08-29T10:23:01Z",
+        identity_census_run=census_run(
+            walk_started_at="2026-08-29T10:23:01Z",
+        ),
         signer_funnel=funnel(
             census=795_918,
             census_started_at="2026-08-29T10:23:01Z",
@@ -1144,6 +1180,189 @@ def test_census_window_and_long_walk_warning_reach_shared_display():
     assert point["signer_funnel"]["display"]["census"] == census
     assert ssr_values(result)["identity-rate"] == census["context"]
     assert ssr_values(result)["funnel-census-context"] == census["context"]
+
+
+def test_census_run_cost_and_failure_provenance_are_published():
+    run = census_run(
+        reads_attempted=279,
+        read_failures=23,
+        failure_causes={"http_503": 23},
+    )
+    result = derive_records(
+        [
+            tick(
+                "2026-08-30T16:44:00Z",
+                identity=795_918,
+                identity_census_started=run["walk_started_at"],
+                identity_census_run=run,
+            )
+        ]
+    )
+    point = result["points"][0]
+    published = point["identity_census_run"]
+    display = point["identity_census_run_display"]
+
+    assert published["shards_collected"] == 256
+    assert published["shards_outstanding"] == 0
+    assert published["shard_reads_attempted"] == 279
+    assert published["shard_read_failures"] == 23
+    assert published["failure_causes"] == {"http_503": 23}
+    assert published["invocations"] == 1
+    assert "0 outstanding" in display
+    assert "stop reason complete: all shards collected" in display
+    assert "23 service HTTP 503 responses" in display
+    assert "collector deadline reached" not in display
+    assert ssr_values(result)["identity-census-run"] == display
+
+
+def test_tick_without_census_run_is_explicitly_not_recorded_never_zero():
+    record = tick("2026-08-28T08:00:00Z")
+    record.pop("identity_census_run")
+
+    accepted, rejected = read_jsonl([json.dumps(record)])
+    assert (len(accepted), rejected) == (1, 0)
+
+    result = derive_records(accepted)
+    point = result["points"][0]
+    display = point["identity_census_run_display"]
+
+    assert point["identity_census_run"] is None
+    assert display == derive.CENSUS_RUN_NOT_RECORDED
+    assert "not recorded" in display
+    assert "absence never means zero" in display
+    assert "0" not in display
+    assert ssr_values(result)["identity-census-run"] == display
+
+
+def test_census_run_invocations_sum_only_read_costs_within_one_walk():
+    walk_started_at = "2026-08-30T15:00:00Z"
+    records = [
+        tick(
+            "2026-08-30T16:00:00Z",
+            identity_census_started=walk_started_at,
+            identity_census_run=census_run(
+                walk_started_at=walk_started_at,
+                outstanding_at_start=256,
+                collected=9,
+                outstanding=247,
+                passes=5,
+                reads_attempted=32,
+                read_failures=23,
+                failure_causes={"http_503": 23},
+                stop_reason="maximum_passes",
+            ),
+        ),
+        tick(
+            "2026-08-30T16:05:00Z",
+            event_seq=30_001,
+            lobby=5_001,
+            identity_census_started=walk_started_at,
+            identity_census_run=census_run(
+                walk_started_at=walk_started_at,
+                outstanding_at_start=247,
+                collected=20,
+                outstanding=236,
+                passes=5,
+                reads_attempted=30,
+                read_failures=19,
+                failure_causes={"deadline": 2, "http_503": 17},
+                stop_reason="maximum_passes",
+            ),
+        ),
+    ]
+
+    result = derive_records(records)
+    published = result["points"][-1]["identity_census_run"]
+
+    assert published["invocations"] == 2
+    assert published["shard_reads_attempted"] == 62
+    assert published["shard_read_failures"] == 42
+    assert published["failure_causes"] == {"deadline": 2, "http_503": 40}
+    assert published["shards_collected"] == 20
+    assert published["shards_outstanding"] == 236
+    assert published["shards_collected"] != 9 + 20
+    assert published["shards_outstanding"] != 247 + 236
+    assert result["points"][-1]["identity_total"] is None
+    assert result["points"][-1]["census_display"]["value"] is None
+    assert "2 collector deadline expirations" in (
+        result["points"][-1]["identity_census_run_display"]
+    )
+    assert "40 service HTTP 503 responses" in (
+        result["points"][-1]["identity_census_run_display"]
+    )
+
+
+def test_incomplete_census_run_accepts_its_walk_start_but_publishes_no_count():
+    run = census_run(
+        collected=9,
+        outstanding=247,
+        passes=5,
+        reads_attempted=32,
+        read_failures=23,
+        failure_causes={"http_503": 23},
+        stop_reason="maximum_passes",
+    )
+    validated = validate_tick(
+        tick(
+            "2026-08-30T16:44:00Z",
+            identity=None,
+            identity_census_started=run["walk_started_at"],
+            identity_census_run=run,
+        )
+    )
+    result = derive_records([validated])
+    point = result["points"][0]
+
+    assert point["identity_total"] is None
+    assert point["census_display"]["value"] is None
+    assert ssr_values(result)["identity-total"] == "—"
+
+    inconsistent = tick(
+        "2026-08-30T16:44:00Z",
+        identity=795_918,
+        identity_census_started=run["walk_started_at"],
+        identity_census_run=run,
+    )
+    with pytest.raises(
+        ValueError,
+        match="incomplete census run publishes an identity total",
+    ):
+        validate_tick(inconsistent)
+
+
+def test_census_run_ssr_and_javascript_read_the_same_finished_string(tmp_path):
+    run = census_run(
+        reads_attempted=279,
+        read_failures=23,
+        failure_causes={"http_503": 23},
+    )
+    data = derive_records(
+        [
+            tick(
+                "2026-08-30T16:44:00Z",
+                identity=795_918,
+                identity_census_started=run["walk_started_at"],
+                identity_census_run=run,
+            )
+        ]
+    )
+    path = tmp_path / "index.html"
+    path.write_text(html_template(), encoding="utf-8")
+    inject_html(path, data)
+    source = path.read_text(encoding="utf-8")
+    embedded = embedded_data(source)
+    display = embedded["points"][0]["identity_census_run_display"]
+
+    assert rendered_ssr(source, "identity-census-run") == display
+
+    page_source = Path("index.html").read_text(encoding="utf-8")
+    assert "const censusRunDisplay=point.identity_census_run_display;" in page_source
+    assert (
+        'byId("identity-census-run").textContent=typeof '
+        'censusRunDisplay==="string"'
+        in page_source
+    )
+    assert ".innerHTML" not in page_source
 
 
 def test_legacy_census_without_start_is_explicitly_not_recorded():

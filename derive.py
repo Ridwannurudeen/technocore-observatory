@@ -34,7 +34,31 @@ HOURLY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DAILY_RETENTION_SECONDS = 365 * 24 * 60 * 60
 HOURLY_ROLLUP_SECONDS = 60 * 60
 DAILY_ROLLUP_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.10.0"
+METHODOLOGY_VERSION = "1.11.0"
+CENSUS_SHARD_COUNT = 256
+CENSUS_RUN_FIELDS = {
+    "walk_started_at",
+    "shards_outstanding_at_start",
+    "shards_collected",
+    "shards_outstanding",
+    "passes_attempted",
+    "maximum_passes",
+    "deadline_seconds",
+    "shard_reads_attempted",
+    "shard_read_failures",
+    "failure_causes",
+    "stop_reason",
+}
+CENSUS_FAILURE_CAUSES = {
+    "deadline",
+    "transport_or_decode",
+    "invalid_shard_response",
+}
+CENSUS_STOP_REASONS = {"complete", "deadline", "maximum_passes"}
+CENSUS_RUN_NOT_RECORDED = (
+    "Census sweep cost not recorded · this tick does not carry "
+    "identity_census_run; absence never means zero"
+)
 ROOM_SAMPLING_STRUCTURAL_CEILING = 200
 ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
 ROOM_REVISIT_STRUCTURAL_CEILING = 305
@@ -239,6 +263,112 @@ def validate_engagement(value: Any) -> dict[str, Any] | None:
         "nick_diversity": finite_number(value.get("nick_diversity")),
         "window_cap": non_negative_int(value.get("window_cap")),
         "windowed_messages": non_negative_int(value.get("windowed_messages")),
+    }
+
+
+def validate_identity_census_run(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != CENSUS_RUN_FIELDS:
+        raise ValueError("identity_census_run is not a complete census-run object")
+
+    walk_started_at = value["walk_started_at"]
+    try:
+        parse_ts(walk_started_at)
+    except ValueError as error:
+        raise ValueError(
+            "identity_census_run.walk_started_at is not a valid timestamp"
+        ) from error
+
+    outstanding_at_start = integer(
+        value["shards_outstanding_at_start"],
+        "identity_census_run.shards_outstanding_at_start",
+    )
+    shards_collected = integer(
+        value["shards_collected"],
+        "identity_census_run.shards_collected",
+    )
+    shards_outstanding = integer(
+        value["shards_outstanding"],
+        "identity_census_run.shards_outstanding",
+    )
+    passes_attempted = integer(
+        value["passes_attempted"],
+        "identity_census_run.passes_attempted",
+    )
+    maximum_passes = integer(
+        value["maximum_passes"],
+        "identity_census_run.maximum_passes",
+        1,
+    )
+    deadline_seconds = integer(
+        value["deadline_seconds"],
+        "identity_census_run.deadline_seconds",
+        1,
+    )
+    reads_attempted = integer(
+        value["shard_reads_attempted"],
+        "identity_census_run.shard_reads_attempted",
+    )
+    read_failures = integer(
+        value["shard_read_failures"],
+        "identity_census_run.shard_read_failures",
+    )
+    stop_reason = value["stop_reason"]
+
+    failure_causes = value["failure_causes"]
+    if not isinstance(failure_causes, dict):
+        raise ValueError("identity_census_run.failure_causes is not an object")
+    validated_causes: dict[str, int] = {}
+    for cause, count in failure_causes.items():
+        if (
+            not isinstance(cause, str)
+            or (
+                cause not in CENSUS_FAILURE_CAUSES
+                and re.fullmatch(r"http_\d{3}", cause) is None
+            )
+        ):
+            raise ValueError("identity_census_run contains an invalid failure cause")
+        validated_causes[cause] = integer(
+            count,
+            f"identity_census_run.failure_causes.{cause}",
+        )
+
+    if (
+        outstanding_at_start > CENSUS_SHARD_COUNT
+        or shards_collected > CENSUS_SHARD_COUNT
+        or shards_outstanding > CENSUS_SHARD_COUNT
+        or shards_collected + shards_outstanding != CENSUS_SHARD_COUNT
+        or shards_outstanding > outstanding_at_start
+    ):
+        raise ValueError("identity_census_run shard accounting is inconsistent")
+    if (
+        passes_attempted > maximum_passes
+        or read_failures > reads_attempted
+        or sum(validated_causes.values()) != read_failures
+        or outstanding_at_start - shards_outstanding
+        > reads_attempted - read_failures
+    ):
+        raise ValueError("identity_census_run read accounting is inconsistent")
+    if stop_reason not in CENSUS_STOP_REASONS:
+        raise ValueError("identity_census_run.stop_reason is invalid")
+    if (stop_reason == "complete") != (shards_outstanding == 0):
+        raise ValueError("identity_census_run stop reason contradicts shard state")
+    if stop_reason == "maximum_passes" and passes_attempted != maximum_passes:
+        raise ValueError("identity_census_run stopped before its maximum pass")
+
+    return {
+        "walk_started_at": walk_started_at,
+        "shards_outstanding_at_start": outstanding_at_start,
+        "shards_collected": shards_collected,
+        "shards_outstanding": shards_outstanding,
+        "passes_attempted": passes_attempted,
+        "maximum_passes": maximum_passes,
+        "deadline_seconds": deadline_seconds,
+        "shard_reads_attempted": reads_attempted,
+        "shard_read_failures": read_failures,
+        "failure_causes": dict(sorted(validated_causes.items())),
+        "stop_reason": stop_reason,
     }
 
 
@@ -746,13 +876,30 @@ def validate_tick(value: Any) -> dict[str, Any]:
         value.get("identity_census_started"),
         "identity_census_started",
     )
-    if identity_total is None and identity_census_started is not None:
-        raise ValueError("tick has a census start without a census")
+    identity_census_run = validate_identity_census_run(
+        value.get("identity_census_run")
+    )
+    if (
+        identity_total is None
+        and identity_census_started is not None
+        and identity_census_run is None
+    ):
+        raise ValueError("tick has a census start without a census or census run")
     if (
         identity_census_started is not None
         and parse_ts(identity_census_started) > parsed_ts
     ):
         raise ValueError("tick census starts after the tick timestamp")
+    if identity_census_run is not None:
+        if identity_census_run["walk_started_at"] != identity_census_started:
+            raise ValueError("tick census start disagrees with its census run")
+        if parse_ts(identity_census_run["walk_started_at"]) > parsed_ts:
+            raise ValueError("tick census run starts after the tick timestamp")
+        if (
+            identity_census_run["shards_outstanding"] > 0
+            and identity_total is not None
+        ):
+            raise ValueError("incomplete census run publishes an identity total")
 
     raw_collector_version = value.get("collector_version")
     result = {
@@ -777,6 +924,7 @@ def validate_tick(value: Any) -> dict[str, Any]:
         "events_last_seq": integer(value.get("events_last_seq"), "events_last_seq"),
         "identity_total": identity_total,
         "identity_census_started": identity_census_started,
+        "identity_census_run": identity_census_run,
         "events_window": validated_events,
         "newest_rooms": validated_rooms,
         "room_sampling": validate_room_sampling(value.get("room_sampling")),
@@ -1682,6 +1830,88 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def derived_identity_census_run(
+    run: dict[str, Any] | None,
+    runs_by_walk: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if run is None:
+        return None
+
+    aggregate = runs_by_walk.setdefault(
+        run["walk_started_at"],
+        {
+            "invocations": 0,
+            "shard_reads_attempted": 0,
+            "shard_read_failures": 0,
+            "failure_causes": {},
+        },
+    )
+    aggregate["invocations"] += 1
+    aggregate["shard_reads_attempted"] += run["shard_reads_attempted"]
+    aggregate["shard_read_failures"] += run["shard_read_failures"]
+    for cause, count in run["failure_causes"].items():
+        aggregate["failure_causes"][cause] = (
+            aggregate["failure_causes"].get(cause, 0) + count
+        )
+
+    return {
+        **run,
+        "invocations": aggregate["invocations"],
+        "shard_reads_attempted": aggregate["shard_reads_attempted"],
+        "shard_read_failures": aggregate["shard_read_failures"],
+        "failure_causes": dict(sorted(aggregate["failure_causes"].items())),
+    }
+
+
+def identity_census_run_display(run: dict[str, Any] | None) -> str:
+    if run is None:
+        return CENSUS_RUN_NOT_RECORDED
+
+    stop_text = {
+        "complete": "all shards collected",
+        "deadline": "collector deadline reached",
+        "maximum_passes": "collector maximum-pass bound reached",
+    }[run["stop_reason"]]
+    cause_labels = {
+        "deadline": "collector deadline expirations",
+        "transport_or_decode": "transport or decode errors while reading the service",
+        "invalid_shard_response": "invalid shard responses",
+    }
+    causes = []
+    for cause, count in run["failure_causes"].items():
+        label = (
+            f"service HTTP {cause.removeprefix('http_')} responses"
+            if cause.startswith("http_")
+            else cause_labels[cause]
+        )
+        causes.append(f"{format_int(count)} {label}")
+    failure_text = (
+        "no shard-read failures recorded"
+        if not causes
+        else (
+            f"{format_int(run['shard_read_failures'])} shard-read failures "
+            f"({'; '.join(causes)})"
+        )
+    )
+    invocation_label = (
+        "invocation" if run["invocations"] == 1 else "invocations"
+    )
+    return (
+        f"census sweep {run['walk_started_at']} · "
+        f"{format_int(run['shards_collected'])} / "
+        f"{format_int(CENSUS_SHARD_COUNT)} shards collected · "
+        f"{format_int(run['shards_outstanding'])} outstanding · "
+        f"stop reason {run['stop_reason']}: {stop_text} · "
+        f"{format_int(run['shard_reads_attempted'])} shard reads attempted across "
+        f"{format_int(run['invocations'])} {invocation_label} · {failure_text} · "
+        f"latest invocation began with "
+        f"{format_int(run['shards_outstanding_at_start'])} outstanding and attempted "
+        f"{format_int(run['passes_attempted'])} / "
+        f"{format_int(run['maximum_passes'])} passes under a "
+        f"{format_int(run['deadline_seconds'])}s collector deadline"
+    )
+
+
 def census_display(
     latest_census: tuple[int, str | None, str] | None,
 ) -> dict[str, Any]:
@@ -1841,8 +2071,15 @@ def methodology_definitions() -> dict[str, str]:
             "result is a walk, not a point-in-time count. Walks lasting at least one "
             "hour are labelled LONG CENSUS WALK. A legacy census without a recorded "
             "start says so explicitly and no start is inferred. A count publishes "
-            "only when all shards succeed; incomplete censuses publish no count. It "
-            "counts neither people, agents nor users."
+            "only when all shards succeed; incomplete censuses publish no count. "
+            "Census-run invocations are grouped by walk_started_at. Only shard-read "
+            "attempts, shard-read failures and their corresponding failure-cause "
+            "counts are summed across invocations; collected and outstanding shard "
+            "counts remain the latest point-in-time state and are never added. HTTP "
+            "causes describe service responses, while deadline causes and stop reasons "
+            "describe collector bounds. A tick without identity_census_run reports "
+            "the sweep cost as not recorded, never zero. It counts neither people, "
+            "agents nor users."
         ),
         "first_message_only": (
             "Numerator: captured new-room events whose same-tick newest-room record has "
@@ -2120,6 +2357,7 @@ def derive_records(
     first_event_seq = ticks[0]["events_last_seq"]
     previous_identity: dict[str, Any] | None = None
     coverage_by_frame: dict[tuple[Any, ...], dict[str, Any]] = {}
+    census_runs_by_walk: dict[str, dict[str, Any]] = {}
     # The newest completed census known at each point, from measured
     # identity_total ticks and from funnel-recorded census results alike.
     latest_census: tuple[int, str | None, str] | None = None
@@ -2160,6 +2398,10 @@ def derive_records(
                 latest_census = candidate
 
         room_sampling = derived_room_sampling(tick["room_sampling"], coverage_by_frame)
+        census_run = derived_identity_census_run(
+            tick.get("identity_census_run"),
+            census_runs_by_walk,
+        )
         point = {
             "ts": tick["ts"],
             "rooms_total": tick["rooms_total"],
@@ -2171,6 +2413,8 @@ def derive_records(
             "events_last_seq": tick["events_last_seq"],
             "identity_total": tick["identity_total"],
             "identity_census_started": tick["identity_census_started"],
+            "identity_census_run": census_run,
+            "identity_census_run_display": identity_census_run_display(census_run),
             "census_display": census_display(latest_census),
             "observed_public_rooms": max(0, tick["events_last_seq"] - first_event_seq),
             "room_sampling": room_sampling,
@@ -2517,6 +2761,7 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
             "lobby-rate-samples": "Needs two gap-free observations",
             "identity-total": "—",
             "identity-rate": "No complete census yet",
+            "identity-census-run": CENSUS_RUN_NOT_RECORDED,
             "stillborn": "—",
             "stillborn-samples": "No matched new rooms",
             "engagement-ratio": "—",
@@ -2588,6 +2833,9 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
         "lobby-rate-samples": lobby_tile["context"],
         "identity-total": str(census_tile.get("value_text", "—")),
         "identity-rate": str(census_tile.get("context", "No completed census yet")),
+        "identity-census-run": str(
+            point.get("identity_census_run_display") or CENSUS_RUN_NOT_RECORDED
+        ),
         "stillborn": format_percent(stillborn.get("fraction")),
         "stillborn-samples": (
             f"{format_int(stillborn.get('first_message_only'))}/"

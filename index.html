@@ -260,7 +260,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 <section class="stats" aria-label="Current measurements">
   <div class="stat"><div class="label">Latest interval room creation rate</div><div class="number" id="room-rate" data-ssr="room-rate">15.00/min</div><div class="samples" id="room-rate-samples" data-ssr="room-rate-samples">2 samples over 108s</div></div>
   <div class="stat"><div class="label">Latest interval lobby velocity</div><div class="number" id="lobby-rate" data-ssr="lobby-rate">24.59/s</div><div class="samples" id="lobby-rate-samples" data-ssr="lobby-rate-samples">2 samples over 108s</div></div>
-  <div class="stat"><div class="label">Identity census</div><div class="number" id="identity-total" data-ssr="identity-total">608,600</div><div class="samples" id="identity-rate" data-ssr="identity-rate">well-formed published DID notes · measured 2026-08-28T16:28:46Z</div></div>
+  <div class="stat"><div class="label">Identity census</div><div class="number" id="identity-total" data-ssr="identity-total">608,600</div><div class="samples" id="identity-rate" data-ssr="identity-rate">well-formed published DID notes · measured 2026-08-28T16:28:46Z</div><div class="samples" id="identity-census-run" data-ssr="identity-census-run">Census sweep cost not recorded · this tick does not carry identity_census_run; absence never means zero</div></div>
   <div class="stat"><div class="label">First-message-only signal</div><div class="number" id="stillborn" data-ssr="stillborn">100.0%</div><div class="samples" id="stillborn-samples" data-ssr="stillborn-samples">2/2 matched new rooms</div></div>
 </section>
 
@@ -785,6 +785,10 @@ function update(index){
   byId("identity-rate").textContent=censusDisplay
     ?censusDisplay.context
     :"No completed census yet";
+  const censusRunDisplay=point.identity_census_run_display;
+  byId("identity-census-run").textContent=typeof censusRunDisplay==="string"
+    ?censusRunDisplay
+    :"Census sweep cost not recorded · this tick does not carry identity_census_run; absence never means zero";
 
   const stillborn=point.stillborn_signal||{};
   byId("stillborn").textContent=formatPercent(stillborn.fraction);

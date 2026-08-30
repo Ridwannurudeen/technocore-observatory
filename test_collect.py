@@ -90,8 +90,191 @@ def insert_record(
     )
 
 
-def test_collector_version_is_bumped_for_wall_clock_bounded_revisits():
-    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 8, 0)
+def test_collector_version_is_bumped_for_resilient_identity_census():
+    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 9, 0)
+
+
+def test_census_continues_after_failures_and_retries_only_missing_shards(tmp_path):
+    state_path = tmp_path / "identity-census-state.json"
+    attempts = {}
+
+    class IntermittentClient:
+        def get(self, path, deadline=None):
+            shard = path.rsplit("/", 1)[-1]
+            attempts[shard] = attempts.get(shard, 0) + 1
+            if shard == "did-01" or (
+                shard == "did-00" and attempts[shard] == 1
+            ):
+                raise CollectionError(f"GET {path} failed with HTTP 503")
+            return "[{}]"
+
+    total, started_at, census_run = collect.run_census(
+        IntermittentClient(),
+        state_path,
+        0,
+    )
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert total is None
+    assert started_at == saved["started_at"]
+    assert len(saved["counts"]) == 255
+    assert "did-00" in saved["counts"]
+    assert "did-01" not in saved["counts"]
+    assert "did-ff" in saved["counts"]
+    assert attempts["did-00"] == 2
+    assert attempts["did-01"] == collect.CENSUS_MAX_PASSES
+    assert attempts["did-ff"] == 1
+    assert census_run == {
+        "walk_started_at": started_at,
+        "shards_outstanding_at_start": 256,
+        "shards_collected": 255,
+        "shards_outstanding": 1,
+        "passes_attempted": collect.CENSUS_MAX_PASSES,
+        "maximum_passes": collect.CENSUS_MAX_PASSES,
+        "deadline_seconds": collect.CENSUS_DEADLINE_SECONDS,
+        "shard_reads_attempted": 261,
+        "shard_read_failures": 6,
+        "failure_causes": {"http_503": 6},
+        "stop_reason": "maximum_passes",
+    }
+
+
+def test_census_completes_missing_shards_then_resets_the_next_walk(
+    tmp_path,
+    monkeypatch,
+):
+    state_path = tmp_path / "identity-census-state.json"
+    previous_started_at = "2026-08-29T10:23:00Z"
+    collect.save_census_state(
+        state_path,
+        {
+            "version": 1,
+            "started_at": previous_started_at,
+            "counts": {
+                f"did-{index:02x}": 1
+                for index in range(256)
+                if index != 7
+            },
+        },
+    )
+
+    class SuccessfulClient:
+        def __init__(self, body):
+            self.body = body
+            self.calls = []
+
+        def get(self, path, deadline=None):
+            self.calls.append(path)
+            return self.body
+
+    finishing_client = SuccessfulClient("[{}]")
+    total, started_at, census_run = collect.run_census(
+        finishing_client,
+        state_path,
+        0,
+    )
+
+    assert total == 256
+    assert started_at == previous_started_at
+    assert finishing_client.calls == ["/kv/did-07"]
+    assert census_run["shards_outstanding_at_start"] == 1
+    assert census_run["shards_collected"] == 256
+    assert census_run["shards_outstanding"] == 0
+    assert census_run["shard_reads_attempted"] == 1
+    assert census_run["shard_read_failures"] == 0
+    assert census_run["failure_causes"] == {}
+    assert census_run["stop_reason"] == "complete"
+
+    completed_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert completed_state["started_at"] == previous_started_at
+    assert len(completed_state["counts"]) == 256
+
+    next_started_at = "2026-08-30T16:23:00Z"
+    monkeypatch.setattr(collect, "utc_now", lambda: next_started_at)
+    next_client = SuccessfulClient("[{},{}]")
+    next_total, reset_started_at, next_run = collect.run_census(
+        next_client,
+        state_path,
+        0,
+    )
+
+    reset_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert next_total == 512
+    assert reset_started_at == next_started_at
+    assert len(next_client.calls) == 256
+    assert reset_state["started_at"] == next_started_at
+    assert len(reset_state["counts"]) == 256
+    assert next_run["shards_outstanding_at_start"] == 256
+    assert next_run["shards_outstanding"] == 0
+    assert next_run["stop_reason"] == "complete"
+
+
+def test_incomplete_census_tick_publishes_progress_but_no_count(
+    tmp_path,
+    monkeypatch,
+):
+    tick_ts = "2026-08-30T16:44:00Z"
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+
+    class TickClient:
+        def get(self, path, deadline=None):
+            if path == "/rooms?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "total": 0,
+                        "capacity": 0,
+                        "bytes": 0,
+                        "notes": {
+                            "total": 0,
+                            "capacity": 0,
+                            "bytes": 0,
+                        },
+                        "rooms": [],
+                    }
+                )
+            if path == "/r/lobby?format=json&limit=200":
+                return room_body(message(1, "server"))
+            if path == "/r/events?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "messages": [
+                            {
+                                "seq": 1,
+                                "ts": tick_ts,
+                                "from": "server",
+                                "text": "created census-test-room",
+                            }
+                        ]
+                    }
+                )
+            raise AssertionError(f"unexpected read: {path}")
+
+    census_run = {
+        "walk_started_at": "2026-08-30T10:35:00Z",
+        "shards_outstanding_at_start": 256,
+        "shards_collected": 255,
+        "shards_outstanding": 1,
+        "passes_attempted": collect.CENSUS_MAX_PASSES,
+        "maximum_passes": collect.CENSUS_MAX_PASSES,
+        "deadline_seconds": collect.CENSUS_DEADLINE_SECONDS,
+        "shard_reads_attempted": 260,
+        "shard_read_failures": 5,
+        "failure_causes": {"http_503": 5},
+        "stop_reason": "maximum_passes",
+    }
+    tick = collect.collect_tick(
+        TickClient(),
+        tmp_path / "signers.json",
+        100,
+        identity_total=None,
+        census_started=census_run["walk_started_at"],
+        census_run=census_run,
+    )
+
+    assert tick["identity_total"] is None
+    assert tick["identity_census_started"] == census_run["walk_started_at"]
+    assert tick["identity_census_run"] == census_run
+    assert tick["signer_funnel"]["well_formed_did_notes"] is None
 
 
 def test_hash_chain_declares_genesis_after_unchained_prefix_and_verifies(tmp_path):
