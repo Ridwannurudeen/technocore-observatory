@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# The collected tick ledger is deliberately not published here. It embeds ~2,000
+# distinct room names, and room names on this service are anonymous, world-writable
+# strings — republishing them wholesale is exactly what this project's own doctrine
+# forbids, which is why the sampling manifest stores hashes instead. The derived
+# payload is served publicly at /data.json.
+ticks-sample.jsonl
+ticks.jsonl
+data.json
+signers.json
