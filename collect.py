@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -51,10 +52,10 @@ PREFIX_CLASSES = (
     ("e-", "ephemeral"),
 )
 ROOM_READ_BUDGET = 80
-COLLECTOR_VERSION = "2.3.0"
+COLLECTOR_VERSION = "2.4.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
-SIGNER_STATE_VERSION = 2
+SIGNER_STATE_VERSION = 3
 # The daemon fails closed and skips its tick if the signer state is locked; a
 # census invocation waits longer because losing its slot discards a completed
 # 256-shard walk (the next census run would reset and start over).
@@ -619,6 +620,61 @@ def run_census(client: Client, state_path: Path, pace: float) -> tuple[int, str]
         return sum(counts.values()), state["started_at"]
 
 
+def signer_database_path(state_path: Path) -> Path:
+    return state_path.with_suffix(".sqlite3")
+
+
+def initialize_signer_database(connection: sqlite3.Connection) -> None:
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version not in (0, SIGNER_STATE_VERSION):
+        raise CollectionError(f"signer database has unsupported schema version {version}")
+
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS signer_metadata (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            state_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS signer_dids (
+            did TEXT PRIMARY KEY,
+            first_observed_ts TEXT,
+            last_observed_ts TEXT,
+            tick_count INTEGER NOT NULL CHECK (tick_count >= 0),
+            collection_first_utc_date TEXT,
+            collection_last_utc_date TEXT,
+            collection_utc_dates_count INTEGER NOT NULL
+                CHECK (collection_utc_dates_count >= 0),
+            rooms_json TEXT NOT NULL,
+            room_count INTEGER NOT NULL CHECK (room_count BETWEEN 0 AND 8),
+            has_counterparty INTEGER NOT NULL CHECK (has_counterparty IN (0, 1))
+        );
+
+        CREATE INDEX IF NOT EXISTS signer_dids_funnel
+        ON signer_dids (
+            tick_count,
+            collection_utc_dates_count,
+            room_count,
+            has_counterparty
+        );
+        """
+    )
+    connection.execute(f"PRAGMA user_version = {SIGNER_STATE_VERSION}")
+    connection.commit()
+
+
+def connect_signer_database(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path, timeout=5.0)
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = FULL")
+        initialize_signer_database(connection)
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
 def new_signer_state(tracked_cap: int) -> dict[str, Any]:
     started_at = utc_now()
     return {
@@ -631,8 +687,8 @@ def new_signer_state(tracked_cap: int) -> dict[str, Any]:
         "persistence_collection_utc_dates_count": 0,
         "tracked_cap": tracked_cap,
         "cap_hit": False,
+        "tracking_cap_saturation": None,
         "census": None,
-        "dids": {},
         "selector_version": SELECTOR_VERSION,
         "selector_seed": secrets.token_hex(16),
         "selector_epoch": -1,
@@ -641,45 +697,17 @@ def new_signer_state(tracked_cap: int) -> dict[str, Any]:
     }
 
 
-def reset_legacy_persistence(value: dict[str, Any]) -> None:
-    reset_at = utc_now()
-    for record in value["dids"].values():
-        if not isinstance(record, dict):
-            raise CollectionError("signer state contains an invalid DID record")
-        record.pop("first_seen_ts", None)
-        record.pop("last_seen_ts", None)
-        record.pop("utc_dates", None)
-        record.pop("utc_dates_count", None)
-        record["first_observed_ts"] = None
-        record["last_observed_ts"] = None
-        record["collection_first_utc_date"] = None
-        record["collection_last_utc_date"] = None
-        record["collection_utc_dates_count"] = 0
-
-    value["version"] = SIGNER_STATE_VERSION
-    value["persistence_started_at"] = reset_at
-    value["persistence_reset_at"] = reset_at
-    value["persistence_first_utc_date"] = None
-    value["persistence_last_utc_date"] = None
-    value["persistence_collection_utc_dates_count"] = 0
-
-
-def load_signer_state(path: Path, tracked_cap: int) -> dict[str, Any]:
-    if not path.exists():
-        return new_signer_state(tracked_cap)
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise CollectionError(f"cannot read signer state {path}") from error
+def validate_signer_metadata(value: Any) -> dict[str, Any]:
     if (
         not isinstance(value, dict)
-        or value.get("version") not in (1, SIGNER_STATE_VERSION)
-        or not isinstance(value.get("dids"), dict)
+        or value.get("version") != SIGNER_STATE_VERSION
+        or "dids" in value
+        or isinstance(value.get("tracked_cap"), bool)
+        or not isinstance(value.get("tracked_cap"), int)
+        or value["tracked_cap"] <= 0
+        or not isinstance(value.get("cap_hit"), bool)
     ):
-        raise CollectionError("signer state has an unexpected shape")
-
-    if value["version"] == 1:
-        reset_legacy_persistence(value)
+        raise CollectionError("signer metadata has an unexpected shape")
 
     selector_fields = (
         "selector_version",
@@ -688,20 +716,8 @@ def load_signer_state(path: Path, tracked_cap: int) -> dict[str, Any]:
         "selector_frame",
         "selector_position",
     )
-    present_selector_fields = [field in value for field in selector_fields]
-    if any(present_selector_fields) and not all(present_selector_fields):
-        raise CollectionError("signer state has an incomplete room selector")
-
-    if not any(present_selector_fields):
-        value.update(
-            {
-                "selector_version": SELECTOR_VERSION,
-                "selector_seed": secrets.token_hex(16),
-                "selector_epoch": -1,
-                "selector_frame": [],
-                "selector_position": 0,
-            }
-        )
+    if not all(field in value for field in selector_fields):
+        raise CollectionError("signer metadata has an incomplete room selector")
 
     if (
         value["selector_version"] != SELECTOR_VERSION
@@ -718,13 +734,77 @@ def load_signer_state(path: Path, tracked_cap: int) -> dict[str, Any]:
         or value["selector_position"] < 0
         or value["selector_position"] > len(value["selector_frame"])
     ):
-        raise CollectionError("signer state has an invalid room selector")
+        raise CollectionError("signer metadata has an invalid room selector")
 
-    value.pop("rotation_cursor", None)
-    value["tracked_cap"] = tracked_cap
-    value.setdefault("cap_hit", False)
-    value.setdefault("census", None)
-    value.setdefault("collection_started", utc_now())
+    saturation = value.get("tracking_cap_saturation")
+    if saturation is not None:
+        if (
+            not isinstance(saturation, dict)
+            or set(saturation) != {"started_at", "released_at", "permanent_undercount"}
+            or not isinstance(saturation.get("started_at"), str)
+            or not isinstance(saturation.get("released_at"), str)
+            or saturation.get("permanent_undercount") is not True
+        ):
+            raise CollectionError("signer metadata has an invalid cap-saturation window")
+        try:
+            started_at = parse_timestamp(saturation["started_at"])
+            released_at = parse_timestamp(saturation["released_at"])
+        except ValueError as error:
+            raise CollectionError("signer metadata has an invalid cap-saturation timestamp") from error
+        if released_at < started_at:
+            raise CollectionError("signer metadata cap release precedes saturation")
+
+    return value
+
+
+def write_signer_metadata(
+    connection: sqlite3.Connection,
+    state: dict[str, Any],
+) -> None:
+    validate_signer_metadata(state)
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    connection.execute(
+        """
+        INSERT INTO signer_metadata (singleton, state_json)
+        VALUES (1, ?)
+        ON CONFLICT(singleton) DO UPDATE SET state_json = excluded.state_json
+        """,
+        (payload,),
+    )
+
+
+def load_signer_state(
+    path: Path,
+    tracked_cap: int,
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT state_json FROM signer_metadata WHERE singleton = 1"
+    ).fetchone()
+    if row is None:
+        if path.exists():
+            raise CollectionError(
+                "signer metadata exists without a migrated SQLite store; "
+                "run migrate_signers.py while both writers are stopped"
+            )
+        value = new_signer_state(tracked_cap)
+        write_signer_metadata(connection, value)
+        return value
+
+    try:
+        value = json.loads(row[0])
+    except json.JSONDecodeError as error:
+        raise CollectionError("signer database contains invalid metadata JSON") from error
+    validate_signer_metadata(value)
+
+    disk_value: Any = None
+    if path.exists():
+        try:
+            disk_value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            disk_value = None
+    if disk_value != value:
+        save_atomic_json(path, value)
     return value
 
 
@@ -797,24 +877,12 @@ def room_sample_names(
     }
 
 
-def record_collection_date(record: dict[str, Any], date: str) -> None:
-    count = record["collection_utc_dates_count"]
-    if count == 0:
-        record["collection_first_utc_date"] = date
-        record["collection_last_utc_date"] = date
-        record["collection_utc_dates_count"] = 1
-    elif record["collection_last_utc_date"] != date:
-        record["collection_last_utc_date"] = date
-        record["collection_utc_dates_count"] = count + 1
-
-
 def update_signer_state(
+    connection: sqlite3.Connection,
     state: dict[str, Any],
     sampled_rooms: list[tuple[str, list[dict[str, Any]]]],
     tick_ts: str,
 ) -> None:
-    dids: dict[str, dict[str, Any]] = state["dids"]
-    tracked_cap = state["tracked_cap"]
     observed_this_tick: dict[str, dict[str, Any]] = {}
     collection_date = parse_timestamp(tick_ts).date().isoformat()
 
@@ -864,67 +932,186 @@ def update_signer_state(
             observation["counterparty"] = observation["counterparty"] or did in counterparties
 
     for did, observation in observed_this_tick.items():
-        record = dids.get(did)
-        if record is None:
-            if len(dids) >= tracked_cap:
-                state["cap_hit"] = True
-                continue
-            record = {
-                "first_observed_ts": tick_ts,
-                "last_observed_ts": tick_ts,
-                "tick_count": 0,
-                "collection_first_utc_date": None,
-                "collection_last_utc_date": None,
-                "collection_utc_dates_count": 0,
-                "rooms": [],
-                "counterparties_count": 0,
-            }
-            dids[did] = record
+        row = connection.execute(
+            """
+            SELECT
+                first_observed_ts,
+                tick_count,
+                collection_first_utc_date,
+                collection_last_utc_date,
+                collection_utc_dates_count,
+                rooms_json,
+                has_counterparty
+            FROM signer_dids
+            WHERE did = ?
+            """,
+            (did,),
+        ).fetchone()
 
-        if record["first_observed_ts"] is None:
-            record["first_observed_ts"] = tick_ts
-        record["last_observed_ts"] = tick_ts
-        record["tick_count"] += 1
-        record_collection_date(record, collection_date)
-        rooms = set(record.get("rooms", []))
-        rooms.update(observation["rooms"])
-        record["rooms"] = sorted(rooms)[:8]
-        if observation["counterparty"]:
-            record["counterparties_count"] = 1
+        if row is None:
+            rooms = sorted(observation["rooms"])[:8]
+            connection.execute(
+                """
+                INSERT INTO signer_dids (
+                    did,
+                    first_observed_ts,
+                    last_observed_ts,
+                    tick_count,
+                    collection_first_utc_date,
+                    collection_last_utc_date,
+                    collection_utc_dates_count,
+                    rooms_json,
+                    room_count,
+                    has_counterparty
+                )
+                VALUES (?, ?, ?, 1, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    did,
+                    tick_ts,
+                    tick_ts,
+                    collection_date,
+                    collection_date,
+                    json.dumps(rooms, ensure_ascii=False, separators=(",", ":")),
+                    len(rooms),
+                    int(observation["counterparty"]),
+                ),
+            )
+            continue
+
+        (
+            first_observed_ts,
+            tick_count,
+            collection_first_utc_date,
+            collection_last_utc_date,
+            collection_utc_dates_count,
+            rooms_json,
+            has_counterparty,
+        ) = row
+        try:
+            rooms = json.loads(rooms_json)
+        except json.JSONDecodeError as error:
+            raise CollectionError(f"signer database has invalid rooms for DID {did}") from error
+        if not isinstance(rooms, list) or not all(isinstance(room, str) for room in rooms):
+            raise CollectionError(f"signer database has invalid rooms for DID {did}")
+
+        if collection_utc_dates_count == 0:
+            collection_first_utc_date = collection_date
+            collection_last_utc_date = collection_date
+            collection_utc_dates_count = 1
+        elif collection_last_utc_date != collection_date:
+            collection_last_utc_date = collection_date
+            collection_utc_dates_count += 1
+
+        rooms = sorted(set(rooms).union(observation["rooms"]))[:8]
+        connection.execute(
+            """
+            UPDATE signer_dids
+            SET
+                first_observed_ts = ?,
+                last_observed_ts = ?,
+                tick_count = ?,
+                collection_first_utc_date = ?,
+                collection_last_utc_date = ?,
+                collection_utc_dates_count = ?,
+                rooms_json = ?,
+                room_count = ?,
+                has_counterparty = ?
+            WHERE did = ?
+            """,
+            (
+                first_observed_ts or tick_ts,
+                tick_ts,
+                tick_count + 1,
+                collection_first_utc_date,
+                collection_last_utc_date,
+                collection_utc_dates_count,
+                json.dumps(rooms, ensure_ascii=False, separators=(",", ":")),
+                len(rooms),
+                int(bool(has_counterparty) or observation["counterparty"]),
+                did,
+            ),
+        )
 
     state["last_updated"] = tick_ts
 
 
+def signer_funnel_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    row = connection.execute(
+        """
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(tick_count >= 2), 0),
+            COALESCE(SUM(
+                tick_count >= 2
+                AND collection_utc_dates_count >= 2
+            ), 0),
+            COALESCE(SUM(
+                tick_count >= 2
+                AND collection_utc_dates_count >= 2
+                AND room_count >= 2
+            ), 0),
+            COALESCE(SUM(
+                tick_count >= 2
+                AND collection_utc_dates_count >= 2
+                AND room_count >= 2
+                AND has_counterparty = 1
+            ), 0)
+        FROM signer_dids
+        """
+    ).fetchone()
+    return {
+        "observed": int(row[0]),
+        "two_ticks": int(row[1]),
+        "two_collection_dates": int(row[2]),
+        "two_rooms": int(row[3]),
+        "counterparties": int(row[4]),
+    }
+
+
+def tracking_disclosure(state: dict[str, Any]) -> dict[str, str] | None:
+    saturation = state.get("tracking_cap_saturation")
+    if saturation is None:
+        return None
+
+    started_at = saturation["started_at"]
+    released_at = saturation["released_at"]
+    return {
+        "warning": (
+            f"The tracked-DID cap was saturated from {started_at} to {released_at}. "
+            "DIDs first appearing during that interval were not recorded, so the undercount "
+            "is permanent; a DID active then but first re-observed afterward has a "
+            "first-observed timestamp no earlier than that later observation."
+        ),
+        "methodology": (
+            "Observed DIDs are now stored in SQLite without an insertion cap. tracked_cap and "
+            "cap_hit report the retired JSON-store limit and its historical saturation; they "
+            "no longer gate DID insertion."
+        ),
+    }
+
+
 def aggregate_funnel(
+    connection: sqlite3.Connection,
     state: dict[str, Any],
     sampled_rooms: int,
     known_rooms: int,
 ) -> dict[str, Any]:
-    dids = state["dids"]
+    counts = signer_funnel_counts(connection)
     census = state.get("census")
-    observed = len(dids)
-    survivors = [record for record in dids.values() if record["tick_count"] >= 2]
-    two_ticks = len(survivors)
-    survivors = [record for record in survivors if record["collection_utc_dates_count"] >= 2]
-    two_collection_dates = len(survivors)
-    survivors = [record for record in survivors if len(record["rooms"]) >= 2]
-    two_rooms = len(survivors)
-    survivors = [record for record in survivors if record["counterparties_count"] >= 1]
-    counterparties = len(survivors)
-
-    return {
+    funnel = {
         "well_formed_did_notes": census["total"] if census else None,
         "census_completed_at": census["completed_at"] if census else None,
-        "dids_observed_signing": observed,
-        "seen_two_ticks": two_ticks,
-        "two_collection_utc_dates": two_collection_dates,
-        "two_rooms": two_rooms,
-        "signed_counterparty": counterparties,
+        "dids_observed_signing": counts["observed"],
+        "seen_two_ticks": counts["two_ticks"],
+        "two_collection_utc_dates": counts["two_collection_dates"],
+        "two_rooms": counts["two_rooms"],
+        "signed_counterparty": counts["counterparties"],
         "coverage": {
             "sampled_rooms": sampled_rooms,
             "known_rooms": known_rooms,
         },
-        "tracked_dids": observed,
+        "tracked_dids": counts["observed"],
         "tracked_cap": state["tracked_cap"],
         "cap_hit": bool(state["cap_hit"]),
         "collection_started": state["collection_started"],
@@ -932,6 +1119,10 @@ def aggregate_funnel(
         "persistence_reset_at": state["persistence_reset_at"],
         "persistence_collection_utc_dates_count": state["persistence_collection_utc_dates_count"],
     }
+    disclosure = tracking_disclosure(state)
+    if disclosure is not None:
+        funnel["tracking_disclosure"] = disclosure
+    return funnel
 
 
 def collect_tick(
@@ -947,44 +1138,65 @@ def collect_tick(
     # exclusive lock: an unlocked cycle here let the daemon clobber a census
     # result the cron invocation had just recorded.
     with exclusive_state_lock(signer_state_path, lock_timeout):
-        state = load_signer_state(signer_state_path, signer_cap)
-        names, room_sampling = room_sample_names(rooms["newest_rooms"], state)
+        database_path = signer_database_path(signer_state_path)
+        if signer_state_path.exists() and not database_path.exists():
+            raise CollectionError(
+                "signer metadata exists without its SQLite store; run migrate_signers.py"
+            )
 
-        sampled: list[tuple[str, list[dict[str, Any]]]] = []
-        lobby_body: str | None = None
-        for name in names:
-            sample_result = {"id": room_identifier(name), "success": False}
-            room_sampling["sampled"].append(sample_result)
-            path = f"/r/{urllib.parse.quote(name, safe='')}?format=json&limit=200"
-            try:
-                body = client.get(path)
-                messages = parse_room_messages(body, path)
-            except CollectionError:
+        connection = connect_signer_database(database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            state = load_signer_state(signer_state_path, signer_cap, connection)
+            names, room_sampling = room_sample_names(rooms["newest_rooms"], state)
+
+            sampled: list[tuple[str, list[dict[str, Any]]]] = []
+            lobby_body: str | None = None
+            for name in names:
+                sample_result = {"id": room_identifier(name), "success": False}
+                room_sampling["sampled"].append(sample_result)
+                path = f"/r/{urllib.parse.quote(name, safe='')}?format=json&limit=200"
+                try:
+                    body = client.get(path)
+                    messages = parse_room_messages(body, path)
+                except CollectionError:
+                    if name == "lobby":
+                        raise
+                    continue
+                sample_result["success"] = True
+                sampled.append((name, messages))
                 if name == "lobby":
-                    raise
-                continue
-            sample_result["success"] = True
-            sampled.append((name, messages))
-            if name == "lobby":
-                lobby_body = body
+                    lobby_body = body
 
-        if lobby_body is None:
-            raise CollectionError("lobby was not sampled")
+            if lobby_body is None:
+                raise CollectionError("lobby was not sampled")
 
-        events_last_seq, events, class_counts, primary_counts = parse_events(
-            client.get("/r/events?format=json&limit=200")
-        )
-        tick_ts = utc_now()
-        if identity_total is not None:
-            state["census"] = {
-                "total": identity_total,
-                "completed_at": tick_ts,
-                "started_at": census_started,
-            }
+            events_last_seq, events, class_counts, primary_counts = parse_events(
+                client.get("/r/events?format=json&limit=200")
+            )
+            tick_ts = utc_now()
+            if identity_total is not None:
+                state["census"] = {
+                    "total": identity_total,
+                    "completed_at": tick_ts,
+                    "started_at": census_started,
+                }
 
-        update_signer_state(state, sampled, tick_ts)
-        funnel = aggregate_funnel(state, len(sampled), rooms["rooms_total"])
-        save_atomic_json(signer_state_path, state)
+            update_signer_state(connection, state, sampled, tick_ts)
+            funnel = aggregate_funnel(
+                connection,
+                state,
+                len(sampled),
+                rooms["rooms_total"],
+            )
+            write_signer_metadata(connection, state)
+            connection.commit()
+            save_atomic_json(signer_state_path, state)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     return {
         "collector_version": COLLECTOR_VERSION,

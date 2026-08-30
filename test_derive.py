@@ -28,8 +28,9 @@ def funnel(
     persistence_reset_at=None,
     cap_hit=False,
     census_completed_at="2026-08-28T07:59:00Z",
+    tracking_disclosure=None,
 ):
-    return {
+    value = {
         "well_formed_did_notes": census,
         "census_completed_at": (census_completed_at if census is not None else None),
         "dids_observed_signing": observed,
@@ -46,6 +47,9 @@ def funnel(
         "cap_hit": cap_hit,
         "collection_started": "2026-08-28T08:00:00Z",
     }
+    if tracking_disclosure is not None:
+        value["tracking_disclosure"] = tracking_disclosure
+    return value
 
 
 def legacy_funnel(**overrides):
@@ -54,6 +58,20 @@ def legacy_funnel(**overrides):
     value.pop("persistence_started_at")
     value.pop("persistence_reset_at")
     value.pop("persistence_collection_utc_dates_count")
+    return value
+
+
+def saturation_disclosure():
+    value = collect.tracking_disclosure(
+        {
+            "tracking_cap_saturation": {
+                "started_at": "2026-08-29T18:00:15Z",
+                "released_at": "2026-08-30T09:32:47Z",
+                "permanent_undercount": True,
+            }
+        }
+    )
+    assert value is not None
     return value
 
 
@@ -223,10 +241,10 @@ def embedded_data(source):
     return json.loads(match.group(1))
 
 
-def test_methodology_version_is_bumped_for_room_sampling_change():
+def test_methodology_version_is_bumped_for_tracking_disclosure():
     result = derive_records([])
-    assert derive.METHODOLOGY_VERSION == "1.4.0"
-    assert result["methodology_version"] == "1.4.0"
+    assert derive.METHODOLOGY_VERSION == "1.5.0"
+    assert result["methodology_version"] == "1.5.0"
     assert (
         "since collector 2.2.0 a sender without a nonce is never counted"
         in result["methodology"]["signer_funnel"]
@@ -929,6 +947,201 @@ def test_observed_signers_may_exceed_the_census():
     value = funnel(census=50, observed=100)
     validated = validate_tick(tick("2026-08-28T08:00:00Z", signer_funnel=value))
     assert validated["signer_funnel"]["dids_observed_signing"] == 100
+
+
+def test_retired_tracking_cap_accepts_count_above_cap_and_legacy_cap_still_gates():
+    disclosed = funnel(
+        observed=201_365,
+        two_ticks=127_177,
+        two_collection_dates=65_515,
+        two_rooms=47_409,
+        counterparties=47_306,
+        cap_hit=True,
+        tracking_disclosure=saturation_disclosure(),
+    )
+    validated = validate_tick(
+        tick("2026-08-30T10:00:00Z", signer_funnel=disclosed)
+    )
+    assert validated["signer_funnel"]["tracked_dids"] == 201_365
+    assert validated["signer_funnel"]["tracking_disclosure"] == saturation_disclosure()
+
+    legacy = deepcopy(disclosed)
+    legacy.pop("tracking_disclosure")
+    with pytest.raises(ValueError, match="tracked DID count exceeds its cap"):
+        validate_tick(tick("2026-08-30T10:00:00Z", signer_funnel=legacy))
+
+    malformed = deepcopy(disclosed)
+    malformed["tracking_disclosure"] = {"warning": "incomplete"}
+    with pytest.raises(ValueError, match="complete disclosure object"):
+        validate_tick(tick("2026-08-30T10:00:00Z", signer_funnel=malformed))
+
+
+def test_tracking_disclosure_reaches_shared_warning_and_methodology(tmp_path):
+    disclosure = saturation_disclosure()
+    result = derive_records(
+        [
+            tick(
+                "2026-08-30T10:00:00Z",
+                signer_funnel=funnel(
+                    observed=201_365,
+                    two_ticks=127_177,
+                    two_collection_dates=65_515,
+                    two_rooms=47_409,
+                    counterparties=47_306,
+                    cap_hit=True,
+                    tracking_disclosure=disclosure,
+                ),
+            )
+        ]
+    )
+    point = result["points"][0]
+    display = point["signer_funnel"]["display"]
+    values = ssr_values(result)
+
+    assert display["warning"].endswith(disclosure["warning"])
+    assert values["funnel-warning"] == display["warning"]
+    assert result["methodology"]["signer_funnel"].endswith(disclosure["methodology"])
+    assert "admissions stopped" not in values["funnel-observed-context"]
+    assert "new observed DIDs are no longer added" not in values["funnel-warning"]
+    assert values["tracked-dids"] == (
+        "201,365 tracked DIDs · retired JSON-store cap 200,000 "
+        "(no longer gates insertion)"
+    )
+
+    path = tmp_path / "index.html"
+    path.write_text(html_template(), encoding="utf-8")
+    inject_html(path, result)
+    source = path.read_text(encoding="utf-8")
+    embedded = embedded_data(source)
+    assert rendered_ssr(source, "funnel-warning") == (
+        embedded["points"][0]["signer_funnel"]["display"]["warning"]
+    )
+    assert embedded["methodology"]["signer_funnel"].endswith(
+        disclosure["methodology"]
+    )
+
+    legacy = derive_records(
+        [tick("2026-08-30T10:00:00Z", signer_funnel=funnel())]
+    )
+    legacy_warning = legacy["points"][0]["signer_funnel"]["display"]["warning"]
+    assert legacy_warning == (
+        "The sampling frame is the newest rooms, so this funnel is biased "
+        "toward new and short-lived rooms."
+    )
+    assert disclosure["warning"] not in legacy_warning
+    assert disclosure["methodology"] not in legacy["methodology"]["signer_funnel"]
+
+
+def test_collector_assembled_current_and_legacy_ticks_validate(
+    tmp_path, monkeypatch
+):
+    tick_ts = "2026-08-30T10:00:00Z"
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+    signer_state_path = tmp_path / "signers.json"
+    database_path = collect.signer_database_path(signer_state_path)
+
+    connection = collect.connect_signer_database(database_path)
+    try:
+        state = collect.new_signer_state(1)
+        state["cap_hit"] = True
+        state["tracking_cap_saturation"] = {
+            "started_at": "2026-08-29T18:00:15Z",
+            "released_at": "2026-08-30T09:32:47Z",
+            "permanent_undercount": True,
+        }
+        first_messages = collect.parse_room_messages(
+            json.dumps(
+                {
+                    "messages": [
+                        {
+                            "seq": 1,
+                            "ts": tick_ts,
+                            "from": f"did:key:z6Mk{'1' * 20}",
+                            "nonce": "1",
+                        }
+                    ]
+                }
+            ),
+            "/r/lobby",
+        )
+        collect.update_signer_state(
+            connection,
+            state,
+            [("lobby", first_messages)],
+            tick_ts,
+        )
+        collect.write_signer_metadata(connection, state)
+        connection.commit()
+    finally:
+        connection.close()
+
+    responses = {
+        "/rooms?format=json&limit=200": json.dumps(
+            {
+                "total": 1,
+                "capacity": 40_960,
+                "bytes": 1_000,
+                "notes": {
+                    "total": 1,
+                    "capacity": 1_310_720,
+                    "bytes": 1_000,
+                },
+                "rooms": [],
+            }
+        ),
+        "/r/lobby?format=json&limit=200": json.dumps(
+            {
+                "messages": [
+                    {
+                        "seq": 2,
+                        "ts": tick_ts,
+                        "from": f"did:key:z6Mk{'2' * 20}",
+                        "nonce": "2",
+                    }
+                ]
+            }
+        ),
+        "/r/events?format=json&limit=200": json.dumps(
+            {
+                "messages": [
+                    {
+                        "seq": 1,
+                        "ts": tick_ts,
+                        "from": "server",
+                        "text": "created baseline",
+                    }
+                ]
+            }
+        ),
+    }
+
+    class StubClient:
+        def get(self, path):
+            return responses[path]
+
+    record = collect.collect_tick(StubClient(), signer_state_path, signer_cap=1)
+    assert record["signer_funnel"]["tracked_dids"] == 2
+    assert record["signer_funnel"]["tracked_cap"] == 1
+    assert record["signer_funnel"]["tracking_disclosure"] == (
+        collect.tracking_disclosure(state)
+    )
+    validated = validate_tick(record)
+    assert validated["signer_funnel"]["tracked_dids"] == 2
+
+    legacy = deepcopy(record)
+    legacy.pop("collector_version")
+    legacy_funnel_value = legacy["signer_funnel"]
+    legacy_funnel_value.pop("tracking_disclosure")
+    legacy_funnel_value["dids_observed_signing"] = 1
+    legacy_funnel_value["tracked_dids"] = 1
+    legacy_validated = validate_tick(legacy)
+    assert legacy_validated["collector_version"] == "legacy"
+    assert legacy_validated["signer_funnel"]["tracked_dids"] == 1
+
+    legacy_over_cap = deepcopy(legacy)
+    legacy_over_cap["signer_funnel"]["tracked_dids"] = 2
+    with pytest.raises(ValueError, match="tracked DID count exceeds its cap"):
+        validate_tick(legacy_over_cap)
 
 
 def test_service_derived_strings_survive_injection_escaped(tmp_path):

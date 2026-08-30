@@ -28,7 +28,7 @@ UUID_LIKE_RE = re.compile(
 )
 MIXED_TOKEN_RE = re.compile(r"^[a-z0-9]{12,}$", re.IGNORECASE)
 TRAILING_WINDOW_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.4.0"
+METHODOLOGY_VERSION = "1.5.0"
 ROOM_SAMPLING_STRUCTURAL_CEILING = 200
 # A fixed ten-minute honesty threshold. At the measured post-deploy cadence of
 # about 258 seconds per tick, this is about 2.3 collector intervals. The rebuild
@@ -83,6 +83,21 @@ def version_string(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > 64:
         raise ValueError(f"{field} is not a valid version")
     return value
+
+
+def validate_tracking_disclosure(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"warning", "methodology"}:
+        raise ValueError("tracking_disclosure is not a complete disclosure object")
+
+    result: dict[str, str] = {}
+    for field in ("warning", "methodology"):
+        text = value[field]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"tracking_disclosure.{field} is not valid text")
+        result[field] = text
+    return result
 
 
 def validate_room_sampling(value: Any) -> dict[str, Any] | None:
@@ -301,9 +316,15 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
 
     result["legacy_persistence_reset"] = legacy_persistence
     result["sustained_reciprocal_footprint"] = result["signed_counterparty"]
+    result["tracking_disclosure"] = validate_tracking_disclosure(
+        value.get("tracking_disclosure")
+    )
     result["tracked_dids"] = integer(value.get("tracked_dids"), "tracked_dids")
     result["tracked_cap"] = integer(value.get("tracked_cap"), "tracked_cap", 1)
-    if result["tracked_dids"] > result["tracked_cap"]:
+    if (
+        result["tracking_disclosure"] is None
+        and result["tracked_dids"] > result["tracked_cap"]
+    ):
         raise ValueError("tracked DID count exceeds its cap")
     if not isinstance(value.get("cap_hit"), bool):
         raise ValueError("signer funnel cap_hit is not boolean")
@@ -611,6 +632,8 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     two_dates = funnel["two_collection_utc_dates"]
     sustained = funnel["sustained_reciprocal_footprint"]
     date_count = funnel["persistence_collection_utc_dates_count"]
+    tracking_disclosure = funnel["tracking_disclosure"]
+    cap_gates = tracking_disclosure is None
 
     # Bars are proportions of the observed-signing cohort, the population the
     # later stages actually filter. The census is a separate population that
@@ -633,9 +656,9 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     observed_context = (
         f"{format_int(observed)} distinct did:key signers observed in sampled rooms · "
     )
-    if funnel["cap_hit"]:
-        # Adjacent disclosure: once the tracking cap is reached the figure is
-        # the cap, not a live count, and must not imply it is still rising.
+    if funnel["cap_hit"] and cap_gates:
+        # Adjacent disclosure: while the tracking cap gates insertion the
+        # figure is the cap, not a live count, and must not imply it is rising.
         observed_context += (
             f"pinned at the {format_int(funnel['tracked_cap'])}-DID tracking-state cap — "
             "admissions stopped when the cap was reached, so signers observed since "
@@ -645,7 +668,9 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
         "a lower bound on signers, since sampling covers a fraction of rooms · "
         "a separate population from the census: neither contains the other"
     )
-    cohort_suffix = " (pinned at the tracking cap)" if funnel["cap_hit"] else ""
+    cohort_suffix = (
+        " (pinned at the tracking cap)" if funnel["cap_hit"] and cap_gates else ""
+    )
     two_ticks_context = (
         f"{format_percent(two_ticks / observed)} of {format_int(observed)} "
         f"in the captured observed-signing cohort{cohort_suffix}"
@@ -687,11 +712,13 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
         )
         if funnel["persistence_reset_at"]:
             warning += f" Persistence restarted at {funnel['persistence_reset_at']}."
-    if funnel["cap_hit"]:
+    if funnel["cap_hit"] and cap_gates:
         warning += (
             f" The {format_int(funnel['tracked_cap'])}-DID state cap has been "
             "reached; new observed DIDs are no longer added."
         )
+    if tracking_disclosure is not None:
+        warning += f" {tracking_disclosure['warning']}"
 
     coverage = funnel["coverage"]
     if coverage["frame_size"] is not None:
@@ -749,9 +776,17 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
         "warning": warning,
         "coverage_text": coverage_text,
         "tracked_text": (
-            f"{format_int(funnel['tracked_dids'])} / {format_int(funnel['tracked_cap'])} "
-            f"tracked DIDs ({format_percent(funnel['tracked_dids'] / funnel['tracked_cap'])} "
-            "of the state cap used)"
+            (
+                f"{format_int(funnel['tracked_dids'])} tracked DIDs · retired JSON-store "
+                f"cap {format_int(funnel['tracked_cap'])} (no longer gates insertion)"
+            )
+            if tracking_disclosure is not None
+            else (
+                f"{format_int(funnel['tracked_dids'])} / "
+                f"{format_int(funnel['tracked_cap'])} tracked DIDs "
+                f"({format_percent(funnel['tracked_dids'] / funnel['tracked_cap'])} "
+                "of the state cap used)"
+            )
         ),
     }
 
@@ -1038,6 +1073,13 @@ def derive_records(
             "rejected_ticks": rejected_ticks,
             "methodology": methodology,
         }
+
+    for tick in reversed(ticks):
+        funnel = tick["signer_funnel"]
+        disclosure = funnel["tracking_disclosure"] if funnel is not None else None
+        if disclosure is not None:
+            methodology["signer_funnel"] += f" {disclosure['methodology']}"
+            break
 
     points: list[dict[str, Any]] = []
     gaps: list[dict[str, Any]] = []

@@ -11,3 +11,6 @@ ticks-sample.jsonl
 ticks.jsonl
 data.json
 signers.json
+signers.sqlite3
+signers.sqlite3-wal
+signers.sqlite3-shm
