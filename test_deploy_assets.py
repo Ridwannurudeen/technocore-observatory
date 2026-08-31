@@ -241,6 +241,20 @@ def test_nginx_errors_are_no_store_while_static_api_successes_are_cacheable():
         "(?:status|incidents|changes|methodology)(?:\\?|$) "
         '"public, max-age=60, stale-if-error=300";' in cache_map
     )
+    alias_rule = next(
+        line.strip()
+        for line in cache_map.splitlines()
+        if "/(?:status|methodology)\\." in line
+    )
+    alias_pattern, alias_policy = alias_rule.split(maxsplit=1)
+    assert alias_policy == '"public, max-age=60, stale-if-error=300";'
+    for status in (200, 206, 304):
+        for resource in ("status", "methodology"):
+            for suffix in ("txt", "json"):
+                assert re.fullmatch(
+                    alias_pattern.removeprefix("~"),
+                    f"{status}:1:/api/v1/{resource}.{suffix}",
+                )
     assert (
         vhost.count("add_header Cache-Control $observatory_cache_control always;") == 2
     )
