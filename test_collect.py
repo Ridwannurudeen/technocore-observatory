@@ -3386,6 +3386,80 @@ def test_observing_a_did_twice_updates_one_row(signer_store):
     ).fetchone() == (1, 2)
 
 
+def test_signer_update_backfills_missing_legacy_observation_timestamps(signer_store):
+    suffix = DID.removeprefix("did:key:z6Mk")
+    insert_record(signer_store, suffix, 7, 2, ["room-a"], 1)
+    signer_store.execute(
+        "UPDATE signer_dids SET "
+        "first_observed_ts = NULL, last_observed_ts = NULL, "
+        "collection_first_utc_date = NULL, collection_last_utc_date = NULL, "
+        "collection_utc_dates_count = 0 "
+        "WHERE did = ?",
+        (suffix,),
+    )
+    messages = parse_room_messages(
+        room_body(message(1, DID, nonce="1")),
+        "/r/test",
+    )
+
+    update_signer_state(
+        signer_store,
+        new_signer_state(1),
+        [("room-a", messages)],
+        "2026-08-30T08:00:00Z",
+    )
+
+    assert signer_store.execute(
+        "SELECT first_observed_ts, last_observed_ts, tick_count, "
+        "collection_first_utc_date, collection_last_utc_date, "
+        "collection_utc_dates_count, rooms_json, has_counterparty "
+        "FROM signer_dids WHERE did = ?",
+        (suffix,),
+    ).fetchone() == (
+        "2026-08-30T08:00:00Z",
+        "2026-08-30T08:00:00Z",
+        8,
+        "2026-08-30",
+        "2026-08-30",
+        1,
+        '["room-a"]',
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_observed_ts", "last_observed_ts"),
+    (
+        (None, "2026-08-29T08:00:00Z"),
+        ("2026-08-28T08:00:00Z", None),
+    ),
+)
+def test_signer_update_rejects_a_partial_observation_timestamp_pair(
+    signer_store,
+    first_observed_ts,
+    last_observed_ts,
+):
+    suffix = DID.removeprefix("did:key:z6Mk")
+    insert_record(signer_store, suffix, 3, 2, ["room-a"], 0)
+    signer_store.execute(
+        "UPDATE signer_dids SET first_observed_ts = ?, last_observed_ts = ? "
+        "WHERE did = ?",
+        (first_observed_ts, last_observed_ts, suffix),
+    )
+    messages = parse_room_messages(
+        room_body(message(1, DID, nonce="1")),
+        "/r/test",
+    )
+
+    with pytest.raises(CollectionError, match="inconsistent observation timestamps"):
+        update_signer_state(
+            signer_store,
+            new_signer_state(1),
+            [("room-a", messages)],
+            "2026-08-30T08:00:00Z",
+        )
+
+
 def test_signer_update_rejects_a_tick_before_the_last_observation(signer_store):
     messages = parse_room_messages(room_body(message(1, DID, nonce="1")), "/r/test")
     state = new_signer_state(1)
@@ -3547,12 +3621,12 @@ def test_v2_migration_preserves_all_funnel_counts(tmp_path):
     state.pop("latest_room_listing_observed_at")
     state["dids"] = {
         "one": {
-            "first_observed_ts": "2026-08-28T08:00:00Z",
-            "last_observed_ts": "2026-08-28T08:00:00Z",
+            "first_observed_ts": None,
+            "last_observed_ts": None,
             "tick_count": 1,
-            "collection_first_utc_date": "2026-08-28",
-            "collection_last_utc_date": "2026-08-28",
-            "collection_utc_dates_count": 1,
+            "collection_first_utc_date": None,
+            "collection_last_utc_date": None,
+            "collection_utc_dates_count": 0,
             "rooms": ["a"],
             "counterparties_count": 0,
         },
@@ -3620,6 +3694,15 @@ def test_v2_migration_preserves_all_funnel_counts(tmp_path):
     assert migrated_metadata["selector_seed"] == state["selector_seed"]
     assert migrated_metadata["selector_epoch"] == state["selector_epoch"]
     assert migrated_metadata["latest_room_listing_observed_at"] is None
+    migrated = sqlite3.connect(collect.signer_database_path(metadata))
+    try:
+        assert migrated.execute(
+            "SELECT first_observed_ts, last_observed_ts, tick_count, "
+            "collection_first_utc_date, collection_last_utc_date, "
+            "collection_utc_dates_count FROM signer_dids WHERE did = 'one'"
+        ).fetchone() == (None, None, 1, None, None, 0)
+    finally:
+        migrated.close()
 
 
 @pytest.mark.parametrize(

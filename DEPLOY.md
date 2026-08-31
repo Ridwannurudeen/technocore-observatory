@@ -344,7 +344,7 @@ nginx -t
 Then establish data before consumers:
 
 1. Run `systemctl start technocore-observatory-pulse.service` once so telemetry schema/data exist.
-2. Start `technocore-observatory.service`, wait for one accepted tick, and verify collector 2.11.0,
+2. Start `technocore-observatory.service`, wait for one accepted tick, and verify collector 2.11.1,
    signer-state/SQLite schema 6, and telemetry schema 1 in local state. This upgrades an existing
    v3-v5 SQLite store before any schema-v6-only reader starts.
 3. Run `systemctl start technocore-observatory-rebuild.service`. It must create a new

@@ -305,7 +305,7 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     assert "--database /home/technocore/observatory/signers.sqlite3" in query
     assert "--snapshot-root /opt/technocore-observatory/current" in query
     assert "--host 127.0.0.1" in query
-    assert "--collector-version 2.11.0" in query
+    assert "--collector-version 2.11.1" in query
     assert "--methodology-version 1.13.0" in query
     assert "ProtectSystem=strict" in query
     assert "ProtectHome=read-only" in query

@@ -85,7 +85,7 @@ ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
 CENSUS_MAX_PASSES = 5
 CENSUS_DEADLINE_SECONDS = 30 * 60
 CENSUS_STATE_VERSION = 2
-COLLECTOR_VERSION = "2.11.0"
+COLLECTOR_VERSION = "2.11.1"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
 SIGNER_STATE_VERSION = 6
@@ -5603,7 +5603,7 @@ def update_signer_state(
                 tick_count == 0
                 and (first_observed is not None or last_observed is not None)
             )
-            or (tick_count > 0 and (first_observed is None or last_observed is None))
+            or ((first_observed is None) != (last_observed is None))
             or (
                 first_observed is not None
                 and last_observed is not None
