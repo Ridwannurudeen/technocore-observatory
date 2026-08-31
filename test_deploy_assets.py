@@ -943,6 +943,9 @@ def test_fallback_contracts_are_bounded_credential_free_and_non_indexable():
 def test_static_release_guard_requires_every_generated_route_artifact():
     assert {
         "changes/index.html",
+        "favicon.ico",
+        "og.png",
+        "assets/favicon.svg",
         "api/v1/status",
         "api/v1/incidents",
         "api/v1/changes",

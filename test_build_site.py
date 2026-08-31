@@ -2,6 +2,7 @@ import json
 import os
 import re
 import stat
+import struct
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,9 @@ EXPECTED_FILES = {
     "openapi.json",
     ".well-known/agent.json",
     "robots.txt",
+    "favicon.ico",
+    "og.png",
+    "assets/favicon.svg",
     "assets/styles.css",
     "assets/site.js",
     "data.json",
@@ -119,7 +123,7 @@ def test_static_build_is_complete_versioned_and_contains_no_room_names(built_rel
         json.loads(encoded)
     for path in release.rglob("*"):
         if path.is_file():
-            assert hostile_name not in path.read_text(encoding="utf-8")
+            assert hostile_name.encode() not in path.read_bytes()
 
 
 def test_build_release_records_an_external_unpublished_sidecar(built_release):
@@ -240,7 +244,11 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     assert "2026-08-30T00:00:00Z" in home
     assert "2026-08-30T00:15:00Z" in home
     assert ">Fresh<" in home
-    assert not re.search(r'<(?:script|link)\b[^>]*(?:src|href)="https?://', home)
+    assert not re.search(r'<script\b[^>]*src="https?://', home)
+    assert not re.search(
+        r'<link\b[^>]*rel="(?:stylesheet|icon)"[^>]*href="https?://',
+        home,
+    )
 
     assert 'const themes = ["system", "light", "dark"];' in script
     assert "themeToggle.textContent = `THEME ${label.toUpperCase()}`;" in script
@@ -252,6 +260,113 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     assert ".textContent" in script
     assert "\u00e2" not in home + rooms + script
     assert "\u00c2" not in home + rooms + script
+
+
+def test_pages_publish_canonical_icon_and_generic_social_cards(built_release):
+    release, hostile_name = built_release
+    routes = {
+        "index.html": "/",
+        "status/index.html": "/status/",
+        "rooms/index.html": "/rooms/",
+        "incidents/index.html": "/incidents/",
+        "changes/index.html": "/changes/",
+        "observatory/index.html": "/observatory/",
+        "methodology/index.html": "/methodology/",
+        "about/index.html": "/about/",
+    }
+    icon_markers = (
+        '<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48 64x64">',
+        '<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" sizes="any">',
+    )
+    image_url = f"{build_site.PUBLIC_BASE_URL}/og.png"
+
+    for relative, route in routes.items():
+        source = (release / relative).read_text(encoding="utf-8")
+        head = source.split("</head>", 1)[0]
+
+        for marker in icon_markers:
+            assert head.count(marker) == 1, relative
+        assert (
+            head.count(
+                f'<link rel="canonical" href="{build_site.PUBLIC_BASE_URL}{route}">'
+            )
+            == 1
+        )
+        assert head.count(f'<meta property="og:image" content="{image_url}">') == 1
+        # X falls back to og:image, so twitter:image would only duplicate the
+        # single %%OG_IMAGE_URL%% marker that replace_marker requires to be unique.
+        assert '<meta name="twitter:image"' not in head
+        assert (
+            head.count('<meta name="twitter:card" content="summary_large_image">') == 1
+        )
+
+        social = "\n".join(
+            line
+            for line in head.splitlines()
+            if 'property="og:' in line or 'name="twitter:' in line
+        )
+        assert hostile_name not in social
+        assert not re.search(r"\b20\d{2}-\d{2}-\d{2}T", social)
+
+    rooms = (release / "rooms/index.html").read_text(encoding="utf-8")
+    assert '<meta name="robots" content="noindex,nofollow,noarchive">' in rooms
+
+    shared_head = (
+        (release / "status/index.html")
+        .read_text(encoding="utf-8")
+        .split("</head>", 1)[0]
+    )
+    observatory_head = (
+        (release / "observatory/index.html")
+        .read_text(encoding="utf-8")
+        .split("</head>", 1)[0]
+    )
+    for marker in (
+        *icon_markers,
+        f'<meta property="og:image" content="{image_url}">',
+        '<meta name="twitter:card" content="summary_large_image">',
+    ):
+        assert marker in shared_head
+        assert marker in observatory_head
+
+
+def test_brand_assets_are_static_valid_and_generic(built_release):
+    release, hostile_name = built_release
+    favicon_svg = Path("site/assets/favicon.svg").read_bytes()
+    favicon_ico = Path("site/assets/favicon.ico").read_bytes()
+    share_png = Path("site/assets/og.png").read_bytes()
+    share_svg = Path("site/assets/og.svg").read_text(encoding="utf-8")
+
+    assert (release / "assets/favicon.svg").read_bytes() == favicon_svg
+    assert (release / "favicon.ico").read_bytes() == favicon_ico
+    assert (release / "og.png").read_bytes() == share_png
+    assert favicon_ico[:6] == b"\x00\x00\x01\x00\x04\x00"
+    assert share_png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert struct.unpack(">II", share_png[16:24]) == (1200, 630)
+    assert hostile_name.encode() not in favicon_ico + share_png
+    assert hostile_name not in share_svg
+    assert "%%" not in share_svg
+    assert "<text" not in share_svg
+    assert set(re.findall(r'fill="([^"]+)"', share_svg)) == {
+        "#0B0E0C",
+        "#F4F1E8",
+        "#63D286",
+    }
+
+
+def test_site_index_links_have_the_shared_explicit_focus_treatment():
+    expected = """.site-index nav a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}"""
+
+    for path in (Path("site/assets/styles.css"), Path("index.html")):
+        source = path.read_text(encoding="utf-8")
+        assert expected in source
+        assert ':root[data-theme="light"]' in source
+        assert ':root[data-theme="dark"]' in source
+        assert "--accent: #176B3A;" in source
+        assert "--accent: #63D286;" in source
 
 
 def test_query_unavailable_fallback_uses_the_shared_shell():
@@ -739,6 +854,31 @@ def test_observatory_ssr_and_scripted_views_agree_value_for_value(built_release)
 def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
     sync_api = pytest.importorskip("playwright.sync_api")
     release, _ = built_release
+
+    def assert_index_focus(page):
+        summary = page.locator(".site-index summary")
+        summary.click()
+        page.keyboard.press("Tab")
+        focused = page.evaluate(
+            "() => {"
+            " const link = document.activeElement;"
+            " const panel = link.closest('.site-index nav');"
+            " const style = getComputedStyle(link);"
+            " return {"
+            "   target: link.matches('.site-index nav a'),"
+            "   outlineStyle: style.outlineStyle,"
+            "   outlineWidth: style.outlineWidth,"
+            "   outlineColor: style.outlineColor,"
+            "   panelColor: getComputedStyle(panel).backgroundColor"
+            " };"
+            "}"
+        )
+        assert focused["target"]
+        assert focused["outlineStyle"] == "solid"
+        assert focused["outlineWidth"] == "2px"
+        assert focused["outlineColor"] != focused["panelColor"]
+        summary.click()
+
     with sync_api.sync_playwright() as playwright:
         browser = None
         for channel in ("chrome", "msedge", None):
@@ -784,11 +924,13 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
                     assert toggle.get_attribute("aria-label") == "Theme: light"
                     assert toggle.get_attribute("data-theme-value") == "light"
                     assert page.locator("html").get_attribute("data-theme") == "light"
+                    assert_index_focus(page)
                     toggle.click()
                     assert toggle.text_content() == "THEME DARK"
                     assert toggle.get_attribute("aria-label") == "Theme: dark"
                     assert toggle.get_attribute("data-theme-value") == "dark"
                     assert page.locator("html").get_attribute("data-theme") == "dark"
+                    assert_index_focus(page)
                     toggle.click()
                     assert toggle.text_content() == "THEME AUTO"
                     assert toggle.get_attribute("aria-label") == "Theme: auto"
@@ -819,9 +961,11 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
                 toggle.click()
                 assert toggle.get_attribute("data-theme-value") == "light"
                 assert page.locator("html").get_attribute("data-theme") == "light"
+                assert_index_focus(page)
                 toggle.click()
                 assert toggle.get_attribute("data-theme-value") == "dark"
                 assert page.locator("html").get_attribute("data-theme") == "dark"
+                assert_index_focus(page)
 
                 # No playback control: the record does not animate itself.
                 assert page.locator("#play").count() == 0

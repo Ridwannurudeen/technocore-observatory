@@ -26,6 +26,18 @@ SITE_ROOT = Path(__file__).with_name("site")
 RELEASE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 UNPUBLISHED_PREFIX = ".unpublished-"
 TOKEN = re.compile(r"%%([A-Z][A-Z0-9_]*)%%")
+PUBLIC_BASE_URL = "https://technocore.gudman.xyz"
+SHARE_IMAGE_URL = f"{PUBLIC_BASE_URL}/og.png"
+PAGE_PATHS = {
+    "about": "/about/",
+    "changes": "/changes/",
+    "home": "/",
+    "incidents": "/incidents/",
+    "methodology": "/methodology/",
+    "observatory": "/observatory/",
+    "rooms": "/rooms/",
+    "status": "/status/",
+}
 
 
 def text(value: Any) -> str:
@@ -49,6 +61,12 @@ def substitute(template: str, values: dict[str, Any]) -> str:
     if missing:
         raise ValueError(f"template values missing: {', '.join(missing)}")
     return TOKEN.sub(lambda match: str(values[match.group(1)]), template)
+
+
+def replace_marker(source: str, marker: str, value: str) -> str:
+    if source.count(marker) != 1:
+        raise ValueError(f"template marker must occur exactly once: {marker}")
+    return source.replace(marker, value)
 
 
 def read_template(name: str) -> str:
@@ -242,6 +260,8 @@ def page(
             "TITLE": html.escape(title, quote=True),
             "DESCRIPTION": html.escape(description, quote=True),
             "ROBOTS": robots,
+            "CANONICAL_URL": f"{PUBLIC_BASE_URL}{PAGE_PATHS[name]}",
+            "OG_IMAGE_URL": SHARE_IMAGE_URL,
             "ASSET_PREFIX": asset_prefix,
             "PAGE": name,
             "CONTENT": body,
@@ -790,6 +810,9 @@ def build_release(
         assets.mkdir()
         shutil.copy2(SITE_ROOT / "assets" / "styles.css", assets / "styles.css")
         shutil.copy2(SITE_ROOT / "assets" / "site.js", assets / "site.js")
+        shutil.copy2(SITE_ROOT / "assets" / "favicon.svg", assets / "favicon.svg")
+        shutil.copy2(SITE_ROOT / "assets" / "favicon.ico", temporary / "favicon.ico")
+        shutil.copy2(SITE_ROOT / "assets" / "og.png", temporary / "og.png")
 
         public_data = derive_public_data(
             ticks,
@@ -798,9 +821,19 @@ def build_release(
             gap_seconds=gap_seconds,
         )
         (temporary / "data.json").write_bytes(json_bytes(public_data))
+        observatory_source = Path(observatory_template).read_text(encoding="utf-8")
+        observatory_source = replace_marker(
+            observatory_source,
+            "%%CANONICAL_URL%%",
+            f"{PUBLIC_BASE_URL}{PAGE_PATHS['observatory']}",
+        )
+        observatory_source = replace_marker(
+            observatory_source,
+            "%%OG_IMAGE_URL%%",
+            SHARE_IMAGE_URL,
+        )
+        write_text(temporary, "observatory/index.html", observatory_source)
         observatory = temporary / "observatory" / "index.html"
-        observatory.parent.mkdir(parents=True)
-        shutil.copy2(Path(observatory_template), observatory)
         derive.inject_html(observatory, public_data)
 
         finalize_public_tree(temporary)
