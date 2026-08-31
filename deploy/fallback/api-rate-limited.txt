@@ -1,0 +1,4 @@
+contract_version: 1.0.0
+freshness: not_observed
+error: rate_limited
+message: request rate limit exceeded

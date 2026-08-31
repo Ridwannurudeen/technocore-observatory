@@ -1,0 +1,16 @@
+    <header class="page-lede">
+      <p class="eyebrow">REGIME / public discovery fields</p>
+      <h1>Configuration change register</h1>
+      <p>A chronological ledger of allowlisted public values. Each entry preserves the old and new observation without claiming why the source changed.</p>
+    </header>
+    <section class="change-index" aria-labelledby="change-title">
+      <div class="ledger-heading"><p class="figure-label">01 / Bounded history</p><h2 id="change-title">%%CHANGE_COUNT%% observed changes</h2></div>
+%%CHANGE_ROWS%%
+    </section>
+    <dl class="evidence-rail" aria-label="Configuration-change evidence metadata">
+      <div><dt>Source observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
+      <div><dt>Valid until</dt><dd>%%VALID_UNTIL%%</dd></div>
+      <div><dt>Evidence</dt><dd>Old, new, route and first-observed time</dd></div>
+      <div><dt>Methodology</dt><dd>Versioned per record</dd></div>
+    </dl>
+    <p class="machine-links"><a href="/api/v1/changes">Plain text</a><a href="/api/v1/changes?format=json">JSON</a><a href="/methodology/">Methodology</a></p>

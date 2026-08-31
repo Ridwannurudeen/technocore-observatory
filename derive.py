@@ -34,7 +34,7 @@ HOURLY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DAILY_RETENTION_SECONDS = 365 * 24 * 60 * 60
 HOURLY_ROLLUP_SECONDS = 60 * 60
 DAILY_ROLLUP_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.11.0"
+METHODOLOGY_VERSION = "1.13.0"
 CENSUS_SHARD_COUNT = 256
 CENSUS_RUN_FIELDS = {
     "walk_started_at",
@@ -62,6 +62,13 @@ CENSUS_RUN_NOT_RECORDED = (
 ROOM_SAMPLING_STRUCTURAL_CEILING = 200
 ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
 ROOM_REVISIT_STRUCTURAL_CEILING = 305
+ROOM_GENERATION_COLLECTOR_VERSION = (2, 11, 0)
+ROOM_REVISIT_OUTCOMES = {
+    "present_at_last_check",
+    "absent_at_last_check",
+    "check_failed",
+    "superseded_before_check",
+}
 CENSUS_LONG_WALK_SECONDS = 60 * 60
 # A fixed ten-minute honesty threshold. At the measured post-deploy cadence of
 # about 258 seconds per tick, this is about 2.3 collector intervals. The rebuild
@@ -74,10 +81,13 @@ FUNNEL_BASE_FIELDS = (
     "dids_observed_signing",
     "seen_two_ticks",
 )
+MAX_INTEGER = (1 << 63) - 1
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
 
 
 def parse_ts(value: Any) -> datetime:
@@ -87,7 +97,12 @@ def parse_ts(value: Any) -> datetime:
     parsed = datetime.fromisoformat(normalized)
     if parsed.tzinfo is None:
         raise ValueError("timestamp has no timezone")
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as error:
+        raise ValueError(
+            "timestamp must normalize within the supported UTC range"
+        ) from error
 
 
 def optional_timestamp(value: Any, field: str) -> str | None:
@@ -101,7 +116,12 @@ def optional_timestamp(value: Any, field: str) -> str | None:
 
 
 def integer(value: Any, field: str, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > MAX_INTEGER
+    ):
         raise ValueError(f"{field} is not a valid integer")
     return value
 
@@ -116,6 +136,13 @@ def version_string(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > 64:
         raise ValueError(f"{field} is not a valid version")
     return value
+
+
+def collector_version_at_least(value: str, minimum: tuple[int, int, int]) -> bool:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value)
+    if match is None:
+        return False
+    return tuple(int(part) for part in match.groups()) >= minimum
 
 
 def validate_tracking_disclosure(value: Any) -> dict[str, str] | None:
@@ -145,10 +172,11 @@ def validate_ledger_chain(value: Any) -> dict[str, Any]:
         raise ValueError("ledger_chain.version is not 1")
     previous_hash = value["previous_sha256"]
     if previous_hash is not None and (
-        not isinstance(previous_hash, str)
-        or SHA256_RE.fullmatch(previous_hash) is None
+        not isinstance(previous_hash, str) or SHA256_RE.fullmatch(previous_hash) is None
     ):
-        raise ValueError("ledger_chain.previous_sha256 is not null or lowercase SHA-256")
+        raise ValueError(
+            "ledger_chain.previous_sha256 is not null or lowercase SHA-256"
+        )
     tick_hash = value["tick_sha256"]
     if not isinstance(tick_hash, str) or SHA256_RE.fullmatch(tick_hash) is None:
         raise ValueError("ledger_chain.tick_sha256 is not lowercase SHA-256")
@@ -194,7 +222,9 @@ def validate_room_sampling(value: Any) -> dict[str, Any] | None:
         read_budget if read_budget is not None else ROOM_SAMPLING_STRUCTURAL_CEILING
     )
     if not isinstance(sampled, list) or not 1 <= len(sampled) <= sampled_ceiling:
-        raise ValueError("room_sampling.sampled is not a non-empty list within its read limit")
+        raise ValueError(
+            "room_sampling.sampled is not a non-empty list within its read limit"
+        )
 
     rooms: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -243,15 +273,22 @@ def validate_engagement(value: Any) -> dict[str, Any] | None:
     def finite_number(raw: Any, maximum: float | None = None) -> float | None:
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             return None
+        if raw < 0 or isinstance(raw, int) and raw > MAX_INTEGER:
+            return None
         number = float(raw)
-        if not math.isfinite(number) or number < 0:
+        if not math.isfinite(number):
             return None
         if maximum is not None and number > maximum:
             return None
         return number
 
     def non_negative_int(raw: Any) -> int | None:
-        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, int)
+            or raw < 0
+            or raw > MAX_INTEGER
+        ):
             return None
         return raw
 
@@ -259,7 +296,9 @@ def validate_engagement(value: Any) -> dict[str, Any] | None:
         "windowed_note_to_message_ratio": finite_number(
             value.get("windowed_note_to_message_ratio")
         ),
-        "zero_response_share": finite_number(value.get("zero_response_share"), maximum=1.0),
+        "zero_response_share": finite_number(
+            value.get("zero_response_share"), maximum=1.0
+        ),
         "nick_diversity": finite_number(value.get("nick_diversity")),
         "window_cap": non_negative_int(value.get("window_cap")),
         "windowed_messages": non_negative_int(value.get("windowed_messages")),
@@ -321,12 +360,9 @@ def validate_identity_census_run(value: Any) -> dict[str, Any] | None:
         raise ValueError("identity_census_run.failure_causes is not an object")
     validated_causes: dict[str, int] = {}
     for cause, count in failure_causes.items():
-        if (
-            not isinstance(cause, str)
-            or (
-                cause not in CENSUS_FAILURE_CAUSES
-                and re.fullmatch(r"http_\d{3}", cause) is None
-            )
+        if not isinstance(cause, str) or (
+            cause not in CENSUS_FAILURE_CAUSES
+            and re.fullmatch(r"http_\d{3}", cause) is None
         ):
             raise ValueError("identity_census_run contains an invalid failure cause")
         validated_causes[cause] = integer(
@@ -346,8 +382,7 @@ def validate_identity_census_run(value: Any) -> dict[str, Any] | None:
         passes_attempted > maximum_passes
         or read_failures > reads_attempted
         or sum(validated_causes.values()) != read_failures
-        or outstanding_at_start - shards_outstanding
-        > reads_attempted - read_failures
+        or outstanding_at_start - shards_outstanding > reads_attempted - read_failures
     ):
         raise ValueError("identity_census_run read accounting is inconsistent")
     if stop_reason not in CENSUS_STOP_REASONS:
@@ -381,7 +416,11 @@ def validate_event(value: Any) -> dict[str, Any]:
     name = value.get("name")
     primary = value.get("primary_class")
     base_name = value.get("base_name")
-    if not isinstance(name, str) or not isinstance(base_name, str) or primary not in CLASSES:
+    if (
+        not isinstance(name, str)
+        or not isinstance(base_name, str)
+        or primary not in CLASSES
+    ):
         raise ValueError("event contains an invalid name or class")
     return {
         "seq": seq,
@@ -392,7 +431,11 @@ def validate_event(value: Any) -> dict[str, Any]:
     }
 
 
-def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
+def validate_room_lifecycle(
+    value: Any,
+    *,
+    require_generation_contract: bool = False,
+) -> dict[str, Any] | None:
     if value is None:
         return None
     if not isinstance(value, dict):
@@ -446,6 +489,29 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         ),
     }
 
+    has_generation_contract = (
+        require_generation_contract or "superseded_this_tick" in value
+    )
+    result["superseded_this_tick"] = (
+        integer(
+            value.get("superseded_this_tick"),
+            "room_lifecycle.superseded_this_tick",
+        )
+        if has_generation_contract
+        else None
+    )
+    has_superseded_batch_contract = (
+        require_generation_contract or "deferred_superseded_due_to_batch_limit" in value
+    )
+    result["deferred_superseded_due_to_batch_limit"] = (
+        integer(
+            value.get("deferred_superseded_due_to_batch_limit"),
+            "room_lifecycle.deferred_superseded_due_to_batch_limit",
+        )
+        if has_superseded_batch_contract
+        else None
+    )
+
     deferred_due_to_read_budget = value.get("deferred_due_to_read_budget")
     deferred_due_to_deadline = value.get("deferred_due_to_deadline")
     if deferred_due_to_read_budget is None and deferred_due_to_deadline is None:
@@ -474,19 +540,26 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         raise ValueError("room_lifecycle room denominators are inconsistent")
     if result["reads_failed"] > result["reads_attempted"]:
         raise ValueError("room_lifecycle failed reads exceed attempted reads")
+    finalized_this_tick = result["attempted_this_tick"] + (
+        result["superseded_this_tick"] or 0
+    )
+    deferred_superseded = result["deferred_superseded_due_to_batch_limit"] or 0
     if (
-        result["attempted_this_tick"] > result["due_this_tick"]
+        finalized_this_tick > result["due_this_tick"]
         or result["deferred_due_to_budget"]
-        != result["due_this_tick"] - result["attempted_this_tick"]
+        != result["due_this_tick"] - finalized_this_tick
     ):
         raise ValueError("room_lifecycle due-read accounting is inconsistent")
     if (
         has_wall_clock_contract
         and result["deferred_due_to_read_budget"]
         + result["deferred_due_to_deadline"]
+        + deferred_superseded
         != result["deferred_due_to_budget"]
     ):
-        raise ValueError("room_lifecycle deferral reasons do not partition deferred work")
+        raise ValueError(
+            "room_lifecycle deferral reasons do not partition deferred work"
+        )
     if result["rooms_in_ledger"] == 0 and ledger_started_at is not None:
         raise ValueError("empty room ledger has a start timestamp")
     if result["rooms_in_ledger"] > 0 and ledger_started_at is None:
@@ -500,7 +573,10 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         "other",
         "not_observed",
     }
-    if not isinstance(sender_classes, dict) or set(sender_classes) != expected_sender_classes:
+    if (
+        not isinstance(sender_classes, dict)
+        or set(sender_classes) != expected_sender_classes
+    ):
         raise ValueError("room_lifecycle second-sender classes are incomplete")
     result["second_sender_classes"] = {
         key: integer(
@@ -509,21 +585,33 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         )
         for key in sorted(expected_sender_classes)
     }
-    if sum(result["second_sender_classes"].values()) > result["rooms_with_second_message"]:
+    sender_class_total = sum(result["second_sender_classes"].values())
+    if (
+        has_generation_contract
+        and sender_class_total != result["rooms_with_second_message"]
+    ):
+        raise ValueError(
+            "room_lifecycle sender classes do not partition their room denominator"
+        )
+    if sender_class_total > result["rooms_with_second_message"]:
         raise ValueError("room_lifecycle sender classes exceed their room denominator")
 
     revisits = value.get("revisits")
     if (
         not isinstance(revisits, list)
         or len(revisits) > ROOM_REVISIT_STRUCTURAL_CEILING
-        or len(revisits) != result["attempted_this_tick"]
+        or len(revisits) != finalized_this_tick
     ):
         raise ValueError("room_lifecycle revisits exceed their recorded bounds")
     validated_revisits: list[dict[str, Any]] = []
+    superseded_revisits = 0
+    seen_revisit_keys: set[tuple[int, int]] = set()
+    room_ids_by_creation: dict[int, str] = {}
     for revisit in revisits:
         if not isinstance(revisit, dict):
             raise ValueError("room_lifecycle revisit is not an object")
         room_id = revisit.get("id")
+        created_seq = revisit.get("created_seq")
         stage_seconds = revisit.get("stage_seconds")
         success = revisit.get("success")
         if (
@@ -534,12 +622,50 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         ):
             raise ValueError("room_lifecycle revisit has an invalid identity or stage")
 
-        elapsed_since_creation_seconds = revisit.get(
-            "elapsed_since_creation_seconds"
-        )
-        if elapsed_since_creation_seconds is None:
+        if created_seq is None:
+            if has_generation_contract:
+                raise ValueError(
+                    "current room_lifecycle revisit lacks its creation sequence"
+                )
+        else:
+            created_seq = integer(
+                created_seq,
+                "room_lifecycle.revisit.created_seq",
+            )
+            revisit_key = (created_seq, stage_seconds)
+            if revisit_key in seen_revisit_keys:
+                raise ValueError("room_lifecycle contains a duplicate generation stage")
+            prior_room_id = room_ids_by_creation.setdefault(created_seq, room_id)
+            if prior_room_id != room_id:
+                raise ValueError(
+                    "room_lifecycle maps one creation sequence to multiple room ids"
+                )
+            seen_revisit_keys.add(revisit_key)
+
+        outcome = revisit.get("outcome")
+        if has_generation_contract:
+            if outcome not in ROOM_REVISIT_OUTCOMES:
+                raise ValueError(
+                    "current room_lifecycle revisit has an invalid outcome"
+                )
+        elif outcome is not None:
+            if outcome not in ROOM_REVISIT_OUTCOMES - {"superseded_before_check"}:
+                raise ValueError("legacy room_lifecycle revisit has an invalid outcome")
+
+        elapsed_since_creation_seconds = revisit.get("elapsed_since_creation_seconds")
+        if outcome == "superseded_before_check":
+            superseded_revisits += 1
+            if success:
+                raise ValueError("superseded room revisit has a contradictory outcome")
+            if elapsed_since_creation_seconds is not None:
+                raise ValueError(
+                    "superseded room revisit records elapsed time without an origin read"
+                )
+        elif elapsed_since_creation_seconds is None:
             if has_wall_clock_contract:
-                raise ValueError("new-format room revisit lacks its actual elapsed time")
+                raise ValueError(
+                    "new-format room revisit lacks its actual elapsed time"
+                )
         else:
             elapsed_since_creation_seconds = integer(
                 elapsed_since_creation_seconds,
@@ -552,6 +678,12 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         has_second_message = revisit.get("has_second_message")
         second_sender_class = revisit.get("second_sender_class")
         if not success:
+            if outcome is not None and outcome not in {
+                "absent_at_last_check",
+                "check_failed",
+                "superseded_before_check",
+            }:
+                raise ValueError("failed room revisit has a contradictory outcome")
             if (
                 message_count is not None
                 or has_second_message is not None
@@ -559,12 +691,16 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
             ):
                 raise ValueError("failed room revisit contains an activity result")
         else:
+            if outcome is not None and outcome != "present_at_last_check":
+                raise ValueError("successful room revisit has a contradictory outcome")
             message_count = integer(
                 message_count,
                 "room_lifecycle.revisit.message_count",
             )
             if not isinstance(has_second_message, bool):
-                raise ValueError("successful room revisit lacks its second-message result")
+                raise ValueError(
+                    "successful room revisit lacks its second-message result"
+                )
             if has_second_message:
                 if second_sender_class not in expected_sender_classes:
                     raise ValueError("room revisit has an invalid second-sender class")
@@ -573,14 +709,20 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         validated_revisits.append(
             {
                 "id": room_id,
+                "created_seq": created_seq,
                 "stage_seconds": stage_seconds,
                 "elapsed_since_creation_seconds": elapsed_since_creation_seconds,
                 "success": success,
+                "outcome": outcome,
                 "message_count": message_count,
                 "has_second_message": has_second_message,
                 "second_sender_class": second_sender_class,
             }
         )
+    if has_generation_contract and (
+        superseded_revisits != result["superseded_this_tick"]
+    ):
+        raise ValueError("room_lifecycle superseded accounting is inconsistent")
     result["revisits"] = validated_revisits
 
     budget = value.get("read_budget")
@@ -588,13 +730,8 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         raise ValueError("room_lifecycle has no read-budget accounting")
     assumed_tick_seconds = budget.get("assumed_tick_seconds")
     rate_window_seconds = budget.get("rate_window_seconds")
-    tick_revisit_deadline_seconds = budget.get(
-        "tick_revisit_deadline_seconds"
-    )
-    if (
-        rate_window_seconds is None
-        and tick_revisit_deadline_seconds is None
-    ):
+    tick_revisit_deadline_seconds = budget.get("tick_revisit_deadline_seconds")
+    if rate_window_seconds is None and tick_revisit_deadline_seconds is None:
         assumed_tick_seconds = integer(
             assumed_tick_seconds,
             "read_budget.assumed_tick_seconds",
@@ -650,26 +787,21 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         if (
             isinstance(raw, bool)
             or not isinstance(raw, (int, float))
-            or not math.isfinite(raw)
             or raw < 0
+            or isinstance(raw, int)
+            and raw > MAX_INTEGER
+            or not math.isfinite(raw)
         ):
             raise ValueError(f"read_budget.{field} is not a valid number")
         validated_budget[field] = float(raw)
-    expected_rate = (
-        validated_budget["total_reads"]
-        * 60
-        / normalization_seconds
-    )
-    expected_share = (
-        expected_rate / validated_budget["published_reads_per_minute"]
-    )
+    expected_rate = validated_budget["total_reads"] * 60 / normalization_seconds
+    expected_share = expected_rate / validated_budget["published_reads_per_minute"]
     if (
         validated_budget["total_reads"]
         != validated_budget["base_reads"] + validated_budget["revisit_reads"]
         or validated_budget["revisit_reads"] != result["attempted_this_tick"]
         or validated_budget["total_reads"] > validated_budget["total_read_budget"]
-        or validated_budget["revisit_reads"]
-        > validated_budget["revisit_read_budget"]
+        or validated_budget["revisit_reads"] > validated_budget["revisit_read_budget"]
         or not math.isclose(
             validated_budget["reads_per_minute"],
             expected_rate,
@@ -686,6 +818,8 @@ def validate_room_lifecycle(value: Any) -> dict[str, Any] | None:
         != max(
             0,
             result["due_this_tick"]
+            - (result["superseded_this_tick"] or 0)
+            - deferred_superseded
             - validated_budget["revisit_read_budget"],
         )
     ):
@@ -715,9 +849,8 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
             "signer_funnel.census_started_at",
         )
         parse_ts(census_completed_at)
-        if (
-            census_started_at is not None
-            and parse_ts(census_started_at) > parse_ts(census_completed_at)
+        if census_started_at is not None and parse_ts(census_started_at) > parse_ts(
+            census_completed_at
         ):
             raise ValueError("funnel census starts after it completes")
     result["census_started_at"] = census_started_at
@@ -733,7 +866,9 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     result["coverage"] = {"sampled_rooms": sampled, "known_rooms": known}
 
     legacy_persistence = "two_collection_utc_dates" not in value
-    persistence_field = "two_utc_dates" if legacy_persistence else "two_collection_utc_dates"
+    persistence_field = (
+        "two_utc_dates" if legacy_persistence else "two_collection_utc_dates"
+    )
     raw_two_dates = optional_integer(
         value.get(persistence_field),
         f"signer_funnel.{persistence_field}",
@@ -741,9 +876,7 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     raw_two_rooms = optional_integer(value.get("two_rooms"), "signer_funnel.two_rooms")
     legacy_reciprocity = "signed_reciprocal_alternation" not in value
     reciprocity_field = (
-        "signed_counterparty"
-        if legacy_reciprocity
-        else "signed_reciprocal_alternation"
+        "signed_counterparty" if legacy_reciprocity else "signed_reciprocal_alternation"
     )
     raw_reciprocity = optional_integer(
         value.get(reciprocity_field),
@@ -759,7 +892,10 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     ]
     if any(stage is None for stage in raw_observed_stages):
         raise ValueError("signer funnel has a missing observed stage")
-    if any(right > left for left, right in zip(raw_observed_stages, raw_observed_stages[1:])):
+    if any(
+        right > left
+        for left, right in zip(raw_observed_stages, raw_observed_stages[1:])
+    ):
         raise ValueError("signer funnel stages are not monotonic")
     # The census and the observed-signing count measure different populations
     # (a signer need not have published a DID note), so observed > census is a
@@ -803,9 +939,7 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
 
     result["legacy_persistence_reset"] = legacy_persistence
     result["legacy_reciprocity"] = legacy_reciprocity
-    result["sustained_reciprocal_footprint"] = result[
-        "signed_reciprocal_alternation"
-    ]
+    result["sustained_reciprocal_footprint"] = result["signed_reciprocal_alternation"]
     result["tracking_disclosure"] = validate_tracking_disclosure(
         value.get("tracking_disclosure")
     )
@@ -821,7 +955,7 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     )
     result["tracked_dids"] = integer(value.get("tracked_dids"), "tracked_dids")
     result["tracked_cap"] = integer(value.get("tracked_cap"), "tracked_cap", 1)
-    cap_gates = result["signer_state_version"] not in (3, 4, 5) and not (
+    cap_gates = result["signer_state_version"] not in (3, 4, 5, 6) and not (
         result["signer_state_version"] is None
         and result["tracking_disclosure"] is not None
     )
@@ -841,6 +975,13 @@ def validate_tick(value: Any) -> dict[str, Any]:
         raise ValueError("tick is not an object")
     ts = value.get("ts")
     parsed_ts = parse_ts(ts)
+    try:
+        parsed_ts - timedelta(seconds=DAILY_RETENTION_SECONDS)
+        parsed_ts + timedelta(seconds=DAILY_ROLLUP_SECONDS)
+    except OverflowError as error:
+        raise ValueError(
+            "tick timestamp cannot support the declared history windows"
+        ) from error
     events = value.get("events_window")
     rooms = value.get("newest_rooms")
     if not isinstance(events, list) or not isinstance(rooms, list):
@@ -863,10 +1004,13 @@ def validate_tick(value: Any) -> dict[str, Any]:
             or isinstance(seq, bool)
             or not isinstance(seq, int)
             or seq < 0
+            or seq > MAX_INTEGER
             or isinstance(idle, bool)
             or not isinstance(idle, (int, float))
-            or not math.isfinite(idle)
             or idle < 0
+            or isinstance(idle, int)
+            and idle > MAX_INTEGER
+            or not math.isfinite(idle)
         ):
             raise ValueError("room has an invalid name, seq, or idle value")
         validated_rooms.append({"name": name, "seq": seq, "idle_seconds": float(idle)})
@@ -876,9 +1020,7 @@ def validate_tick(value: Any) -> dict[str, Any]:
         value.get("identity_census_started"),
         "identity_census_started",
     )
-    identity_census_run = validate_identity_census_run(
-        value.get("identity_census_run")
-    )
+    identity_census_run = validate_identity_census_run(value.get("identity_census_run"))
     if (
         identity_total is None
         and identity_census_started is not None
@@ -895,19 +1037,17 @@ def validate_tick(value: Any) -> dict[str, Any]:
             raise ValueError("tick census start disagrees with its census run")
         if parse_ts(identity_census_run["walk_started_at"]) > parsed_ts:
             raise ValueError("tick census run starts after the tick timestamp")
-        if (
-            identity_census_run["shards_outstanding"] > 0
-            and identity_total is not None
-        ):
+        if identity_census_run["shards_outstanding"] > 0 and identity_total is not None:
             raise ValueError("incomplete census run publishes an identity total")
 
     raw_collector_version = value.get("collector_version")
+    collector_version = (
+        "legacy"
+        if raw_collector_version is None
+        else version_string(raw_collector_version, "collector_version")
+    )
     result = {
-        "collector_version": (
-            "legacy"
-            if raw_collector_version is None
-            else version_string(raw_collector_version, "collector_version")
-        ),
+        "collector_version": collector_version,
         "ledger_chain": (
             validate_ledger_chain(value["ledger_chain"])
             if "ledger_chain" in value
@@ -929,7 +1069,13 @@ def validate_tick(value: Any) -> dict[str, Any]:
         "newest_rooms": validated_rooms,
         "room_sampling": validate_room_sampling(value.get("room_sampling")),
         "signer_funnel": validate_funnel(value.get("signer_funnel")),
-        "room_lifecycle": validate_room_lifecycle(value.get("room_lifecycle")),
+        "room_lifecycle": validate_room_lifecycle(
+            value.get("room_lifecycle"),
+            require_generation_contract=collector_version_at_least(
+                collector_version,
+                ROOM_GENERATION_COLLECTOR_VERSION,
+            ),
+        ),
         "engagement": validate_engagement(value.get("engagement")),
     }
     if validated_events and validated_events[-1]["seq"] != result["events_last_seq"]:
@@ -970,8 +1116,10 @@ ROLLUP_RATE_FIELDS = (
 
 
 def utc_text(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
-        "+00:00", "Z"
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
     )
 
 
@@ -1002,8 +1150,7 @@ def aggregate_rollup_bucket(
         return None
 
     values = {
-        field: [point[field] for point in points]
-        for field in ROLLUP_VALUE_FIELDS
+        field: [point[field] for point in points] for field in ROLLUP_VALUE_FIELDS
     }
     ratios: dict[str, dict[str, Any]] = {}
     observed_seconds = 0.0
@@ -1039,8 +1186,7 @@ def aggregate_rollup_bucket(
     )
     missing = max(0, expected - len(points))
     has_gap = any(
-        parse_ts(gap["from"]) < end and parse_ts(gap["to"]) > start
-        for gap in gaps
+        parse_ts(gap["from"]) < end and parse_ts(gap["to"]) > start for gap in gaps
     )
     return {
         "start": utc_text(start),
@@ -1115,11 +1261,7 @@ def expected_tick_interval(
         (parse_ts(right["ts"]) - parse_ts(left["ts"])).total_seconds()
         for left, right in zip(points, points[1:])
     ]
-    usable = sorted(
-        interval
-        for interval in intervals
-        if 0 < interval <= gap_seconds
-    )
+    usable = sorted(interval for interval in intervals if 0 < interval <= gap_seconds)
     if not usable:
         return gap_seconds
     middle = len(usable) // 2
@@ -1138,22 +1280,16 @@ def reduce_payload_history(
     hourly_cutoff = newest - timedelta(seconds=HOURLY_RETENTION_SECONDS)
     daily_cutoff = newest - timedelta(seconds=DAILY_RETENTION_SECONDS)
 
-    raw_points = [
-        point for point in points if parse_ts(point["ts"]) >= raw_cutoff
-    ]
+    raw_points = [point for point in points if parse_ts(point["ts"]) >= raw_cutoff]
     hourly_points = [
-        point
-        for point in points
-        if hourly_cutoff <= parse_ts(point["ts"]) < raw_cutoff
+        point for point in points if hourly_cutoff <= parse_ts(point["ts"]) < raw_cutoff
     ]
     daily_points = [
         point
         for point in points
         if daily_cutoff <= parse_ts(point["ts"]) < hourly_cutoff
     ]
-    archive_points = [
-        point for point in points if parse_ts(point["ts"]) < daily_cutoff
-    ]
+    archive_points = [point for point in points if parse_ts(point["ts"]) < daily_cutoff]
 
     tick_seconds = expected_tick_interval(points, gap_seconds)
     levels: list[dict[str, Any]] = []
@@ -1202,9 +1338,7 @@ def reduce_payload_history(
         if level is not None:
             levels.append(level)
 
-    recent_gaps = [
-        gap for gap in gaps if parse_ts(gap["to"]) >= raw_cutoff
-    ]
+    recent_gaps = [gap for gap in gaps if parse_ts(gap["to"]) >= raw_cutoff]
     history = {
         "raw_retention_seconds": RAW_RETENTION_SECONDS,
         "raw_started_at": raw_points[0]["ts"] if raw_points else None,
@@ -1279,7 +1413,7 @@ def read_jsonl(lines: Iterable[str]) -> tuple[list[dict[str, Any]], int]:
             tick = validate_tick(json.loads(line))
             if previous_time is not None and tick["_datetime"] <= previous_time:
                 raise ValueError("tick timestamps are not strictly increasing")
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             rejected += 1
             continue
         ticks.append(tick)
@@ -1346,7 +1480,9 @@ def measured_capacity(
     segment = trailing_segment(ticks, index, cap_field, gap_seconds)
     if len(segment) >= 2:
         elapsed = (segment[-1]["_datetime"] - segment[0]["_datetime"]).total_seconds()
-        result["trailing_rate"] = (segment[-1][total_field] - segment[0][total_field]) / elapsed
+        result["trailing_rate"] = (
+            segment[-1][total_field] - segment[0][total_field]
+        ) / elapsed
         result["trailing_window"] = {"seconds": elapsed, "samples": len(segment)}
     return result
 
@@ -1473,7 +1609,7 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
             f"{format_int(lifecycle['deferred_due_to_budget'])} deferred by the "
             "recorded aggregate budget; the reason split was not recorded"
         )
-    else:
+    elif lifecycle["deferred_superseded_due_to_batch_limit"] is None:
         deferral_text = (
             f"{format_int(lifecycle['deferred_due_to_budget'])} deferred: "
             f"{format_int(lifecycle['deferred_due_to_read_budget'])} by the "
@@ -1481,6 +1617,36 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
             f"{format_int(lifecycle['deferred_due_to_deadline'])} because the "
             "wall-clock deadline was reached"
         )
+    else:
+        deferral_text = (
+            f"{format_int(lifecycle['deferred_due_to_budget'])} deferred: "
+            f"{format_int(lifecycle['deferred_due_to_read_budget'])} by the "
+            "per-tick read cap, "
+            f"{format_int(lifecycle['deferred_due_to_deadline'])} because the "
+            "wall-clock deadline was reached, and "
+            f"{format_int(lifecycle['deferred_superseded_due_to_batch_limit'])} "
+            f"by the {format_int(ROOM_REVISIT_STRUCTURAL_CEILING)}-record bounded "
+            "local-finalization batch"
+        )
+
+    superseded = lifecycle["superseded_this_tick"]
+    superseded_text = (
+        ""
+        if superseded is None
+        else (
+            f"{format_int(superseded)} older creation "
+            f"{'cohort' if superseded == 1 else 'cohorts'} finalized as "
+            "superseded without an origin read · "
+        )
+    )
+    generation_evidence_text = (
+        "only 16-hex SHA-256 prefixes leave the legacy collector"
+        if superseded is None
+        else (
+            "published evidence carries a stable 16-hex SHA-256 room-name prefix "
+            "plus its nonnegative creation-event sequence"
+        )
+    )
 
     actual_delays = [
         revisit["elapsed_since_creation_seconds"]
@@ -1510,8 +1676,7 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
             "value_text": format_int(rooms),
             "context": (
                 f"exact created-room names retained privately in SQLite since "
-                f"{lifecycle['ledger_started_at']} · only 16-hex SHA-256 prefixes "
-                "leave the collector"
+                f"{lifecycle['ledger_started_at']} · {generation_evidence_text}"
             ),
         },
         "revisited": {
@@ -1553,9 +1718,12 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
         "coverage_text": (
             f"{format_int(lifecycle['created_rooms_observed_this_tick'])} new ledger "
             f"entries this tick · {format_int(lifecycle['due_this_tick'])} scheduled "
-            f"revisits due · {format_int(lifecycle['attempted_this_tick'])} attempted · "
-            f"{deferral_text}. Deferred revisits were not attempted and are neither "
-            "failed reads nor evidence that a room had no second message. Nominal due "
+            f"revisits due · {format_int(lifecycle['attempted_this_tick'])} origin "
+            f"reads attempted · {superseded_text}"
+            f"{deferral_text}. Read-cap and deadline deferrals were not attempted and "
+            "are neither failed reads nor evidence that a room had no second message. "
+            "A superseded batch deferral is bounded local bookkeeping and not an "
+            "origin-read or deadline failure. Nominal due "
             "targets are 5 minutes, 1 hour and 24 hours after creation; they are "
             f"scheduling targets, not measured delays · {delay_text}. Coverage begins "
             "when this ledger begins and says nothing about older rooms."
@@ -1588,11 +1756,17 @@ def engagement_display(engagement: dict[str, Any] | None) -> dict[str, dict[str,
 
     window_parts = []
     if engagement["window_cap"] is not None:
-        window_parts.append(f"window cap {format_int(engagement['window_cap'])} messages")
+        window_parts.append(
+            f"window cap {format_int(engagement['window_cap'])} messages"
+        )
     if engagement["windowed_messages"] is not None:
-        window_parts.append(f"{format_int(engagement['windowed_messages'])} windowed messages")
+        window_parts.append(
+            f"{format_int(engagement['windowed_messages'])} windowed messages"
+        )
     window_text = (
-        " · ".join(window_parts) if window_parts else "window figures not published this tick"
+        " · ".join(window_parts)
+        if window_parts
+        else "window figures not published this tick"
     )
     provenance = (
         f"the service's own figure over its declared message window ({window_text}) · "
@@ -1663,7 +1837,7 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     sustained = funnel["sustained_reciprocal_footprint"]
     date_count = funnel["persistence_collection_utc_dates_count"]
     tracking_disclosure = funnel["tracking_disclosure"]
-    cap_gates = funnel["signer_state_version"] not in (3, 4, 5) and not (
+    cap_gates = funnel["signer_state_version"] not in (3, 4, 5, 6) and not (
         funnel["signer_state_version"] is None and tracking_disclosure is not None
     )
 
@@ -1893,9 +2067,7 @@ def identity_census_run_display(run: dict[str, Any] | None) -> str:
             f"({'; '.join(causes)})"
         )
     )
-    invocation_label = (
-        "invocation" if run["invocations"] == 1 else "invocations"
-    )
+    invocation_label = "invocation" if run["invocations"] == 1 else "invocations"
     return (
         f"census sweep {run['walk_started_at']} · "
         f"{format_int(run['shards_collected'])} / "
@@ -2159,8 +2331,10 @@ def methodology_definitions() -> dict[str, str]:
             "Frame: exact room names observed in server-authored created events from "
             "/r/events?format=json&limit=200, beginning only when the SQLite ledger "
             "starts. Rooms older than that boundary are outside the measurement and "
-            "nothing is inferred about them. Deduplication keys are exact room name "
-            "and creation-event sequence; SQL values are parameter-bound. Each newly "
+            "nothing is inferred about them. Each creation cohort is keyed by its "
+            "nonnegative creation-event sequence; the published 16-hex room-name hash "
+            "remains stable across same-name recreations, while created_seq "
+            "distinguishes those cohorts. SQL values are parameter-bound. Each newly "
             "observed room is scheduled for one read at approximately 5 minutes, "
             "1 hour and 24 hours after its creation timestamp. Endpoint: "
             "/r/<exact-name>?format=json&limit=200. A successful read records whether "
@@ -2169,7 +2343,11 @@ def methodology_definitions() -> dict[str, str]:
             "sequence 2 has rotated out of the returned window, the room still counts "
             "as having a second message but its exact second sender is reported as not "
             "observed. A failed read is recorded as a failure with null activity "
-            "fields and never becomes evidence of no response. Published denominators "
+            "fields and never becomes evidence of no response. When a newer cohort "
+            "with the same exact name exists before an older cohort's scheduled check, "
+            "the older cohort is finalized as superseded_before_check with no origin "
+            "read, null activity fields, and no contribution to attempted reads, failed "
+            "reads, presence, absence, or revisit denominators. Published denominators "
             "include rooms in the ledger, distinct rooms revisited, distinct rooms "
             "successfully revisited and failed reads. Raw room names remain only in "
             "SQLite; tick manifests publish the first 16 hexadecimal characters of "
@@ -2186,7 +2364,10 @@ def methodology_definitions() -> dict[str, str]:
             "A base phase that reaches that deadline receives no revisit work, so due "
             "work yields rather than extending the tick. Due work excluded by the "
             "eight-read cap and due work skipped because the wall-clock deadline was "
-            "reached are published separately; their sum is the aggregate deferred "
+            "reached are published separately. Superseded cohorts held for a later "
+            "tick by the 305-record bounded local finalization batch are published as "
+            "a third deferral reason; this is local bookkeeping, not origin-read work "
+            "or a deadline failure. The three reasons sum to the aggregate deferred "
             "count. Deferred work is not attempted, is not a failed read, and is never "
             "evidence of absent room activity."
         ),
@@ -2426,8 +2607,12 @@ def derive_records(
                 "identities_per_second": empty_rate(),
             },
             "capacity": {
-                "notes": measured_capacity(ticks, index, "notes_total", "note_cap", gap_seconds),
-                "rooms": measured_capacity(ticks, index, "rooms_total", "room_cap", gap_seconds),
+                "notes": measured_capacity(
+                    ticks, index, "notes_total", "note_cap", gap_seconds
+                ),
+                "rooms": measured_capacity(
+                    ticks, index, "rooms_total", "room_cap", gap_seconds
+                ),
             },
             "signer_funnel": display_funnel(
                 tick["signer_funnel"],
@@ -2437,9 +2622,7 @@ def derive_records(
                 latest_census,
             ),
             "room_lifecycle": tick["room_lifecycle"],
-            "room_lifecycle_display": room_lifecycle_display(
-                tick["room_lifecycle"]
-            ),
+            "room_lifecycle_display": room_lifecycle_display(tick["room_lifecycle"]),
             "engagement": tick["engagement"],
             "engagement_display": engagement_display(tick["engagement"]),
             "composition": {
@@ -2467,8 +2650,10 @@ def derive_records(
             elapsed = (tick["_datetime"] - previous["_datetime"]).total_seconds()
             is_gap = elapsed > gap_seconds
             deltas = {
-                "public_rooms_per_second": tick["events_last_seq"] - previous["events_last_seq"],
-                "lobby_messages_per_second": tick["lobby_last_seq"] - previous["lobby_last_seq"],
+                "public_rooms_per_second": tick["events_last_seq"]
+                - previous["events_last_seq"],
+                "lobby_messages_per_second": tick["lobby_last_seq"]
+                - previous["lobby_last_seq"],
                 "rooms_total_per_second": tick["rooms_total"] - previous["rooms_total"],
                 "notes_per_second": tick["notes_total"] - previous["notes_total"],
             }
@@ -2504,7 +2689,9 @@ def derive_records(
                 "complete": len(new_events) == expected,
             }
 
-            auto_count = sum(auto_generated_looking(event["base_name"]) for event in new_events)
+            auto_count = sum(
+                auto_generated_looking(event["base_name"]) for event in new_events
+            )
             point["name_signal"] = {
                 "auto_generated_looking": auto_count,
                 "samples": len(new_events),
@@ -2556,9 +2743,13 @@ def derive_records(
                 identity_elapsed = (
                     tick["_datetime"] - previous_identity["_datetime"]
                 ).total_seconds()
-                identity_delta = tick["identity_total"] - previous_identity["identity_total"]
+                identity_delta = (
+                    tick["identity_total"] - previous_identity["identity_total"]
+                )
                 if identity_elapsed > 0 and identity_delta >= 0:
-                    point["rates"]["identities_per_second"] = rate(identity_delta, identity_elapsed)
+                    point["rates"]["identities_per_second"] = rate(
+                        identity_delta, identity_elapsed
+                    )
                 elif identity_delta < 0:
                     gaps.append(
                         {
@@ -2583,7 +2774,9 @@ def derive_records(
     # Stall detection: the rebuild cron runs independently of the collector,
     # so the age of the newest accepted tick at rebuild time is the collector
     # liveness signal. Clamped at zero in case computed_at precedes the tick.
-    age_seconds = max(0.0, (parse_ts(computed_at) - ticks[-1]["_datetime"]).total_seconds())
+    age_seconds = max(
+        0.0, (parse_ts(computed_at) - ticks[-1]["_datetime"]).total_seconds()
+    )
     stalled = age_seconds > STALL_THRESHOLD_SECONDS
 
     return {
@@ -2614,13 +2807,21 @@ def derive_records(
 
 
 def format_int(value: Any) -> str:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
         return "—"
     return f"{value:,.0f}"
 
 
 def format_rate(value: Any) -> str:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+    ):
         return "—"
     if abs(value) >= 1:
         return f"{value:.2f}/s"
@@ -2628,7 +2829,11 @@ def format_rate(value: Any) -> str:
 
 
 def format_percent(value: Any) -> str:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+    ):
         return "—"
     return f"{value * 100:.1f}%"
 
@@ -2658,7 +2863,9 @@ def sampling_ssr(sample: Any) -> dict[str, str]:
         }
     return {
         "coverage-frame": f"{format_int(sample.get('frame_size'))} rooms in the recorded frame",
-        "coverage-sampled": (f"{format_int(sample.get('sampled_rooms'))} selected this tick"),
+        "coverage-sampled": (
+            f"{format_int(sample.get('sampled_rooms'))} selected this tick"
+        ),
         "coverage-unique": (
             f"{format_int(sample.get('cumulative_unique_rooms'))} / "
             f"{format_int(sample.get('frame_size'))} unique room hashes in this frame epoch"
@@ -2720,7 +2927,9 @@ def engagement_ssr(display: Any) -> dict[str, str]:
         entry = display.get(key) if isinstance(display, dict) else None
         if isinstance(entry, dict):
             values[value_key] = str(entry.get("value_text", "—"))
-            values[context_key] = str(entry.get("context", "No engagement display recorded"))
+            values[context_key] = str(
+                entry.get("context", "No engagement display recorded")
+            )
         else:
             values[value_key] = "—"
             values[context_key] = "No engagement display recorded"
@@ -2730,9 +2939,7 @@ def engagement_ssr(display: Any) -> dict[str, str]:
 def ssr_values(data: dict[str, Any]) -> dict[str, str]:
     history = data.get("history")
     resolution_label = (
-        history.get("chart_resolution_label")
-        if isinstance(history, dict)
-        else None
+        history.get("chart_resolution_label") if isinstance(history, dict) else None
     )
     chain = data.get("ledger_chain")
     chain_display = chain.get("display") if isinstance(chain, dict) else None
@@ -2745,8 +2952,7 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
             or "Chart resolution unavailable; scrubber contains no raw observations"
         ),
         "ledger-integrity": str(
-            chain_display
-            or "Hash-chain state unavailable; no integrity claim is made"
+            chain_display or "Hash-chain state unavailable; no integrity claim is made"
         ),
     }
     points = data.get("points")
@@ -3018,7 +3224,9 @@ def replace_meta(source: str, attribute: str, name: str, value: str) -> str:
 
 def inject_html(path: Path, data: dict[str, Any]) -> None:
     source = path.read_text(encoding="utf-8")
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace(
+        "<", "\\u003c"
+    )
     pattern = re.compile(
         r'(<script id="observatory-data" type="application/json">).*?(</script>)',
         re.DOTALL,

@@ -1,0 +1,20 @@
+    <header class="page-lede">
+      <p class="eyebrow">PULSE / status ledger</p>
+      <h1>What the instruments observed</h1>
+      <p>Origin reachability, collector cadence and endpoint attempts are independent evidence classes. There is no composite health score.</p>
+    </header>
+    <section class="ledger" aria-labelledby="components-title">
+      <div class="ledger-heading"><p class="figure-label">01 / Components</p><h2 id="components-title">Latest component observations</h2></div>
+%%COMPONENT_ROWS%%
+    </section>
+    <section class="ledger" aria-labelledby="endpoints-title">
+      <div class="ledger-heading"><p class="figure-label">02 / Endpoints</p><h2 id="endpoints-title">Trailing attempt register</h2></div>
+%%ENDPOINT_ROWS%%
+    </section>
+    <dl class="evidence-rail" aria-label="Status evidence metadata">
+      <div><dt>Source observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
+      <div><dt>Valid until</dt><dd>%%VALID_UNTIL%%</dd></div>
+      <div><dt>Published</dt><dd>%%PUBLISHED_AT%%</dd></div>
+      <div><dt>Freshness</dt><dd>%%FRESHNESS%%</dd></div>
+    </dl>
+    <p class="machine-links"><a href="/api/v1/status.txt">Plain text</a><a href="/api/v1/status.json">JSON</a></p>

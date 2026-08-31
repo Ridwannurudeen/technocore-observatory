@@ -1,135 +1,212 @@
 # Technocore Observatory
 
-The Technocore Observatory is a forward-collected, animated view of measurable Technocore activity. It is deliberately not a status page and not a reconstruction of the earlier surge.
+The Technocore Observatory is Technocore's independent read-side utility layer: a forward-only
+room evidence index, an externally observed status and change record, and bounded exact-key
+observation records. It never writes to Technocore, proxies a public request upstream, ranks a
+participant, or converts non-observation into absence.
 
-The service cannot page backward through its event or room listings. Collection therefore begins at the first locally recorded tick. The page never draws, infers, back-fills, or synthesises history before that timestamp.
+> **Release-code status, 2026-08-31:** the read-side release is implemented and locally verified in
+> this checkout. Live deployment state must be checked at `technocore.gudman.xyz`; source history
+> alone is not evidence that a particular release is active. No integration note has been posted.
 
-## What it measures
+## What the release provides
 
-Each successful collector tick records:
+- **COMPASS:** query-gated search over the local forward room ledger, capped at 20 results, plus
+  stable 16-hex room evidence URLs.
+- **PULSE + REGIME:** independently stored request-attempt telemetry, an unmetered `/healthz`
+  probe, bounded incidents, and observed discovery/configuration changes.
+- **THE FACE:** home, status, rooms, incidents, observatory, methodology, and about views built
+  from local assets with progressive-enhancement GET forms.
+- **TRACE:** exact DID observation records from retained evidence. Unknown and not-recorded remain
+  distinct from zero, and retained room references are hashed.
+- **Agent-native discovery:** text by default, `?format=json` for JSON, plus `/llms.txt`,
+  `/openapi.json`, and `/.well-known/agent.json`.
 
-- UTC collection time
-- total rooms and the room cap
-- stored bytes
-- total notes and the separate note cap
-- latest lobby sequence
-- latest public-room event sequence
-- the newest event window and validated room rows
-- room-class counts for `p-`, `mb-`, `d-`, `e-`, bare 16-hex, and other names
-- an optional complete census of all 256 `did-00` through `did-ff` identity-note namespaces
+Names returned by room search are anonymous, attacker-chosen public input. They are disclosed only
+after an explicit query, labelled untrusted, escaped in HTML, encoded in JSON, excluded from generic
+previews, and never included in a default listing or bulk export.
 
-The derived page shows:
+## Architecture
 
-- public rooms observed after collection began
-- room-creation and lobby-message rates
-- room-class composition by collected interval
-- identity totals and growth between complete censuses
-- a first-message-only signal among newly observed rooms still present in the newest room listing
-- an openly defined auto-generated-looking name signal
-- the service's own engagement figures — nick diversity, note-to-message ratio, and zero-response share — republished unverified beside the window figures the service declares; a tick without them reads "not recorded", never zero
+| Component | Reads | Writes | Runtime boundary |
+|---|---|---|---|
+| `collect.py` | `https://technocore.chat` | append-only ticks, signer metadata/SQLite, request telemetry | `technocore` user |
+| `pulse_probe.py --once` | unmetered `/healthz`, `/config`, discovery | telemetry SQLite | one-minute systemd timer as `technocore` |
+| `build_site.py` through `rebuild.sh` | ticks and telemetry | a guarded `releases/<id>` candidate, one atomic `current` symlink flip, then bounded retention | ten-minute systemd timer as `technocore` |
+| `query_service.py` | signer SQLite in `mode=ro`, current static snapshots | nothing persistent | `127.0.0.1:8765` as distinct `technocore-query` user |
+| nginx | `/opt/technocore-observatory/current` and loopback query responses | query-free access logs | public GET/HEAD boundary |
 
-The name heuristic marks a base name when it is a bare 16-hex token, UUID-like, or an unseparated alphanumeric token of at least 12 characters containing both letters and digits. This is only a string-shape signal. It does not identify farming, ownership, people, or agents.
+Static status and methodology responses do not depend on the query daemon. Incidents and changes
+are also static for no query string or exactly `format=json`; `since`, `limit`, combined filters,
+and every other argument require the local query daemon. If it is unavailable, a filtered request
+returns a bounded 503 contract instead of an unfiltered 200. Search, room evidence, and TRACE use
+the same bounded failure boundary. A public request never causes an upstream Technocore request.
 
-The first-message-only measure is also a signal rather than a final stillborn verdict. It counts captured new rooms that can still be matched in the newest room listing and have `seq <= 1`. A room may later receive messages, and rooms outside the newest listing cannot be followed through the available interface.
+A failure after the builder returns a validated candidate but before the atomic flip removes that
+exact unpublished candidate without changing `current`. After a successful flip, retention always
+protects the active release and its immediate predecessor, then keeps the newest releases while the
+retained set remains at or below both 1,008 entries (seven days at the ten-minute cadence) and 2 GiB
+of apparent payload bytes. If the two protected releases alone exceed a bound, they remain and older
+history is removed.
 
-## Limits that shape the design
+## Evidence and limits
 
-`/r/events` exposes one server-written event for each new public room but returns at most the newest 200 events. Supplying an older `since` value does not page backward.
+Collection begins at the first locally accepted tick. `/r/events` and `/rooms` expose bounded
+newest windows rather than pageable history, so the Observatory does not backfill or reconstruct
+anything before that boundary. It retains incomplete intervals, marks collector gaps and counter
+decreases, rejects malformed JSONL records instead of repairing them, and records an identity
+census only after all 256 shards complete.
 
-`/rooms` likewise exposes only the newest 200 rooms. There is no usable historical offset for older rooms.
+The room-name heuristic is only a string-shape signal. First-message-only is only an observation
+within the reachable listing window. DID notes are never called people, users, or agents. Every
+published rate keeps its window and denominator; missing is never rendered as zero.
 
-Consequently:
+The hash chain establishes internal consistency, not collection time. The private tick ledger is
+not published because it contains attacker-chosen room names; public artifacts expose aggregates,
+explicit-query results, and hashed identifiers instead.
 
-- no event or room history before `collection_started` is shown
-- the first event window establishes a baseline and contributes no invented interval
-- a sequence delta can measure aggregate activity while the event window may still be too short to recover its composition
-- incomplete composition intervals are retained, marked incomplete, and rendered faded
-- polling gaps and decreasing counters are explicit metadata
-- malformed or partial responses produce no collector tick
-- malformed JSONL ticks are rejected rather than repaired
-- identity totals are recorded only after all 256 shards complete successfully
+`ticks.jsonl`, `ticks.jsonl.ledger-checkpoint.json`, and
+`ticks.jsonl.ledger-pending.json` are one ledger recovery state family. The checkpoint binds the
+last verified tip to the ledger file. The pending journal records an exact in-progress append and
+may legitimately remain after an interruption so the next locked append can complete it
+idempotently. The signer SQLite outbox binds a committed collector transaction to that exact
+publication operation. Before making a recovery-ready backup, fence every writer and run
+`recover_publication.py` with absolute ledger, signer-state, and census-state paths. It performs
+no origin request, drains any committed outbox, resolves its journal, and verifies the full ledger.
+Back up and disaster-recovery restore the ledger family, `telemetry.sqlite3`, `signers.json`,
+`signers.sqlite3`, and the census state from one snapshot; never discard a pending journal merely
+because it exists.
 
-Room names, topics, and values are anonymous world-writable input. The collector retains names only to calculate interval aggregates and match current room rows. `data.json` contains numeric aggregates rather than those names. The page uses DOM text nodes for dynamic text.
+The normalized SQLite databases use DELETE journaling, so the release has no persistent WAL/SHM
+dependency. A killed transaction can still leave a required rollback `-journal`, and a legacy
+pre-migration database can have WAL/SHM evidence from its prior mode. A raw evidence snapshot must
+preserve each database, its existing rollback journal, and any legacy WAL/SHM sidecars together.
+Before making the recovery-ready copy, normalize the fenced database to DELETE mode, run
+`PRAGMA integrity_check`, close it, and require every `-journal`, `-wal`, and `-shm` sidecar to be
+absent; never discard a sidecar merely to make that gate pass.
 
 ## Requirements
 
 - Python 3.12
-- Python standard library for collection and derivation
-- pytest only for tests
-- a local or remote HTTP service origin supplied explicitly with `--base-url`
+- Python standard library for production code
+- pytest for tests
+- Playwright plus an installed Chromium-family browser only for the two render guards
+- nginx and systemd only on the Linux deployment target
 
-There are no writes to the service, credentials, external browser requests, CDNs, frameworks, or telemetry.
+There are no browser analytics, cookies, credentials, CDNs, external fonts, or external client-side
+requests. The telemetry database contains the collector's and pulse probe's normalized upstream
+attempts; it is not visitor telemetry.
 
-## Collect
+## Exact local commands
 
-Use absolute paths for collector output and census state:
+Use absolute state paths so the local run matches the deployment boundary. In PowerShell from the
+repository root:
 
-    python observatory/collect.py \
-      --base-url https://SERVICE-ORIGIN \
-      --output C:\absolute\path\to\observatory.jsonl
+```powershell
+$repo = (Get-Location).Path
 
-The default interval is 60 seconds. A single ordinary poll is:
+python .\collect.py `
+  --base-url https://technocore.chat `
+  --output "$repo\ticks.jsonl" `
+  --telemetry-database "$repo\telemetry.sqlite3" `
+  --signer-state "$repo\signers.json" `
+  --once
 
-    python observatory/collect.py \
-      --base-url https://SERVICE-ORIGIN \
-      --output C:\absolute\path\to\observatory.jsonl \
-      --once
+python .\pulse_probe.py `
+  --base-url https://technocore.chat `
+  --telemetry-database "$repo\telemetry.sqlite3" `
+  --once
 
-A complete identity census is:
+python .\build_site.py `
+  "$repo\ticks.jsonl" `
+  "$repo\telemetry.sqlite3" `
+  "$repo\public" `
+  --template "$repo\index.html"
+```
 
-    python observatory/collect.py \
-      --base-url https://SERVICE-ORIGIN \
-      --output C:\absolute\path\to\observatory.jsonl \
-      --census \
-      --census-state C:\absolute\path\to\identity-census-state.json
+`build_site.py` prints the exact versioned release directory. Use that path for the local query
+service and guards:
 
-The census reads the 256 `did-xx` namespace listings with pacing. Its state file is updated after each valid shard, so an interrupted census resumes at the next unfinished shard. After a completed census has been recorded, the next `--census` invocation begins a fresh census.
+```powershell
+$release = (Get-ChildItem "$repo\public\releases" -Directory |
+  Sort-Object Name -Descending |
+  Select-Object -First 1).FullName
 
-HTTP 429 responses use `Retry-After` when valid, then a retry duration found in the body. HTTP 5xx responses and transport failures use bounded exponential backoff. Exhausted retries, empty bodies, malformed headers, incomplete room listings, truncated shard listings, and unexpected event shapes cause the attempt to fail without appending a tick.
+New-Item "$release\errors" -ItemType Directory
+Copy-Item ".\deploy\fallback\*" "$release\errors\"
 
-The JSONL history is append-only. The collector opens it in append mode, writes exactly one JSON object for a successful tick, and never rewrites prior ticks.
+python .\query_service.py `
+  --database "$repo\signers.sqlite3" `
+  --snapshot-root "$release" `
+  --host 127.0.0.1 `
+  --port 8765
 
-## Derive and embed
+python .\guards.py `
+  --html "$release\observatory\index.html" `
+  --derive "$repo\derive.py" `
+  --ticks "$repo\ticks.jsonl" `
+  --site-root "$release"
+```
 
-Generate compact page data:
+`query_service.py` refuses a relative database or snapshot path and refuses any bind address other
+than `127.0.0.1`. The signer database is `signers.sqlite3`, derived by the collector from the
+`--signer-state signers.json` metadata path. The current public contract is methodology 1.13.0;
+the deployed query unit must advertise that exact version.
 
-    python observatory/derive.py \
-      C:\absolute\path\to\observatory.jsonl \
-      observatory\data.json
+For a complete test run:
 
-Generate `data.json` and replace the embedded payload in the self-contained page:
+```powershell
+python -m pytest -q
+python -m py_compile (Get-ChildItem -Filter *.py | ForEach-Object FullName)
+ruff check . --per-file-ignores "derive.py:F841"
+```
 
-    python observatory/derive.py \
-      C:\absolute\path\to\observatory.jsonl \
-      observatory\data.json \
-      --html observatory\index.html
+The Ruff command records the one known pre-existing unused local in `derive.py:2808` as an explicit
+waiver; the roadmap implementation does not change that dead-code finding.
 
-The default polling-gap threshold is 300 seconds. Change it only when the intended polling cadence requires a different definition:
+On Windows, the deployment tests perform structural nginx and systemd validation and say so in
+their skip messages. They do not claim that `nginx -t` or `systemd-analyze verify` ran. Those two
+runtime checks belong on the Linux target immediately before activation.
 
-    python observatory/derive.py input.jsonl output.json --gap-seconds 900
+## Public API
 
-Open `observatory/index.html` directly or serve that single file from any static web server. It makes no external requests.
+- `GET /api/v1/status`
+- `GET /api/v1/incidents?since=&limit=`
+- `GET /api/v1/changes?since=&limit=`
+- `GET /api/v1/methodology`
+- `GET /api/v1/rooms/search?q=&limit=1..20`
+- `GET /api/v1/rooms/{16-hex}`
+- `GET /api/v1/dids/{did}`
 
-Run derivation again whenever new ticks should be published. The HTML injection replaces only the `observatory-data` JSON script; it does not add observations that are absent from the JSONL source.
+Text is the default API representation. Add `?format=json` for JSON. All public routes accept only
+GET and HEAD. Responses are credential-free CORS; room and DID surfaces are non-indexable. Query
+limits, byte limits, a SQLite progress deadline, loopback binding, read-only/query-only SQLite, and
+nginx rate limits bound the dynamic surface. nginx-generated API 400, 405, 429, and 503 responses
+use matching bounded text/JSON contracts; `format=json` selects JSON and text is the safe default.
 
-## Test
+## Tests and guards
 
-    pytest -q observatory/test_derive.py
+The suite covers collection retries and validation, migrations, SQLite persistence, query bounds
+and escaping, zero-upstream behavior, snapshot freshness/incidents/changes, static release
+completeness, deployment structure, and accessibility contracts.
 
-The tests cover rate calculations, polling gaps, a one-point series, malformed-tick rejection, and the invariant that derivation never fabricates ticks.
+The pre-publication guard runs the four existing checks unchanged in purpose:
 
-## Historical honesty
+1. tick-ledger hash-chain verification;
+2. producer/consumer payload contract;
+3. real-browser zero-width layout detection;
+4. no-JavaScript honesty.
 
-No history before collection start can be shown.
-
-The earlier surge is unrecoverable through the listed interfaces. The empty region before collection is a result, not missing decoration. Any claim about how much of the observed identity population represents agents, people, or farming remains outside what these endpoints can prove.
+It also validates the complete built static tree, API discovery files, local-only assets,
+non-indexing policy, and progressive GET forms. Any real finding returns non-zero. A missing browser
+is reported as a skipped render check rather than a successful runtime validation.
 
 ## Source, licence and contact
 
-The observatory's source lives at https://github.com/Ridwannurudeen/technocore-observatory.
+Source: <https://github.com/Ridwannurudeen/technocore-observatory>
 
-The code is licensed under the Apache License 2.0; see `LICENSE`. Copyright 2026 Ridwan Nurudeen.
+The code is licensed under the Apache License 2.0; see [LICENSE](LICENSE). Copyright 2026 Ridwan
+Nurudeen. Questions, corrections, and disputes belong on the repository issue tracker.
 
-Questions, corrections, and disputes about any published measurement belong on the repository issue tracker: https://github.com/Ridwannurudeen/technocore-observatory/issues.
-
-The observatory is an independent instrument. It is not affiliated with FLOP Labs or with the measured service.
+The Observatory is an independent instrument. It is not affiliated with FLOP Labs or with the
+measured service.

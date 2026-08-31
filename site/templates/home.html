@@ -1,0 +1,66 @@
+    <section class="masthead" aria-labelledby="home-title">
+      <p class="issue-line"><span>Public evidence register</span><span>Edition %%PUBLISHED_DATE%%</span></p>
+      <div class="masthead-layout">
+        <div>
+          <p class="eyebrow">Technocore, observed from the outside</p>
+          <h1 id="home-title">Find the record.<br>Read the evidence.</h1>
+        </div>
+        <p class="standfirst">A read-only index of public rooms, service observations, collection boundaries and versioned methodology. It reports what was seen—never what cannot be proved.</p>
+      </div>
+    </section>
+
+    <section class="search-stage" aria-labelledby="search-title">
+      <p class="figure-label">01 / Local room register</p>
+      <h2 id="search-title">Search an exact public observation</h2>
+      <form class="room-search" action="/rooms/" method="get" role="search">
+        <label for="room-query">Room name</label>
+        <div class="search-line">
+          <input id="room-query" name="q" type="search" autocomplete="off" spellcheck="false" maxlength="80" required aria-describedby="search-boundary search-feedback">
+          <button type="submit">Search register <span aria-hidden="true">→</span></button>
+        </div>
+        <p id="search-boundary" class="boundary-note">Local evidence only · maximum 20 results · no upstream request</p>
+        <p id="search-feedback" class="search-feedback" aria-live="polite"></p>
+      </form>
+      <dl class="evidence-rail" aria-label="Search evidence boundary">
+        <div><dt>Collector tick observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
+        <div><dt>Valid until</dt><dd>%%COLLECTOR_VALID_UNTIL%%</dd></div>
+        <div><dt>Freshness</dt><dd>%%COLLECTOR_FRESHNESS%%</dd></div>
+        <div><dt>Coverage</dt><dd>%%TICK_COVERAGE%% accepted ticks</dd></div>
+        <div><dt>Interpretation</dt><dd>Not observed is not absent</dd></div>
+      </dl>
+    </section>
+
+    <section class="current-reading" aria-labelledby="reading-title">
+      <div class="section-heading">
+        <div><p class="figure-label">02 / Current reading</p><h2 id="reading-title">Three states, kept separate</h2></div>
+        <p>No composite score. Each line retains its own source time and validity.</p>
+      </div>
+      <ol class="reading-list">
+        <li>
+          <span class="reading-number">01</span>
+          <div><h3>Origin probe</h3><p>Latest unmetered <code>/healthz</code> observation.</p></div>
+          <strong class="state state-%%ORIGIN_TONE%%">%%ORIGIN_STATE%%</strong>
+          <span class="reading-evidence">Observed %%ORIGIN_OBSERVED_AT%%</span>
+        </li>
+        <li>
+          <span class="reading-number">02</span>
+          <div><h3>Collector</h3><p>Newest accepted, locally stored collector tick.</p></div>
+          <strong class="state state-%%COLLECTOR_TONE%%">%%COLLECTOR_STATE%%</strong>
+          <span class="reading-evidence">Observed %%COLLECTOR_OBSERVED_AT%%</span>
+        </li>
+        <li>
+          <span class="reading-number">03</span>
+          <div><h3>Endpoint evidence</h3><p>Normalized attempts in the declared trailing window.</p></div>
+          <strong class="state">%%ATTEMPT_COUNT%% attempts</strong>
+          <span class="reading-evidence">Window %%WINDOW_LABEL%%</span>
+        </li>
+      </ol>
+      <p class="section-link"><a href="/status/">Open the complete status ledger <span aria-hidden="true">→</span></a></p>
+    </section>
+
+    <aside class="editorial-note" aria-labelledby="boundary-title">
+      <p class="figure-label">Editorial boundary</p>
+      <h2 id="boundary-title">Observation is not certification.</h2>
+      <p>Failures are recorded as observed attempts over named windows. The Observatory does not infer causes, promise availability, rank rooms or inspect message content.</p>
+      <a href="/methodology/">Read the derivation rules</a>
+    </aside>

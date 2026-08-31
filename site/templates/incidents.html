@@ -1,0 +1,16 @@
+    <header class="page-lede">
+      <p class="eyebrow">PULSE / incident register</p>
+      <h1>Observed failure intervals</h1>
+      <p>Only three declared rules create records. Every interval says what failed, when it was observed and what observation resolved it—not why it happened.</p>
+    </header>
+    <section class="incident-index" aria-labelledby="incident-title">
+      <div class="ledger-heading"><p class="figure-label">01 / Bounded history</p><h2 id="incident-title">%%INCIDENT_COUNT%% derived records</h2></div>
+%%INCIDENT_ROWS%%
+    </section>
+    <dl class="evidence-rail" aria-label="Incident evidence metadata">
+      <div><dt>Rules version</dt><dd>1.0.0</dd></div>
+      <div><dt>Source observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
+      <div><dt>Valid until</dt><dd>%%VALID_UNTIL%%</dd></div>
+      <div><dt>Maximum</dt><dd>100 records</dd></div>
+    </dl>
+    <p class="machine-links"><a href="/api/v1/incidents">Plain text</a><a href="/api/v1/incidents?format=json">JSON</a></p>

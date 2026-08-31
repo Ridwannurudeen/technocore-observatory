@@ -1,0 +1,17 @@
+    <article class="article-page">
+      <header class="page-lede">
+        <p class="eyebrow">METHOD / versioned definitions</p>
+        <h1>How an observation becomes a record</h1>
+        <p>The Observatory separates stored evidence, derivation and publication. Each layer keeps its own time, limits and version.</p>
+      </header>
+      <nav class="article-index" aria-label="On this page">
+        <p>Contents</p>
+        <a href="#times">Three clocks</a><a href="#incidents">Incident rules</a><a href="#evidence">Evidence classes</a><a href="#limits">Boundaries</a><a href="#history">Change history</a>
+      </nav>
+      <section id="times"><p class="figure-label">01 / Time</p><h2>Source, derivation, publication</h2><p><code>source_observed_at</code> belongs to the newest evidence used. <code>derived_at</code> records calculation time; <code>published_at</code> records release time. Validity is always source time plus fifteen minutes, so rebuilding frozen input cannot make it fresh.</p></section>
+      <section id="incidents"><p class="figure-label">02 / Rules 1.0.0</p><h2>Three incident rules, no inferred cause</h2><dl class="definition-list"><div><dt>health_probe_failed</dt><dd>A contiguous interval of unsuccessful <code>/healthz</code> observations, resolved by the next success.</dd></div><div><dt>endpoint_5xx</dt><dd>Observed HTTP 5xx attempts on one normalized route, resolved by the next successful attempt.</dd></div><div><dt>collector_gap</dt><dd>An interval beyond the declared cadence, resolved by the next accepted collector tick.</dd></div></dl></section>
+      <section id="evidence"><p class="figure-label">03 / Evidence</p><h2>Stored before interpreted</h2><p>Accepted collector ticks support public-capacity and rate measurements. Normalized request attempts support reachability, latency and failure counts. Canonical discovery snapshots support allowlisted configuration diffs. Room evidence stays in the local index; static pages never publish a bulk name list.</p></section>
+      <section id="limits"><p class="figure-label">04 / Boundary</p><h2>What this cannot establish</h2><p>A successful probe is not an availability promise. A failed attempt is not an outage diagnosis. Unknown is not zero, and not observed is not absent. The ledger hash chain supports internal consistency only unless externally anchored.</p></section>
+      <section id="history"><p class="figure-label">05 / Change history</p><h2>The doctrine changes in public</h2><p>%%HISTORY_BOUNDARY%%</p><dl class="definition-list methodology-history">%%CHANGE_HISTORY%%</dl></section>
+      <dl class="evidence-rail" aria-label="Methodology metadata"><div><dt>Incident rules</dt><dd>1.0.0</dd></div><div><dt>Derivation</dt><dd>%%METHODOLOGY_VERSION%%</dd></div><div><dt>Schema</dt><dd>%%SCHEMA_VERSION%%</dd></div></dl>
+    </article>

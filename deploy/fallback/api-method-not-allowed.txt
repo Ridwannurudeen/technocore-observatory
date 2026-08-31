@@ -1,0 +1,4 @@
+contract_version: 1.0.0
+freshness: not_observed
+error: method_not_allowed
+message: only GET and HEAD are allowed
