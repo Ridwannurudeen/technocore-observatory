@@ -923,6 +923,7 @@ def test_fallback_contracts_are_bounded_credential_free_and_non_indexable():
     assert '<meta name="robots" content="noindex,nofollow,noarchive">' in html
     assert "local query service is unavailable" in html.lower()
     assert "<script" not in html.lower()
+    assert 'id="theme-toggle"' not in html
     for stem, error in API_FALLBACKS.items():
         payload = json.loads(read(FALLBACK / f"{stem}.json"))
         plain = (FALLBACK / f"{stem}.txt").read_bytes()

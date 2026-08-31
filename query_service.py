@@ -721,6 +721,7 @@ class QueryApplication:
                 {
                     "query": query,
                     "match_mode": mode,
+                    "name_trust": "untrusted",
                     "limit": limit,
                     "capped": capped,
                     "results": results,
@@ -757,8 +758,20 @@ class QueryApplication:
             raise ApiError(
                 400, "missing_query", "q is required; no default listing exists"
             )
-        results = ""
-        rail = "No query submitted. The service publishes no default room listing."
+        results = (
+            '<p class="empty-row state-missing">'
+            '<span class="missing-marker" aria-hidden="true"></span>'
+            "Submit a query. No default room listing is published.</p>"
+        )
+        result_heading = "No query submitted"
+        rail = (
+            "<div><dt>OBSERVED</dt><dd>"
+            '<span class="missing-marker" aria-hidden="true"></span>'
+            "— · NOT RECORDED</dd></div>"
+            "<div><dt>WINDOW</dt><dd>FORWARD-ONLY LEDGER</dd></div>"
+            "<div><dt>COVERAGE</dt><dd>NO DEFAULT LISTING</dd></div>"
+            "<div><dt>METHOD</dt><dd>LOCAL NAME SEARCH</dd></div>"
+        )
         if query is not None and query != "":
             validate_query_text(query)
             limit = parse_limit(
@@ -767,26 +780,61 @@ class QueryApplication:
                 default=DEFAULT_SEARCH_LIMIT,
             )
             payload = self.room_search_payload(query, limit)
+            observed_at = payload["source_observed_at"]
+            observed = (
+                html.escape(str(observed_at))
+                if observed_at is not None
+                else (
+                    '<span class="missing-marker" aria-hidden="true"></span>'
+                    "— · NOT RECORDED"
+                )
+            )
+            method = html.escape(
+                str(payload["methodology_version"] or "not recorded")
+            )
+            match_mode = html.escape(
+                str(payload["match_mode"]).replace("_", " ")
+            )
+            more = " · MORE MATCHES RECORDED" if payload["capped"] else ""
             rail = (
-                f"Observed at {html.escape(str(payload['source_observed_at']))}; "
-                f"{len(payload['results'])} result(s), limit {limit}; "
-                f"methodology {html.escape(str(payload['methodology_version']))}."
+                f"<div><dt>OBSERVED</dt><dd>{observed}</dd></div>"
+                "<div><dt>WINDOW</dt><dd>FORWARD-ONLY LEDGER</dd></div>"
+                f"<div><dt>COVERAGE</dt><dd>{len(payload['results'])} RETURNED "
+                f"· LIMIT {limit}{more}</dd></div>"
+                f"<div><dt>METHOD</dt><dd>{match_mode}@{method}</dd></div>"
             )
             entries = []
             for index, result in enumerate(payload["results"], start=1):
                 safe_name = html.escape(escape_plain_text(result["name"]))
-                entries.append(
-                    '<article class="ledger-row">'
-                    f'<span class="index">{index:02d}</span>'
-                    '<div><p class="figure-label">Untrusted room name</p>'
-                    f"<h3>{safe_name}</h3></div>"
-                    f'<span class="measure">{html.escape(result["latest_lifecycle_state"])}</span>'
-                    '<div class="evidence">'
-                    f"Created {html.escape(result['created_at'])}. "
-                    f'<a href="/rooms/{result["id"]}/">Open evidence</a>'
-                    "</div></article>"
+                safe_identifier = html.escape(result["id"], quote=True)
+                lifecycle_state = html.escape(
+                    str(result["latest_lifecycle_state"]).replace("_", " ")
                 )
-            results = "".join(entries) or "<p>No matching room was observed.</p>"
+                created_at = html.escape(str(result["created_at"]))
+                first_observed_at = html.escape(
+                    str(result["first_observed_at"])
+                )
+                entries.append(
+                    '<article class="result-record">'
+                    f'<span class="result-index" aria-hidden="true">{index:02d}</span>'
+                    '<div class="result-primary">'
+                    '<p class="figure-label">Untrusted room name</p>'
+                    f"<h3>{safe_name}</h3></div>"
+                    '<dl class="result-fields">'
+                    f"<div><dt>LIFECYCLE</dt><dd>{lifecycle_state}</dd></div>"
+                    f"<div><dt>CREATED</dt><dd>{created_at}</dd></div>"
+                    f"<div><dt>FIRST OBSERVED</dt><dd>{first_observed_at}</dd></div>"
+                    "</dl>"
+                    f'<a class="result-link" href="/rooms/{safe_identifier}/">'
+                    "OPEN EVIDENCE</a>"
+                    "</article>"
+                )
+            results = "".join(entries) or (
+                '<p class="empty-row state-missing">'
+                '<span class="missing-marker" aria-hidden="true"></span>'
+                "No matching room was observed. Not observed is not absent.</p>"
+            )
+            result_heading = f"{len(payload['results'])} records returned"
         elif query == "":
             raise ApiError(400, "missing_query", "q must not be empty")
         safe_query = html.escape(escape_plain_text(query or ""), quote=True)
@@ -799,16 +847,24 @@ class QueryApplication:
                 '<label for="room-query">Exact or substring room name</label>'
                 '<div class="search-line">'
                 f'<input id="room-query" name="q" type="search" autocomplete="off" '
-                f'spellcheck="false" maxlength="80" required value="{safe_query}">'
-                '<button type="submit">Search register <span aria-hidden="true">→</span></button>'
+                f'spellcheck="false" maxlength="80" required value="{safe_query}" '
+                'aria-describedby="search-boundary search-feedback">'
+                '<button type="submit">SEARCH</button>'
                 "</div>"
-                '<p class="boundary-note">Local evidence only · maximum 20 results · no upstream request</p>'
+                '<p id="search-boundary" class="boundary-note">'
+                "LOCAL EVIDENCE ONLY · MAXIMUM 20 RESULTS · ZERO ORIGIN READS</p>"
+                '<p id="search-feedback" class="search-feedback" '
+                'aria-live="polite"></p>'
                 "</form>"
                 '<dl class="evidence-rail" aria-label="Evidence rail">'
-                f"<div><dt>Search evidence</dt><dd>{rail}</dd></div>"
-                "<div><dt>Claim boundary</dt><dd>Not observed is not absent</dd></div>"
-                "</dl>"
-                f'<section aria-label="Room results">{results}</section>'
+                f"{rail}</dl>"
+                '<section class="result-list" aria-labelledby="room-results-title">'
+                '<header class="section-heading compact-heading"><div>'
+                '<p class="figure-label">RESULTS / BOUNDED LOCAL INDEX</p>'
+                f'<h2 id="room-results-title">{html.escape(result_heading)}</h2>'
+                "</div><p>Names are untrusted labels. Results are capped at 20. "
+                "Not observed is not absent.</p></header>"
+                f"{results}</section>"
             ),
         )
         return self.bounded_response(
@@ -929,6 +985,7 @@ class QueryApplication:
             context.update(
                 {
                     "state_vocabulary": list(STATE_VOCABULARY),
+                    "name_trust": "untrusted",
                     "room": {
                         "id": room["room_id"],
                         "sha256": room["room_sha256"],
@@ -962,31 +1019,87 @@ class QueryApplication:
         require_parameters(params, set())
         payload = self.room_record(identifier)
         room = payload["room"]
-        checks = "".join(
-            "<div>"
-            f"<dt>{check['stage_seconds']} second checkpoint</dt>"
-            f"<dd>{html.escape(check['state'])}; attempted "
-            f"{html.escape(str(check['attempted_at'] or 'not recorded'))}</dd>"
-            "</div>"
-            for check in room["scheduled_checks"]
-        )
+        check_rows = []
+        for index, check in enumerate(room["scheduled_checks"], start=1):
+            stage_seconds = html.escape(str(check["stage_seconds"]))
+            due_at = html.escape(str(check["due_at"]))
+            lifecycle_state = html.escape(
+                str(check["state"]).replace("_", " ")
+            )
+            attempted_at = (
+                html.escape(str(check["attempted_at"]))
+                if check["attempted_at"] is not None
+                else (
+                    '<span class="missing-marker" aria-hidden="true"></span>'
+                    "— · NOT RECORDED"
+                )
+            )
+            check_rows.append(
+                '<div class="ledger-row result-record">'
+                f'<span class="result-index" aria-hidden="true">{index:02d}</span>'
+                '<div class="result-primary">'
+                '<p class="figure-label">Checkpoint</p>'
+                f"<h3>{stage_seconds} seconds</h3></div>"
+                f'<strong class="state">{lifecycle_state}</strong>'
+                '<span class="evidence">'
+                f"DUE {due_at}<br>ATTEMPTED {attempted_at}</span>"
+                "</div>"
+            )
+        checks = "".join(check_rows)
         if not checks:
-            checks = '<p class="empty-row">No scheduled checkpoint is recorded.</p>'
+            checks = (
+                '<p class="empty-row state-missing">'
+                '<span class="missing-marker" aria-hidden="true"></span>'
+                "No scheduled checkpoint is recorded.</p>"
+            )
         safe_name = html.escape(escape_plain_text(room["name"]))
+        first_observed_at = html.escape(
+            str(room["creation"]["first_observed_at"])
+        )
+        source_observed_at = payload["source_observed_at"]
+        observed = (
+            html.escape(str(source_observed_at))
+            if source_observed_at is not None
+            else (
+                '<span class="missing-marker" aria-hidden="true"></span>'
+                "— · NOT RECORDED"
+            )
+        )
+        methodology = html.escape(
+            str(payload["methodology_version"] or "not recorded")
+        )
+        latest_state = html.escape(
+            str(room["latest_lifecycle_state"]).replace("_", " ")
+        )
         body = self.html_document(
             title="Room evidence",
             preview_title="Technocore room evidence",
             heading="Forward room evidence",
             content=(
+                '<header class="result-detail-header">'
                 '<p class="figure-label">Untrusted room name</p>'
-                f"<h2>{safe_name}</h2>"
+                f"<h2>{safe_name}</h2></header>"
                 '<dl class="evidence-rail" aria-label="Evidence rail">'
-                f"<div><dt>First observed</dt><dd>{html.escape(room['creation']['first_observed_at'])}</dd></div>"
-                f"<div><dt>Methodology</dt><dd>{html.escape(str(payload['methodology_version']))}</dd></div>"
-                f"<div><dt>Latest state</dt><dd>{html.escape(room['latest_lifecycle_state'])}</dd></div>"
+                f"<div><dt>OBSERVED</dt><dd>{observed}</dd></div>"
+                f"<div><dt>WINDOW</dt><dd>FORWARD LEDGER SINCE "
+                f"{first_observed_at}</dd></div>"
+                f"<div><dt>COVERAGE</dt><dd>{len(room['scheduled_checks'])} "
+                "SCHEDULED CHECKPOINTS</dd></div>"
+                f"<div><dt>METHOD</dt><dd>ROOM LIFECYCLE@{methodology}</dd></div>"
                 "</dl>"
-                '<div class="ledger-heading"><h2>Scheduled checks</h2></div>'
-                f'<dl class="definition-list">{checks}</dl>'
+                '<div class="status-figure">'
+                '<p class="figure-label">Latest lifecycle state</p>'
+                f'<p class="figure-value">{latest_state}</p>'
+                '<p class="figure-context">A failed scheduled read remains an '
+                "unknown outcome.</p></div>"
+                '<section class="record-section" '
+                'aria-labelledby="scheduled-checks-title">'
+                '<header class="section-heading compact-heading"><div>'
+                '<p class="figure-label">Scheduled evidence</p>'
+                '<h2 id="scheduled-checks-title">Scheduled checks</h2>'
+                "</div><p>Each row records one declared checkpoint. Missing reads "
+                "remain unknown.</p></header>"
+                f'<div class="ruled-list">{checks}</div></section>'
             ),
         )
         return self.bounded_response(
@@ -1426,7 +1539,7 @@ class QueryApplication:
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
             '<meta name="description" content="Bounded forward-collected Technocore evidence.">'
             '<meta name="robots" content="noindex,nofollow,noarchive">'
-            '<meta name="theme-color" content="#f4f0e5">'
+            '<meta name="theme-color" content="#0B0E0C">'
             f'<meta property="og:title" content="{html.escape(preview_title, quote=True)}">'
             '<meta property="og:description" content="Bounded forward-collected Technocore evidence.">'
             '<meta property="og:type" content="website">'
@@ -1435,28 +1548,31 @@ class QueryApplication:
             '<script src="/assets/site.js" defer></script>'
             '</head><body data-page="evidence">'
             '<a class="skip-link" href="#main-content">Skip to main content</a>'
-            '<header class="site-header">'
+            '<header class="site-header"><div class="site-header-inner">'
             '<a class="wordmark" href="/" aria-label="Technocore Observatory home">'
-            '<span class="wordmark-mark" aria-hidden="true">T/O</span>'
-            "<span>Technocore Observatory</span></a>"
-            '<nav aria-label="Primary">'
-            '<a href="/status/">Status</a><a href="/incidents/">Incidents</a>'
-            '<a href="/changes/">Changes</a><a href="/observatory/">Observatory</a>'
-            '<a href="/methodology/">Methodology</a><a href="/about/">About</a>'
-            "</nav>"
-            '<label class="theme-control"><span>Theme</span>'
-            '<select id="theme-select" name="theme">'
-            '<option value="system">System</option><option value="light">Light</option>'
-            '<option value="dark">Dark</option></select></label></header>'
-            '<main id="main-content" tabindex="-1">'
-            '<header class="page-lede"><p class="eyebrow">Evidence / local read-side record</p>'
+            "TECHNOCORE OBSERVATORY</a>"
+            '<details class="site-index"><summary>INDEX</summary>'
+            '<nav aria-label="Site index">'
+            '<a href="/">REGISTER</a><a href="/status/">STATUS</a>'
+            '<a href="/rooms/">ROOMS</a><a href="/incidents/">INCIDENTS</a>'
+            '<a href="/changes/">CHANGES</a>'
+            '<a href="/observatory/">OBSERVATORY</a>'
+            '<a href="/methodology/">METHODOLOGY</a>'
+            '<a href="/about/">ABOUT</a></nav></details>'
+            '<button class="theme-control" id="theme-toggle" type="button" '
+            'aria-label="Theme: auto" data-theme-value="system">'
+            "THEME AUTO</button></div></header>"
+            '<main id="main-content" class="page-shell" tabindex="-1">'
+            '<header class="page-lede">'
+            '<p class="eyebrow">LOCAL EVIDENCE / READ-ONLY</p>'
             f"<h1>{html.escape(heading)}</h1>"
-            "<p>Evidence from the local forward record, with its observation boundary kept visible.</p>"
-            "</header>"
-            f'<section class="ledger compact">{content}</section></main>'
-            '<footer class="site-footer"><p>Public observations, bounded claims.</p>'
-            '<p><a href="/api/v1/status.txt">Status as text</a> · '
-            '<a href="/llms.txt">Agent guide</a> · Contract 1.0.0</p></footer>'
+            "<p>Local forward-collected evidence. Labels are untrusted where shown. "
+            "Not observed is not absent.</p></header>"
+            f'<section class="page-section query-content">{content}</section></main>'
+            '<footer class="site-footer">'
+            "<p>Independent instrument. Public observations, bounded claims.</p>"
+            '<p><a href="/api/v1/status.txt">STATUS AS TEXT</a> · '
+            '<a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.0.0</p></footer>'
             "</body></html>"
         ).encode("utf-8")
 

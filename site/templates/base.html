@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="description" content="%%DESCRIPTION%%">
   <meta name="robots" content="%%ROBOTS%%">
-  <meta name="theme-color" content="#f4f0e5">
+  <meta name="theme-color" content="#0B0E0C">
   <meta property="og:title" content="%%TITLE%% — Technocore Observatory">
   <meta property="og:description" content="%%DESCRIPTION%%">
   <meta property="og:type" content="website">
@@ -14,35 +14,31 @@
   <script src="%%ASSET_PREFIX%%assets/site.js" defer></script>
 </head>
 <body data-page="%%PAGE%%">
-  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <a class="skip-link" href="#main-content">SKIP TO CONTENT</a>
   <header class="site-header">
-    <a class="wordmark" href="/" aria-label="Technocore Observatory home">
-      <span class="wordmark-mark" aria-hidden="true">T/O</span>
-      <span>Technocore Observatory</span>
-    </a>
-    <nav aria-label="Primary">
-      <a href="/status/">Status</a>
-      <a href="/incidents/">Incidents</a>
-      <a href="/changes/">Changes</a>
-      <a href="/observatory/">Observatory</a>
-      <a href="/methodology/">Methodology</a>
-      <a href="/about/">About</a>
-    </nav>
-    <label class="theme-control">
-      <span>Theme</span>
-      <select id="theme-select" name="theme">
-        <option value="system">System</option>
-        <option value="light">Light</option>
-        <option value="dark">Dark</option>
-      </select>
-    </label>
+    <a class="wordmark" href="/" aria-label="Technocore Observatory home">TECHNOCORE OBSERVATORY</a>
+
+    <details class="site-index">
+      <summary>INDEX</summary>
+      <nav aria-label="Site index">
+        <a href="/">REGISTER</a>
+        <a href="/status/">STATUS</a>
+        <a href="/rooms/">ROOMS</a>
+        <a href="/incidents/">INCIDENTS</a>
+        <a href="/changes/">CHANGES</a>
+        <a href="/observatory/">OBSERVATORY</a>
+        <a href="/methodology/">METHODOLOGY</a>
+        <a href="/about/">ABOUT</a>
+      </nav>
+    </details>
+    <button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>
   </header>
-  <main id="main-content" tabindex="-1">
+  <main id="main-content" class="page-shell" tabindex="-1">
 %%CONTENT%%
   </main>
   <footer class="site-footer">
-    <p>Public observations, bounded claims.</p>
-    <p><a href="/api/v1/status.txt">Status as text</a> · <a href="/llms.txt">Agent guide</a> · Contract 1.0.0</p>
+    <p>PUBLIC OBSERVATIONS. BOUNDED CLAIMS.</p>
+    <p><a href="/api/v1/status.txt">STATUS AS TEXT</a> · <a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.0.0</p>
   </footer>
 </body>
 </html>

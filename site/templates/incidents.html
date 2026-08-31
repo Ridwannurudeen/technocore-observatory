@@ -1,16 +1,25 @@
     <header class="page-lede">
-      <p class="eyebrow">PULSE / incident register</p>
-      <h1>Observed failure intervals</h1>
-      <p>Only three declared rules create records. Every interval says what failed, when it was observed and what observation resolved it—not why it happened.</p>
+      <p class="eyebrow">INCIDENTS / DERIVED INTERVALS</p>
+      <h1>OBSERVED FAILURE INTERVALS</h1>
+      <p>Only three declared rules create records. Every interval states what failed, when it was observed and what observation resolved it. It does not claim why the source failed.</p>
     </header>
+
     <section class="incident-index" aria-labelledby="incident-title">
-      <div class="ledger-heading"><p class="figure-label">01 / Bounded history</p><h2 id="incident-title">%%INCIDENT_COUNT%% derived records</h2></div>
+      <div class="ledger-heading">
+        <div>
+          <p class="figure-label">01 / BOUNDED HISTORY</p>
+          <h2 id="incident-title">%%INCIDENT_COUNT%% derived records</h2>
+        </div>
+        <p>Rules are applied to retained evidence. Unobserved intervals remain unknown.</p>
+      </div>
 %%INCIDENT_ROWS%%
     </section>
+
     <dl class="evidence-rail" aria-label="Incident evidence metadata">
-      <div><dt>Rules version</dt><dd>1.0.0</dd></div>
-      <div><dt>Source observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
-      <div><dt>Valid until</dt><dd>%%VALID_UNTIL%%</dd></div>
-      <div><dt>Maximum</dt><dd>100 records</dd></div>
+      <div><dt>Observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
+      <div><dt>Window</dt><dd>Valid until %%VALID_UNTIL%%</dd></div>
+      <div><dt>Coverage</dt><dd>Maximum 100 records</dd></div>
+      <div><dt>Method</dt><dd>INCIDENT RULES@1.0.0</dd></div>
     </dl>
-    <p class="machine-links"><a href="/api/v1/incidents">Plain text</a><a href="/api/v1/incidents?format=json">JSON</a></p>
+
+    <p class="machine-links"><a href="/api/v1/incidents">PLAIN TEXT</a><a href="/api/v1/incidents?format=json">JSON</a></p>

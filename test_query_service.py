@@ -535,8 +535,14 @@ def test_search_requires_a_query_and_plain_html_has_no_default_listing(running_s
     status, headers, body = request(running_server, "GET", "/rooms/")
     assert status == 200
     assert headers["Content-Type"].startswith("text/html")
-    assert b'<form class="room-search" method="get" action="/rooms/"' in body
-    assert b'name="q"' in body
+    form = body.partition(b'<form class="room-search"')[2].partition(b"</form>")[0]
+    assert form
+    assert b'action="/rooms/"' in form
+    assert b'method="get"' in form
+    assert b'id="room-query"' in form
+    assert b'name="q"' in form
+    assert b'id="search-feedback"' in form
+    assert b'aria-live="polite"' in form
     assert b"needle-room" not in body
 
     status, _, body = request(running_server, "GET", "/rooms/?limit=1")
@@ -780,6 +786,7 @@ def test_hostile_names_are_valid_json_and_cannot_forge_plain_text_fields(
 
     status, _, body = request(running_server, "GET", "/api/v1/rooms/search?q=forged")
     assert status == 200
+    assert b"name_trust: untrusted" in body
     assert b"\\r\\n" in body
     assert b"\r\ncontract_version: forged" not in body
 
@@ -1194,6 +1201,15 @@ def test_room_evidence_includes_every_check_listing_presence_and_state_vocabular
         "listing_observed_at": "2026-08-30T09:00:00Z",
         "last_listed_at": "2026-08-30T09:00:00Z",
     }
+
+    status, _, body = request(
+        running_server,
+        "GET",
+        f"/api/v1/rooms/{identifier}",
+    )
+    assert status == 200
+    assert b"name_trust: untrusted" in body
+
     assert set(payload["state_vocabulary"]) == {
         "unknown",
         "not_yet_checked",
@@ -1264,31 +1280,59 @@ def test_room_id_selects_the_newest_generation_and_only_its_revisits(
 
 
 def test_progressive_room_html_escapes_names_and_uses_generic_previews(running_server):
+    shared_shell = (
+        '<link rel="stylesheet" href="/assets/styles.css">',
+        '<script src="/assets/site.js" defer></script>',
+        '<a class="skip-link" href="#main-content">',
+        '<header class="site-header">',
+        "TECHNOCORE OBSERVATORY",
+        '<details class="site-index">',
+        '<summary>INDEX</summary>',
+        '<nav aria-label="Site index">',
+        '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>',
+        '<main id="main-content" class="page-shell" tabindex="-1">',
+        '<footer class="site-footer">',
+    )
+
     status, headers, body = request(running_server, "GET", "/rooms/?q=forged")
     source = body.decode("utf-8")
     assert status == 200
-    assert headers["X-Robots-Tag"] == "noindex, nofollow, noarchive"
+    assert headers["X-Robots-Tag"] == "noindex, nofollow, noarchive".replace(
+        ",nofollow", ", nofollow"
+    )
+    for marker in shared_shell:
+        assert marker in source
+    assert 'class="priority-nav"' not in source
+    form = source.partition('<form class="room-search"')[2].partition("</form>")[0]
+    assert form
+    assert 'action="/rooms/"' in form
+    assert 'method="get"' in form
+    assert 'id="room-query"' in form
+    assert 'name="q"' in form
+    assert 'id="search-feedback"' in form
+    assert 'aria-live="polite"' in form
+    assert "maximum 20 results" in form.lower()
     assert "Untrusted room name" in source
+    assert '<article class="result-record">' in source
+    for label in ("OBSERVED", "WINDOW", "COVERAGE", "METHOD"):
+        assert f"<dt>{label}</dt>" in source
+    assert "Not observed is not absent" in source
     assert "<script>alert(1)</script>" not in source
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in source
     assert '<meta property="og:title" content="Technocore room search">' in source
     assert "forged<script>" not in source.split("<head>", 1)[1].split("</head>", 1)[0]
-    assert '<link rel="stylesheet" href="/assets/styles.css">' in source
-    assert '<script src="/assets/site.js" defer></script>' in source
-    assert 'class="site-header"' in source
-    assert '<select id="theme-select"' in source
-    assert '<main id="main-content"' in source
 
     identifier = room_id("evidence-room")
     status, _, body = request(running_server, "GET", f"/rooms/{identifier}/")
     source = body.decode("utf-8")
     assert status == 200
+    for marker in shared_shell:
+        assert marker in source
+    assert 'class="priority-nav"' not in source
     assert "Evidence rail" in source
     assert "Untrusted room name" in source
     assert '<meta property="og:title" content="Technocore room evidence">' in source
     assert "evidence-room" not in source.split("<head>", 1)[1].split("</head>", 1)[0]
-    assert '<link rel="stylesheet" href="/assets/styles.css">' in source
-    assert 'class="site-header"' in source
 
 
 def test_trace_returns_only_direct_bounded_facts_and_hashes_rooms(running_server):
@@ -1383,9 +1427,12 @@ def test_trace_is_exact_only_and_html_page_uses_generic_metadata(running_server)
     assert DID not in source.split("<head>", 1)[1].split("</head>", 1)[0]
     assert '<link rel="stylesheet" href="/assets/styles.css">' in source
     assert '<script src="/assets/site.js" defer></script>' in source
-    assert 'class="site-header"' in source
-    assert '<select id="theme-select"' in source
-    assert '<main id="main-content"' in source
+    assert '<header class="site-header">' in source
+    assert '<details class="site-index">' in source
+    assert '<nav aria-label="Site index">' in source
+    assert '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>' in source
+    assert 'class="priority-nav"' not in source
+    assert '<main id="main-content" class="page-shell" tabindex="-1">' in source
     for prohibited in ("liveness", "quality", "verification"):
         assert prohibited not in source.lower()
 
