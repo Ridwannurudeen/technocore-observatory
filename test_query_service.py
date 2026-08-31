@@ -1302,7 +1302,7 @@ def test_progressive_room_html_escapes_names_and_uses_generic_previews(running_s
     )
     for marker in shared_shell:
         assert marker in source
-    assert 'class="priority-nav"' not in source
+    assert '<nav class="priority-nav" aria-label="Primary">' in source
     form = source.partition('<form class="room-search"')[2].partition("</form>")[0]
     assert form
     assert 'action="/rooms/"' in form
@@ -1328,7 +1328,7 @@ def test_progressive_room_html_escapes_names_and_uses_generic_previews(running_s
     assert status == 200
     for marker in shared_shell:
         assert marker in source
-    assert 'class="priority-nav"' not in source
+    assert '<nav class="priority-nav" aria-label="Primary">' in source
     assert "Evidence rail" in source
     assert "Untrusted room name" in source
     assert '<meta property="og:title" content="Technocore room evidence">' in source
@@ -1434,7 +1434,7 @@ def test_trace_is_exact_only_and_html_page_uses_generic_metadata(running_server)
         '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>'
         in source
     )
-    assert 'class="priority-nav"' not in source
+    assert '<nav class="priority-nav" aria-label="Primary">' in source
     assert '<main id="main-content" class="page-shell" tabindex="-1">' in source
     for prohibited in ("liveness", "quality", "verification"):
         assert prohibited not in source.lower()

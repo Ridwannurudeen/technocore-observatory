@@ -31,6 +31,15 @@
   let theme = readTheme();
   applyTheme(theme);
 
+  const page = document.body.dataset.page;
+  if (page) {
+    document.querySelectorAll(".priority-nav a").forEach((link) => {
+      if (link.getAttribute("href") === `/${page}/`) {
+        link.setAttribute("aria-current", "page");
+      }
+    });
+  }
+
   if (themeToggle) {
     themeToggle.addEventListener("click", () => {
       const nextIndex = (themes.indexOf(theme) + 1) % themes.length;
