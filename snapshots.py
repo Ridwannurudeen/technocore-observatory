@@ -1065,6 +1065,12 @@ def envelope(
     ledger_chain_head: str | None,
     freshness_state: str | None = None,
 ) -> dict[str, Any]:
+    if parse_utc(derived_at) > parse_utc(published_at):
+        raise ValueError("snapshot publication predates derivation")
+    if source_observed_at is not None and parse_utc(source_observed_at) > parse_utc(
+        derived_at
+    ):
+        raise ValueError("snapshot source observation postdates derivation")
     validity = valid_until(source_observed_at)
     metadata = common_metadata(
         source_observed_at=source_observed_at,
@@ -1153,10 +1159,10 @@ def build_snapshots_from_records(
     published_at: str | None = None,
     gap_seconds: float = 300.0,
 ) -> dict[str, dict[str, Any]]:
-    derived_time = canonical_time(derived_at)
-    published_time = canonical_time(published_at or derived_time)
     derived = derive.derive_records(ticks, rejected_ticks, gap_seconds)
     telemetry = load_telemetry(Path(telemetry_path))
+    derived_time = canonical_time(derived_at)
+    published_time = canonical_time(published_at or derived_time)
 
     collector_version = derived["collector_version"]
     methodology_version = derived["methodology_version"]

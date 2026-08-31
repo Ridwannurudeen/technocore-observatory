@@ -276,12 +276,12 @@ command -v flock
 ```
 
 Do not place `map`, `log_format`, or `limit_req_zone` inside a server block. Do not reload nginx or
-systemd yet. `UMask=0027` makes ordinary SQLite and metadata files owner-writable and
-group-readable; the tick ledger and lock files deliberately use mode `0600`. Before starting the
-query service, verify the signer database is owned by `technocore:technocore` and is not
-group-writable. The `technocore-query` user receives read access through its supplementary
-`technocore` group; its unit has no `ReadWritePaths` and opens SQLite in `mode=ro` with
-`PRAGMA query_only=ON`.
+systemd yet. `UMask=0027` makes SQLite databases owner-writable and group-readable at mode `0640`.
+Atomically replaced JSON state, the tick ledger, and lock files deliberately use mode `0600`.
+Before starting the query service, verify the signer database is owned by
+`technocore:technocore` and is not group-writable. The `technocore-query` user receives read access
+through its supplementary `technocore` group; its unit has no `ReadWritePaths` and opens SQLite in
+`mode=ro` with `PRAGMA query_only=ON`.
 
 ## 4. Run the one-time signer migration only when needed
 
@@ -310,8 +310,8 @@ timestamp. Do not invent it. A successful run prints matching source/SQLite coun
 `signers.json` metadata and `signers.sqlite3`. If migration fails, it removes its partial database;
 keep writers fenced and diagnose before retrying.
 
-Restore `technocore:technocore` ownership and mode `0640` on the signer metadata and database before
-continuing.
+Restore `technocore:technocore` ownership, mode `0600` on the signer JSON metadata, and mode `0640`
+on the signer database before continuing.
 
 For a v2 source, refresh the recovery-ready state snapshot with the newly created `signers.json`
 and `signers.sqlite3` before activation. Record that these two files are the paired output of the

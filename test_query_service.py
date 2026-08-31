@@ -1622,6 +1622,25 @@ def test_semantically_invalid_snapshot_envelopes_are_server_failures(
     assert error["error"] == "snapshot_invalid"
 
 
+def test_snapshot_source_observation_cannot_postdate_derivation(
+    running_server,
+    snapshot_root,
+):
+    status_path = snapshot_root / "api" / "v1" / "status.json"
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    payload["source_observed_at"] = "2026-08-30T09:00:31Z"
+    payload["valid_until"] = "2026-08-30T09:15:31Z"
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    status, _, error = json_request(
+        running_server,
+        "/api/v1/status?format=json",
+    )
+
+    assert status == 503
+    assert error["error"] == "snapshot_invalid"
+
+
 def test_snapshot_resource_shape_and_ledger_applicability_are_validated(
     running_server,
     snapshot_root,

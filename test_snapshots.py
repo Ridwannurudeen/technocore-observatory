@@ -177,6 +177,44 @@ def test_status_counts_503_attempts_instead_of_reporting_zero_activity(tmp_path)
     assert endpoints["/rooms"]["observed_failures"] == 1
 
 
+def test_snapshot_rejects_a_source_observation_after_derivation(tmp_path):
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
+    with telemetry_database(telemetry) as connection:
+        add_attempt(
+            connection,
+            attempt_id=1,
+            route="/healthz",
+            observed_at="2026-08-30T00:00:02Z",
+            outcome="success",
+            status=200,
+        )
+
+    with pytest.raises(ValueError, match="source observation postdates derivation"):
+        build_snapshots(
+            ticks,
+            telemetry,
+            derived_at="2026-08-30T00:00:01Z",
+            published_at="2026-08-30T00:00:03Z",
+        )
+
+
+def test_snapshot_rejects_publication_before_derivation(tmp_path):
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
+    telemetry_database(telemetry).close()
+
+    with pytest.raises(ValueError, match="publication predates derivation"):
+        build_snapshots(
+            ticks,
+            telemetry,
+            derived_at="2026-08-30T00:00:02Z",
+            published_at="2026-08-30T00:00:01Z",
+        )
+
+
 def test_incidents_resolve_health_5xx_and_collector_gap_intervals(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     telemetry = tmp_path / "telemetry.sqlite3"

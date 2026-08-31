@@ -1224,7 +1224,10 @@ class QueryApplication:
                 expected_valid_time = source_time + QUERY_VALIDITY
             except (ApiError, OverflowError) as error:
                 raise invalid from error
-            if valid_time != expected_valid_time:
+            if (
+                source_time > timestamps["derived_at"]
+                or valid_time != expected_valid_time
+            ):
                 raise invalid
             expected_freshness = (
                 "fresh" if timestamps["generated_at"] <= valid_time else "stale"

@@ -94,7 +94,7 @@ def built_release(tmp_path):
         telemetry,
         tmp_path / "public",
         Path("index.html"),
-        derived_at="2026-08-30T00:01:10Z",
+        derived_at="2026-08-30T00:01:50Z",
         published_at="2026-08-30T00:02:00Z",
     )
     return release, hostile_name
@@ -351,6 +351,54 @@ def test_build_release_reads_the_tick_ledger_once(tmp_path, monkeypatch):
     )
 
     assert calls == [ticks]
+
+
+def test_build_release_samples_clock_after_the_telemetry_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
+    telemetry_connection = telemetry_database(telemetry)
+    original_load = snapshots.load_telemetry
+    telemetry_loaded = False
+
+    def racing_load(path):
+        nonlocal telemetry_loaded
+        add_attempt(
+            telemetry_connection,
+            attempt_id=1,
+            route="/healthz",
+            observed_at="2026-08-30T00:00:02Z",
+            outcome="success",
+            status=200,
+        )
+        telemetry_connection.commit()
+        telemetry_connection.close()
+        result = original_load(path)
+        telemetry_loaded = True
+        return result
+
+    def ordered_clock():
+        return "2026-08-30T00:00:03Z" if telemetry_loaded else "2026-08-30T00:00:01Z"
+
+    monkeypatch.setattr(snapshots, "load_telemetry", racing_load)
+    monkeypatch.setattr(snapshots, "utc_now", ordered_clock)
+
+    release = build_release(
+        ticks,
+        telemetry,
+        tmp_path / "public",
+        Path("index.html"),
+    )
+    status = json.loads((release / "api/v1/status.json").read_bytes())
+
+    assert release.name.startswith("20260830000003-")
+    assert status["source_observed_at"] == "2026-08-30T00:00:02Z"
+    assert status["derived_at"] == "2026-08-30T00:00:03Z"
+    assert status["published_at"] == "2026-08-30T00:00:03Z"
+    assert status["generated_at"] == "2026-08-30T00:00:03Z"
 
 
 def test_unpublished_sidecar_exists_before_the_release_rename(tmp_path, monkeypatch):

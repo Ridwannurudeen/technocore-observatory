@@ -17,7 +17,6 @@ import derive
 from api_contract import json_bytes
 from snapshots import (
     build_snapshots_from_records,
-    canonical_time,
     load_ticks,
     parse_utc,
     write_snapshot_artifacts,
@@ -750,18 +749,18 @@ def build_release(
     release_id: str | None = None,
     gap_seconds: float = 300.0,
 ) -> Path:
-    derived_time = canonical_time(derived_at)
-    published_time = canonical_time(published_at or derived_time)
     loaded_ticks, rejected_ticks = load_ticks(Path(ticks_path))
     ticks = tuple(loaded_ticks)
     snapshots = build_snapshots_from_records(
         ticks,
         rejected_ticks,
         telemetry_path,
-        derived_at=derived_time,
-        published_at=published_time,
+        derived_at=derived_at,
+        published_at=published_at,
         gap_seconds=gap_seconds,
     )
+    derived_time = snapshots["status"]["derived_at"]
+    published_time = snapshots["status"]["published_at"]
     identifier = release_id or release_identifier(snapshots, published_time)
     if RELEASE_NAME.fullmatch(identifier) is None:
         raise ValueError(
