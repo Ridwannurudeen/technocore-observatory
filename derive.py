@@ -3575,9 +3575,12 @@ def inject_html(path: Path, data: dict[str, Any]) -> None:
     for key, percent in ssr_widths(data).items():
         updated = replace_ssr_width(updated, key, percent)
 
+    # The search-snippet description carries the observation count and window.
+    # og:description must NOT: a share card is cached indefinitely by the
+    # consuming platform, so an observed figure there goes stale with no
+    # evidence rail to qualify it. The card keeps the template's generic line.
     description = description_text(data)
     updated = replace_meta(updated, "name", "description", description)
-    updated = replace_meta(updated, "property", "og:description", description)
     path.write_text(updated, encoding="utf-8")
 
 

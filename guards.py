@@ -85,16 +85,19 @@ STATIC_RELEASE_FILES = frozenset(
         "api/v1/status",
         "api/v1/status.json",
         "api/v1/status.txt",
+        "assets/favicon.svg",
         "assets/site.js",
         "assets/styles.css",
         "changes/index.html",
         "data.json",
+        "favicon.ico",
         "errors/query-unavailable.html",
         "incidents/index.html",
         "index.html",
         "llms.txt",
         "methodology/index.html",
         "observatory/index.html",
+        "og.png",
         "openapi.json",
         "robots.txt",
         "rooms/index.html",
@@ -117,8 +120,8 @@ DISCOVERY_PATHS = frozenset(
         "/api/v1/status",
     }
 )
-RESOURCE_ATTRIBUTE = re.compile(
-    r'<(?:script|link|img|source|iframe)\b[^>]*\b(?:src|href)=["\']([^"\']+)',
+RESOURCE_TAG = re.compile(
+    r"<(script|link|img|source|iframe)\b([^>]*)>",
     re.I,
 )
 FORM = re.compile(r"<form\b([^>]*)>", re.I)
@@ -546,7 +549,16 @@ def guard_static_release(root: Path) -> list[str]:
     for path in html_files:
         relative = path.relative_to(root).as_posix()
         source = path.read_text(encoding="utf-8")
-        for target in RESOURCE_ATTRIBUTE.findall(source):
+        for tag, attributes in RESOURCE_TAG.findall(source):
+            parsed = {
+                name.lower(): value for name, _, value in ATTRIBUTE.findall(attributes)
+            }
+            target = parsed.get("src") or parsed.get("href")
+            if target is None:
+                continue
+            rel_values = set(parsed.get("rel", "").lower().split())
+            if tag.lower() == "link" and rel_values == {"canonical"}:
+                continue
             if target.lower().startswith(("http://", "https://", "//")):
                 failures.append(f"`{relative}` loads an external resource: {target}")
         for attributes in FORM.findall(source):
