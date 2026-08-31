@@ -563,7 +563,7 @@ def test_rebuild_removes_an_unpublished_release_when_guards_fail(tmp_path):
         "(release / 'observatory').mkdir()\n"
         "(release.parent / f'.unpublished-{release.name}').write_bytes(b'')\n"
         "if os.name == 'nt':\n"
-        "    relative = release.relative_to(Path(tempfile.gettempdir()))\n"
+        "    relative = release.resolve().relative_to(Path(tempfile.gettempdir()).resolve())\n"
         "    print('/tmp/' + relative.as_posix())\n"
         "else:\n"
         "    print(release.resolve())\n",

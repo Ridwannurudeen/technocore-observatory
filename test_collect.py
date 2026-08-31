@@ -5,6 +5,8 @@ import sqlite3
 import sys
 import time
 import types
+from contextlib import nullcontext
+from unittest import mock
 
 import pytest
 
@@ -193,7 +195,10 @@ def test_origin_json_integer_limit_failures_are_invalid_responses(parser, body):
     ),
 )
 def test_origin_json_recursion_failures_are_invalid_responses(parser, body):
-    with pytest.raises(CollectionError) as caught:
+    with (
+        mock.patch.object(json, "loads", side_effect=RecursionError),
+        pytest.raises(CollectionError) as caught,
+    ):
         parser(body)
 
     assert caught.value.outcome == "invalid_response"
@@ -971,6 +976,7 @@ def test_census_pacing_handles_deadline_crossed_between_clock_reads(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setattr(collect, "exclusive_state_lock", lambda *_args: nullcontext())
     clock = iter((0.0, 1.0, 1799.9, 1800.1))
     monkeypatch.setattr(collect.time, "monotonic", lambda: next(clock))
     sleeps = []
@@ -1032,20 +1038,30 @@ def test_census_rejects_a_final_shard_that_overflows_the_aggregate(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "decoder_recursion"),
     (
         pytest.param(
             f'{{"version":1,"counts":{{"did-00":{HUGE_JSON_INTEGER}}}}}',
+            False,
             id="integer-limit",
         ),
-        pytest.param(DEEPLY_NESTED_JSON, id="recursion-limit"),
+        pytest.param(DEEPLY_NESTED_JSON, True, id="recursion-limit"),
     ),
 )
-def test_census_state_json_parser_failures_are_collection_errors(tmp_path, payload):
+def test_census_state_json_parser_failures_are_collection_errors(
+    tmp_path,
+    payload,
+    decoder_recursion,
+):
     path = tmp_path / "census.json"
     path.write_text(payload, encoding="utf-8")
+    decoder = (
+        mock.patch.object(json, "loads", side_effect=RecursionError)
+        if decoder_recursion
+        else nullcontext()
+    )
 
-    with pytest.raises(CollectionError, match="cannot read census state"):
+    with decoder, pytest.raises(CollectionError, match="cannot read census state"):
         collect.load_census_state(path)
 
 
@@ -1099,18 +1115,20 @@ def test_census_state_rejects_counts_outside_integer_storage(
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "decoder_recursion"),
     (
         pytest.param(
             f'{{"version":5,"tracked_cap":{HUGE_JSON_INTEGER}}}',
+            False,
             id="integer-limit",
         ),
-        pytest.param(DEEPLY_NESTED_JSON, id="recursion-limit"),
+        pytest.param(DEEPLY_NESTED_JSON, True, id="recursion-limit"),
     ),
 )
 def test_legacy_signer_metadata_parser_failures_are_collection_errors(
     tmp_path,
     payload,
+    decoder_recursion,
 ):
     path = tmp_path / "signers.sqlite3"
     connection = sqlite3.connect(path)
@@ -1126,24 +1144,31 @@ def test_legacy_signer_metadata_parser_failures_are_collection_errors(
     connection.commit()
     connection.close()
 
-    with pytest.raises(CollectionError, match="invalid metadata JSON"):
+    decoder = (
+        mock.patch.object(json, "loads", side_effect=RecursionError)
+        if decoder_recursion
+        else nullcontext()
+    )
+    with decoder, pytest.raises(CollectionError, match="invalid metadata JSON"):
         connect_signer_database(path)
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "decoder_recursion"),
     (
         pytest.param(
             f'{{"version":6,"tracked_cap":{HUGE_JSON_INTEGER}}}',
+            False,
             id="integer-limit",
         ),
-        pytest.param(DEEPLY_NESTED_JSON, id="recursion-limit"),
+        pytest.param(DEEPLY_NESTED_JSON, True, id="recursion-limit"),
     ),
 )
 def test_current_signer_metadata_parser_failures_are_collection_errors(
     signer_store,
     tmp_path,
     payload,
+    decoder_recursion,
 ):
     state_path = tmp_path / "signers.json"
     state = new_signer_state(100)
@@ -1154,7 +1179,12 @@ def test_current_signer_metadata_parser_failures_are_collection_errors(
     )
     signer_store.commit()
 
-    with pytest.raises(CollectionError, match="invalid metadata JSON"):
+    decoder = (
+        mock.patch.object(json, "loads", side_effect=RecursionError)
+        if decoder_recursion
+        else nullcontext()
+    )
+    with decoder, pytest.raises(CollectionError, match="invalid metadata JSON"):
         collect.load_signer_state(state_path, 100, signer_store)
 
 
@@ -3735,7 +3765,10 @@ def test_v2_migration_rejects_unbounded_tick_counts(tmp_path, invalid_value):
     metadata = tmp_path / "signers.json"
     source.write_text(payload, encoding="utf-8")
 
-    with pytest.raises(CollectionError, match="signer JSON"):
+    with (
+        mock.patch.object(json.JSONDecoder, "raw_decode", side_effect=RecursionError),
+        pytest.raises(CollectionError, match="signer JSON"),
+    ):
         migrate_signers(source, metadata)
 
     assert not metadata.exists()

@@ -171,9 +171,9 @@ On Windows, the deployment tests perform structural nginx and systemd validation
 their skip messages. They do not claim that `nginx -t` or `systemd-analyze verify` ran. Those two
 runtime checks belong on the Linux target immediately before activation.
 
-GitHub Actions runs the full suite, compilation, Ruff checks, real-browser render coverage, and
-shell syntax checks on Python 3.12 across Ubuntu and Windows. Test dependencies are pinned in
-`requirements-dev.txt`; production remains standard-library-only.
+GitHub Actions runs the full suite, compilation, Ruff checks, and real-browser render coverage on
+Python 3.12 across Ubuntu and Windows, with the deployment shell syntax check on Ubuntu. Direct test
+tools are pinned in `requirements-dev.txt`; production remains standard-library-only.
 
 ## Public API
 
