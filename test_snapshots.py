@@ -1,7 +1,9 @@
 import json
 import sqlite3
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -663,30 +665,34 @@ def test_discovery_changes_distinguish_explicit_null_from_field_absence():
 
 
 @pytest.mark.parametrize(
-    ("location", "fields_json", "message"),
+    ("location", "fields_json", "message", "decoder_recursion"),
     (
         pytest.param(
             "predecessor",
             '{"service":' + "1" * 4_301 + "}",
             "discovery predecessor fields_json must contain valid JSON",
+            False,
             id="predecessor-integer-limit",
         ),
         pytest.param(
             "predecessor",
             "[" * 5_000 + "0" + "]" * 5_000,
             "discovery predecessor fields_json must contain valid JSON",
+            True,
             id="predecessor-recursion-limit",
         ),
         pytest.param(
             "snapshot",
             '{"service":' + "1" * 4_301 + "}",
             "discovery fields_json must contain valid JSON",
+            False,
             id="snapshot-integer-limit",
         ),
         pytest.param(
             "snapshot",
             "[" * 5_000 + "0" + "]" * 5_000,
             "discovery fields_json must contain valid JSON",
+            True,
             id="snapshot-recursion-limit",
         ),
     ),
@@ -695,6 +701,7 @@ def test_discovery_json_parser_failures_are_normalized(
     location,
     fields_json,
     message,
+    decoder_recursion,
 ):
     discovery = {
         "route": "/config",
@@ -704,7 +711,12 @@ def test_discovery_json_parser_failures_are_normalized(
     discoveries = [discovery] if location == "snapshot" else []
     predecessors = {"/config": discovery} if location == "predecessor" else None
 
-    with pytest.raises(ValueError, match=message):
+    decoder = (
+        mock.patch.object(json, "loads", side_effect=RecursionError)
+        if decoder_recursion
+        else nullcontext()
+    )
+    with decoder, pytest.raises(ValueError, match=message):
         change_resource(discoveries, predecessors=predecessors)
 
 

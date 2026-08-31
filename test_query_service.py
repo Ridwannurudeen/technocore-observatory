@@ -6,8 +6,10 @@ import socket
 import sqlite3
 import threading
 import urllib.parse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -928,16 +930,17 @@ def test_search_treats_unparseable_optional_metadata_as_not_observed(
 
 
 @pytest.mark.parametrize(
-    "state_json",
+    ("state_json", "decoder_recursion"),
     (
-        pytest.param(f'{{"version":{HUGE_JSON_INTEGER}}}', id="integer-limit"),
-        pytest.param(DEEPLY_NESTED_JSON, id="recursion-limit"),
+        pytest.param(f'{{"version":{HUGE_JSON_INTEGER}}}', False, id="integer-limit"),
+        pytest.param(DEEPLY_NESTED_JSON, True, id="recursion-limit"),
     ),
 )
 def test_room_evidence_normalizes_unparseable_required_metadata(
     query_database,
     snapshot_root,
     state_json,
+    decoder_recursion,
 ):
     connection = sqlite3.connect(query_database)
     connection.execute(
@@ -953,9 +956,15 @@ def test_room_evidence_normalizes_unparseable_required_metadata(
         )
     )
 
-    response = application.handle(
-        f"/api/v1/rooms/{room_id('evidence-room')}?format=json"
+    decoder = (
+        mock.patch.object(json, "loads", side_effect=RecursionError)
+        if decoder_recursion
+        else nullcontext()
     )
+    with decoder:
+        response = application.handle(
+            f"/api/v1/rooms/{room_id('evidence-room')}?format=json"
+        )
     payload = json.loads(response.body)
 
     assert response.status == 503

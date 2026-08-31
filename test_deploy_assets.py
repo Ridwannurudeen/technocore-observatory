@@ -556,15 +556,13 @@ def test_rebuild_removes_an_unpublished_release_when_guards_fail(tmp_path):
     (checkout / "index.html").write_text("fixture", encoding="utf-8")
     (checkout / "build_site.py").write_text(
         "import os\n"
-        "import tempfile\n"
         "from pathlib import Path\n"
         "release = Path(os.environ['TEST_RELEASE_WINDOWS'])\n"
         "release.mkdir(parents=True)\n"
         "(release / 'observatory').mkdir()\n"
         "(release.parent / f'.unpublished-{release.name}').write_bytes(b'')\n"
         "if os.name == 'nt':\n"
-        "    relative = release.relative_to(Path(tempfile.gettempdir()))\n"
-        "    print('/tmp/' + relative.as_posix())\n"
+        "    print(os.environ['TEST_RELEASE_POSIX'])\n"
         "else:\n"
         "    print(release.resolve())\n",
         encoding="utf-8",
@@ -578,6 +576,7 @@ def test_rebuild_removes_an_unpublished_release_when_guards_fail(tmp_path):
     public = tmp_path / "public"
     public.mkdir()
     release = public / "releases/20260830000000-candidate"
+    release.parent.mkdir()
     environment = os.environ.copy()
     environment.update(
         {
@@ -586,6 +585,14 @@ def test_rebuild_removes_an_unpublished_release_when_guards_fail(tmp_path):
         }
     )
     if os.name == "nt":
+        release_root = subprocess.run(
+            [bash, "-c", 'cd "$1" && pwd -P', "bash", release.parent.as_posix()],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        environment["TEST_RELEASE_POSIX"] = f"{release_root}/{release.name}"
+        environment["MSYS2_ENV_CONV_EXCL"] = "TEST_RELEASE_POSIX"
         fake_bin = tmp_path / "bin"
         fake_bin.mkdir()
         fake_flock = fake_bin / "flock"

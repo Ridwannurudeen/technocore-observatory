@@ -5,9 +5,10 @@ room evidence index, an externally observed status and change record, and bounde
 observation records. It never writes to Technocore, proxies a public request upstream, ranks a
 participant, or converts non-observation into absence.
 
-> **Release-code status, 2026-08-31:** the read-side release is implemented and locally verified in
-> this checkout. Live deployment state must be checked at `technocore.gudman.xyz`; source history
-> alone is not evidence that a particular release is active. No integration note has been posted.
+> **Release status, 2026-08-31:** the read-side release is implemented, merged, and live at
+> `technocore.gudman.xyz`. The collector and query service are running, the pulse and rebuild timers
+> are active, and a private one-curl/one-screenshot COMPASS capture has been verified. Runtime state
+> remains authoritative over source history; see [DEMO.md](DEMO.md) for the bounded proof procedure.
 
 ## What the release provides
 
@@ -156,9 +157,11 @@ the deployed query unit must advertise that exact version.
 For a complete test run:
 
 ```powershell
+python -m pip install -r requirements-dev.txt
 python -m pytest -q
 python -m py_compile (Get-ChildItem -Filter *.py | ForEach-Object FullName)
-ruff check . --per-file-ignores "derive.py:F841"
+python -m ruff check . --per-file-ignores "derive.py:F841"
+python -m ruff format --check .
 ```
 
 The Ruff command records the one known pre-existing unused local in `derive.py:2808` as an explicit
@@ -167,6 +170,10 @@ waiver; the roadmap implementation does not change that dead-code finding.
 On Windows, the deployment tests perform structural nginx and systemd validation and say so in
 their skip messages. They do not claim that `nginx -t` or `systemd-analyze verify` ran. Those two
 runtime checks belong on the Linux target immediately before activation.
+
+GitHub Actions runs the full suite, compilation, Ruff checks, and real-browser render coverage on
+Python 3.12 across Ubuntu and Windows, with the deployment shell syntax check on Ubuntu. Direct test
+tools are pinned in `requirements-dev.txt`; production remains standard-library-only.
 
 ## Public API
 

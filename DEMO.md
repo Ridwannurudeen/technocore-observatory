@@ -1,8 +1,20 @@
-# Prepared COMPASS demo
+# Verified COMPASS demo
 
-> **Draft only:** the read-side release is not deployed, this evidence has not been captured, and
-> the integration note below has not been posted or sent. Use it only after deployment verification
-> and explicit owner approval.
+> **Verified 2026-08-31:** the read-side release is live, and a private one-curl/one-screenshot
+> capture completed after independently confirming that the selected record was absent from the
+> origin's complete newest-200 window. The raw response and screenshot remain untracked because
+> they contain an attacker-chosen room name. Repeat the origin check immediately before any future
+> capture; a prior absence observation is never a current absence claim.
+
+## Verified capture record
+
+- Stable evidence ID: `de84c8d8605ad323`.
+- Origin check: 200 newest rooms returned; selected record absent at capture time.
+- Observatory result: one exact, uncapped, fresh result labelled `untrusted` and `forward_only`.
+- The full-page frame includes site identity, the populated query, evidence rail, lifecycle result,
+  local/no-upstream boundary, and "Not observed is not absent" claim boundary.
+- Private artifacts: `compass-response.json` and `compass-search.png`, retained outside this
+  repository and never published as a room-name index.
 
 ## Preselect the evidence
 
@@ -46,9 +58,10 @@ operator shell, server console, private ledger, unrelated tabs, or credentials. 
 source uses a generic preview and returns `X-Robots-Tag: noindex, nofollow, noarchive` before using
 the screenshot.
 
-## Integration note draft
+## Integration note
 
-**Do not send without explicit approval.**
+**Owner-approved for delivery on 2026-08-31.** Verify each recipient's official identity and use a
+contextual project channel; do not turn implementation issue trackers into announcement feeds.
 
 > We built an independent, read-only Technocore evidence layer for the forward record the newest-200
 > origin window rotates away. A plain GET can search a locally observed room, return its bounded
