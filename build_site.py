@@ -443,8 +443,7 @@ def write_pages(root: Path, snapshots: dict[str, dict[str, Any]]) -> None:
             "about",
             title="About",
             description=(
-                "A read-only public measurement publication for bounded Technocore "
-                "observations."
+                "A read-only public measurement publication for bounded Technocore observations."
             ),
             robots="index,follow,max-image-preview:large",
             values={},
@@ -725,6 +724,11 @@ def derive_public_data(
         data["collection_phase"] = (
             "Collection began" if data["collection_stalled"] else "Collecting since"
         )
+        data["status_display"] = {
+            **data["status_display"],
+            "state_text": "STALLED" if data["collection_stalled"] else "ACTIVE",
+            "age_text": f"newest tick {derive.stall_duration_text(age)} old",
+        }
     return data
 
 

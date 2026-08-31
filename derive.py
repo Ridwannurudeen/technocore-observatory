@@ -70,6 +70,26 @@ ROOM_REVISIT_OUTCOMES = {
     "superseded_before_check",
 }
 CENSUS_LONG_WALK_SECONDS = 60 * 60
+LEDGER_ANCHOR_NOT_RECORDED = (
+    "No external anchor is recorded. The hash chain shows internal consistency "
+    "only; it cannot prove when a tick was collected."
+)
+# Room-name classes and their published labels. The page prints these labels,
+# so they live beside the class tuple rather than in the page's JavaScript.
+CLASS_LABELS = {
+    "unlisted": "unlisted p-",
+    "mailbox": "mailbox mb-",
+    "ownable": "ownable d-",
+    "ephemeral": "ephemeral e-",
+    "bare_hex": "bare 16-hex",
+    "human_or_other": "human / other",
+}
+SERIES_SUFFIXES = {
+    "rooms": " observed",
+    "lobby": " messages",
+    "notes": " notes",
+}
+SAMPLING_NOT_RECORDED = "Not recorded before collector v2.0.0"
 # A fixed ten-minute honesty threshold. At the measured post-deploy cadence of
 # about 258 seconds per tick, this is about 2.3 collector intervals. The rebuild
 # cron runs independently of the collector, so a payload whose newest tick is
@@ -1344,8 +1364,7 @@ def reduce_payload_history(
         "raw_started_at": raw_points[0]["ts"] if raw_points else None,
         "raw_resolution_label": "collector-tick raw · 24-hour retention",
         "chart_resolution_label": (
-            "Chart: lifetime / 1-day / 1-hour rollups; "
-            "scrubber: collector-tick raw (24 hours)"
+            "Chart: lifetime / 1-day / 1-hour rollups; scrubber: collector-tick raw (24 hours)"
         ),
         "expected_tick_seconds": tick_seconds,
         "rollup_levels": levels,
@@ -1376,6 +1395,7 @@ def ledger_chain_summary(ticks: list[dict[str, Any]]) -> dict[str, Any]:
                 f"Hash chain not started · {format_int(len(ticks))} ticks remain "
                 "unchained and rest on operator trust"
             ),
+            "anchor_display": LEDGER_ANCHOR_NOT_RECORDED,
         }
 
     chained = [
@@ -1398,6 +1418,7 @@ def ledger_chain_summary(ticks: list[dict[str, Any]]) -> dict[str, Any]:
             "internal consistency only; no proof of collection time without "
             "an external anchor"
         ),
+        "anchor_display": LEDGER_ANCHOR_NOT_RECORDED,
     }
 
 
@@ -1655,8 +1676,7 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
     ]
     if actual_delays:
         delay_text = (
-            f"actual creation-to-attempt delay this tick "
-            f"{format_int(min(actual_delays))}s"
+            f"actual creation-to-attempt delay this tick {format_int(min(actual_delays))}s"
             if len(actual_delays) == 1
             else (
                 f"actual creation-to-attempt delays this tick "
@@ -1850,9 +1870,12 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     bar_denominator = max(1, observed) if isinstance(observed, int) else 1
 
     def width(value: Any) -> float:
+        # A measured zero draws nothing. The old 1% visibility floor gave an
+        # exact zero the same bar as a small positive count, which read as
+        # "almost none" where the measurement says "none".
         if isinstance(value, bool) or not isinstance(value, int):
             return 0.0
-        return max(1.0, value / bar_denominator * 100)
+        return value / bar_denominator * 100
 
     census_measurement = census_display(
         (
@@ -2063,8 +2086,7 @@ def identity_census_run_display(run: dict[str, Any] | None) -> str:
         "no shard-read failures recorded"
         if not causes
         else (
-            f"{format_int(run['shard_read_failures'])} shard-read failures "
-            f"({'; '.join(causes)})"
+            f"{format_int(run['shard_read_failures'])} shard-read failures ({'; '.join(causes)})"
         )
     )
     invocation_label = "invocation" if run["invocations"] == 1 else "invocations"
@@ -2470,6 +2492,237 @@ def stall_duration_text(seconds: float) -> str:
     return f"{days}d {hours}h"
 
 
+def capacity_metric_display(metric: Any) -> dict[str, Any]:
+    """Every string the capacity ledger row prints.
+
+    The server rendered the trailing window as raw seconds while the browser
+    rendered the same window as minutes, hours or days, so the two views
+    disagreed about one measurement. Both now read these strings.
+    """
+    if not isinstance(metric, dict):
+        return {
+            "count_text": "—",
+            "headroom_text": "No capacity observation recorded",
+            "rate_text": (
+                "Observed net-change rate unavailable because no capacity observation was recorded"
+            ),
+            "cap_change_text": "",
+            "fill_percent": 0.0,
+        }
+
+    fraction = metric.get("fill_fraction")
+    fill_percent = (
+        max(0.0, min(1.0, float(fraction))) * 100
+        if isinstance(fraction, (int, float))
+        and not isinstance(fraction, bool)
+        and math.isfinite(fraction)
+        else 0.0
+    )
+    cap_change = metric.get("cap_change")
+    return {
+        "count_text": (
+            f"{format_int(metric.get('total'))} / {format_int(metric.get('cap'))}"
+        ),
+        "headroom_text": (
+            f"{format_int(metric.get('headroom'))} headroom "
+            f"({format_percent(metric.get('headroom_fraction'))} of "
+            f"{format_int(metric.get('cap'))})"
+        ),
+        "rate_text": capacity_rate_context(metric),
+        "cap_change_text": (
+            f"Cap change · {format_int(cap_change['previous'])} → "
+            f"{format_int(cap_change['new'])} at {cap_change['ts']} · "
+            "a new observed-rate window began"
+            if isinstance(cap_change, dict)
+            else ""
+        ),
+        "fill_percent": fill_percent,
+    }
+
+
+def stillborn_display(signal: Any) -> dict[str, str]:
+    """First-message-only figure and its denominator. The server wrote `x/y`
+    and the browser wrote `x / y` for the same ratio."""
+    matched = signal.get("matched_new_rooms") if isinstance(signal, dict) else None
+    if not matched:
+        return {"value_text": "—", "context": "No matched new rooms"}
+    return {
+        "value_text": format_percent(signal.get("fraction")),
+        "context": (
+            f"{format_int(signal.get('first_message_only'))} / "
+            f"{format_int(matched)} matched new rooms"
+        ),
+    }
+
+
+def sampling_display(coverage: Any) -> dict[str, str]:
+    """The sampling register, from the funnel's merged coverage where one
+    exists. The server said "Unavailable for this legacy tick" where the
+    browser said the collector version that started recording manifests."""
+    frame_size = coverage.get("frame_size") if isinstance(coverage, dict) else None
+    if isinstance(frame_size, bool) or not isinstance(frame_size, int):
+        values = dict.fromkeys(
+            ("frame", "sampled", "unique", "repeats", "failures", "selector"),
+            SAMPLING_NOT_RECORDED,
+        )
+    else:
+        values = {
+            "frame": f"{format_int(frame_size)} rooms in the recorded frame",
+            "sampled": (
+                f"{format_int(coverage.get('sampled_rooms'))} selected this tick"
+            ),
+            "unique": (
+                f"{format_int(coverage.get('cumulative_unique_rooms'))} / "
+                f"{format_int(frame_size)} unique room hashes in this frame epoch"
+            ),
+            "repeats": (
+                f"{format_int(coverage.get('repeat_count'))} repeated selections "
+                "in this frame epoch"
+            ),
+            "failures": (
+                f"{format_int(coverage.get('failed_reads'))} cumulative failures "
+                f"in this frame epoch · "
+                f"{format_int(coverage.get('failed_reads_this_tick'))} / "
+                f"{format_int(coverage.get('sampled_rooms'))} selected reads "
+                "failed this tick"
+            ),
+            "selector": (
+                f"version {format_int(coverage.get('selector_version'))} · "
+                f"epoch {format_int(coverage.get('epoch'))}"
+            ),
+        }
+
+    newest = (
+        coverage.get("newest_listing_rooms") if isinstance(coverage, dict) else None
+    )
+    total = coverage.get("rooms_total") if isinstance(coverage, dict) else None
+    values["newest"] = (
+        f"{format_int(newest)} returned in the newest listing"
+        if isinstance(newest, int) and not isinstance(newest, bool)
+        else "Not recorded"
+    )
+    values["total"] = (
+        f"{format_int(total)} exist · not reachable for sampling"
+        if isinstance(total, int) and not isinstance(total, bool)
+        else "Not recorded"
+    )
+    return values
+
+
+def series_snapshot_value(
+    point: dict[str, Any],
+    key: str,
+    baseline: dict[str, Any],
+) -> int:
+    if key == "lobby":
+        return max(0, point["lobby_last_seq"] - baseline["lobby_last_seq"])
+    if key == "notes":
+        return max(0, point["notes_total"] - baseline["notes_total"])
+    return point["observed_public_rooms"]
+
+
+def attach_series_display(
+    raw_points: list[dict[str, Any]],
+    baseline: dict[str, Any],
+) -> None:
+    """Every string the growth chart prints for a selected raw observation.
+
+    The scrubber addresses these points only, so the selected timestamp is a
+    separate published value from the newest-tick status timestamp.
+    """
+    total = len(raw_points)
+    for index, point in enumerate(raw_points):
+        ordinal_text = f"raw observation {format_int(index + 1)} of {format_int(total)}"
+        point["selected_display"] = {
+            "timestamp_text": point["ts"],
+            "ordinal_text": ordinal_text,
+        }
+        series: dict[str, dict[str, str]] = {}
+        for key, suffix in SERIES_SUFFIXES.items():
+            value_text = (
+                f"{format_int(series_snapshot_value(point, key, baseline))}{suffix}"
+            )
+            series[key] = {
+                "value_text": value_text,
+                "summary": (
+                    f"At {point['ts']} the selected series measured {value_text}. "
+                    f"This is {ordinal_text} in the retained raw window."
+                ),
+                "scrubber_text": f"{point['ts']} — {value_text}",
+            }
+        point["series_display"] = series
+
+
+def composition_display(raw_points: list[dict[str, Any]]) -> dict[str, Any]:
+    """Class-composition totals over the raw retention window, as published
+    strings. The first retained point carries no interval, so it contributes
+    no classified event."""
+    source = raw_points[1:]
+    totals = dict.fromkeys(CLASSES, 0)
+    partial_totals = dict.fromkeys(CLASSES, 0)
+    samples = 0
+    incomplete_intervals = 0
+    for point in source:
+        composition = point["composition"]
+        complete = composition["complete"]
+        samples += composition["samples"]
+        if not complete:
+            incomplete_intervals += 1
+        for name in CLASSES:
+            count = composition["counts"][name]
+            totals[name] += count
+            if not complete:
+                partial_totals[name] += count
+
+    classes = [
+        {
+            "key": name,
+            "label": CLASS_LABELS[name],
+            "count_text": format_int(totals[name]),
+            "share_text": format_percent(totals[name] / samples) if samples else "—",
+            "window_text": (
+                f"{format_int(partial_totals[name])} counted in incomplete event windows"
+                if partial_totals[name]
+                else "all counted in complete event windows"
+            ),
+        }
+        for name in CLASSES
+    ]
+
+    if not source:
+        summary_text = "No class-composition interval has been observed yet."
+    else:
+        summary_text = (
+            f"{format_int(samples)} captured new-room events were classified "
+            f"across {format_int(len(source))} observed intervals"
+        )
+        summary_text += (
+            "; every event window was complete."
+            if not incomplete_intervals
+            else (
+                f"; {format_int(incomplete_intervals)} of those intervals have "
+                "an incomplete event window."
+            )
+        )
+    return {
+        "resolution_text": (
+            "collector-tick raw · 24-hour retention · one column per observed interval"
+        ),
+        "summary_text": summary_text,
+        "classes_text": (
+            " · ".join(
+                f"{entry['label']} {entry['count_text']} ({entry['share_text']})"
+                for entry in classes
+            )
+            if samples
+            else "No classified new-room event has been captured yet"
+        ),
+        "classes": classes,
+        "interval_count": len(source),
+        "incomplete_count": incomplete_intervals,
+    }
+
+
 def derive_records(
     records: Iterable[dict[str, Any]],
     rejected_ticks: int = 0,
@@ -2506,9 +2759,16 @@ def derive_records(
             "collection_stall_threshold_seconds": STALL_THRESHOLD_SECONDS,
             "collection_stall_banner": "",
             "collection_phase": "Collecting since",
+            "status_display": {
+                "state_text": "COLLECTION NOT STARTED",
+                "age_text": "no observation recorded",
+                "schema_text": "schema 6",
+                "raw_window_text": "collector-tick raw · 24-hour retention",
+            },
             "points": [],
             "gaps": [],
             "gap_count": 0,
+            "composition_display": composition_display([]),
             "history": {
                 "raw_retention_seconds": RAW_RETENTION_SECONDS,
                 "raw_started_at": None,
@@ -2738,6 +2998,19 @@ def derive_records(
                     "ts": tick["ts"],
                 }
 
+        point["capacity_display"] = {
+            name: capacity_metric_display(point["capacity"][name])
+            for name in ("notes", "rooms")
+        }
+        point["stillborn_display"] = stillborn_display(point["stillborn_signal"])
+        # The funnel merges the manifest with the listing and room totals, so
+        # its coverage is the fuller record where a funnel exists.
+        point["sampling_display"] = sampling_display(
+            point["signer_funnel"]["coverage"]
+            if point["signer_funnel"] is not None
+            else room_sampling
+        )
+
         if tick["identity_total"] is not None:
             if previous_identity is not None:
                 identity_elapsed = (
@@ -2779,6 +3052,11 @@ def derive_records(
     )
     stalled = age_seconds > STALL_THRESHOLD_SECONDS
 
+    # The chart baseline is the oldest accepted observation, which is also the
+    # first record of the oldest rollup level, so the scripted view and these
+    # strings measure the same distance from the collection boundary.
+    attach_series_display(raw_points, points[0])
+
     return {
         "schema": 6,
         "collector_version": ticks[-1]["collector_version"],
@@ -2795,10 +3073,17 @@ def derive_records(
             else ""
         ),
         "collection_phase": "Collection began" if stalled else "Collecting since",
+        "status_display": {
+            "state_text": "STALLED" if stalled else "ACTIVE",
+            "age_text": f"newest tick {stall_duration_text(age_seconds)} old",
+            "schema_text": "schema 6",
+            "raw_window_text": history["raw_resolution_label"],
+        },
         "points": raw_points,
         "gaps": recent_gaps,
         "gap_count": len(gaps),
         "history": history,
+        "composition_display": composition_display(raw_points),
         "ledger_chain": ledger_chain_summary(ticks),
         "accepted_ticks": len(points),
         "rejected_ticks": rejected_ticks,
@@ -2850,38 +3135,19 @@ def capacity_rate_context(metric: Any) -> str:
     )
 
 
-def sampling_ssr(sample: Any) -> dict[str, str]:
-    if not isinstance(sample, dict):
-        unavailable = "Unavailable for this legacy tick"
-        return {
-            "coverage-frame": unavailable,
-            "coverage-sampled": unavailable,
-            "coverage-unique": unavailable,
-            "coverage-repeats": unavailable,
-            "coverage-failures": unavailable,
-            "coverage-selector": "No recorded selector manifest",
-        }
+def sampling_ssr(display: Any) -> dict[str, str]:
+    """The sampling register, read verbatim from the per-point display contract
+    so the server-rendered and scripted views cannot use different fallbacks."""
+    values = display if isinstance(display, dict) else sampling_display(None)
     return {
-        "coverage-frame": f"{format_int(sample.get('frame_size'))} rooms in the recorded frame",
-        "coverage-sampled": (
-            f"{format_int(sample.get('sampled_rooms'))} selected this tick"
-        ),
-        "coverage-unique": (
-            f"{format_int(sample.get('cumulative_unique_rooms'))} / "
-            f"{format_int(sample.get('frame_size'))} unique room hashes in this frame epoch"
-        ),
-        "coverage-repeats": (
-            f"{format_int(sample.get('repeat_count'))} repeated selections in this frame epoch"
-        ),
-        "coverage-failures": (
-            f"{format_int(sample.get('failed_reads'))} cumulative failures in this frame epoch · "
-            f"{format_int(sample.get('failed_reads_this_tick'))} / "
-            f"{format_int(sample.get('sampled_rooms'))} selected reads failed this tick"
-        ),
-        "coverage-selector": (
-            f"version {format_int(sample.get('selector_version'))} · "
-            f"epoch {format_int(sample.get('epoch'))}"
-        ),
+        "coverage-frame": values["frame"],
+        "coverage-sampled": values["sampled"],
+        "coverage-unique": values["unique"],
+        "coverage-repeats": values["repeats"],
+        "coverage-failures": values["failures"],
+        "coverage-selector": values["selector"],
+        "coverage-newest": values["newest"],
+        "coverage-total": values["total"],
     }
 
 
@@ -2936,6 +3202,26 @@ def engagement_ssr(display: Any) -> dict[str, str]:
     return values
 
 
+# Every measured block names the versioned definition it was computed under.
+# The stamp is assembled here so a rail can never quote a version the payload
+# does not carry.
+METHOD_STAMPS = {
+    "method-instrument": "signer_funnel",
+    "method-sampling": "room_sampling",
+    "method-census": "identity_census",
+    "method-integrity-census": "identity_census",
+    "method-growth": "room_growth",
+    "method-growth-rate": "room_growth",
+    "method-lobby": "lobby_velocity",
+    "method-capacity": "capacity",
+    "method-lifecycle": "room_lifecycle",
+    "method-first-message": "first_message_only",
+    "method-engagement": "service_engagement",
+    "method-composition": "room_composition",
+    "method-integrity": "ledger_integrity",
+}
+
+
 def ssr_values(data: dict[str, Any]) -> dict[str, str]:
     history = data.get("history")
     resolution_label = (
@@ -2943,10 +3229,21 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
     )
     chain = data.get("ledger_chain")
     chain_display = chain.get("display") if isinstance(chain, dict) else None
+    chain_anchor = chain.get("anchor_display") if isinstance(chain, dict) else None
+    status = data.get("status_display")
+    status = status if isinstance(status, dict) else {}
+    composition = data.get("composition_display")
+    if not isinstance(composition, dict):
+        composition = composition_display([])
+    methodology_version = str(data.get("methodology_version") or "—")
     versions = {
         "collector-version": str(data.get("collector_version") or "—"),
-        "methodology-version": f"methodology {data.get('methodology_version') or '—'}",
+        "methodology-version": f"methodology {methodology_version}",
         "computed-at": str(data.get("computed_at") or "—"),
+        "schema-version": str(status.get("schema_text") or "schema not recorded"),
+        "raw-window": str(
+            status.get("raw_window_text") or "collector-tick raw · 24-hour retention"
+        ),
         "resolution-label": str(
             resolution_label
             or "Chart resolution unavailable; scrubber contains no raw observations"
@@ -2954,12 +3251,29 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
         "ledger-integrity": str(
             chain_display or "Hash-chain state unavailable; no integrity claim is made"
         ),
+        "ledger-anchor": str(chain_anchor or LEDGER_ANCHOR_NOT_RECORDED),
+        "composition-summary": str(composition["summary_text"]),
+        "composition-classes": str(composition["classes_text"]),
+        **{
+            key: f"{definition}@{methodology_version}"
+            for key, definition in METHOD_STAMPS.items()
+        },
     }
+    missing_capacity = capacity_metric_display(None)
     points = data.get("points")
     if not isinstance(points, list) or not points:
         return {
             "status": "0 collected observations",
+            "collection-state": str(
+                status.get("state_text") or "COLLECTION NOT STARTED"
+            ),
+            "newest-age": str(status.get("age_text") or "no observation recorded"),
             "hero-value": "—",
+            "chart-summary": (
+                "No observation has been collected, so no series can be summarised."
+            ),
+            "selected-observation": "No collection start",
+            "selected-ordinal": "No raw observation retained",
             "timestamp": "No collection start",
             "room-rate": "—",
             "room-rate-samples": "Needs two gap-free observations",
@@ -2977,12 +3291,14 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
             "engagement-nick": "—",
             "engagement-nick-context": "No engagement observation yet",
             **room_lifecycle_ssr(None),
-            "notes-cap-count": "—",
-            "notes-headroom": "—",
-            "notes-rate": "Observed net-change rate needs at least two gap-free samples under the current cap",
-            "rooms-cap-count": "—",
-            "rooms-headroom": "—",
-            "rooms-rate": "Observed net-change rate needs at least two gap-free samples under the current cap",
+            "notes-cap-count": missing_capacity["count_text"],
+            "notes-headroom": missing_capacity["headroom_text"],
+            "notes-rate": missing_capacity["rate_text"],
+            "notes-cap-change": missing_capacity["cap_change_text"],
+            "rooms-cap-count": missing_capacity["count_text"],
+            "rooms-headroom": missing_capacity["headroom_text"],
+            "rooms-rate": missing_capacity["rate_text"],
+            "rooms-cap-change": missing_capacity["cap_change_text"],
             "funnel-census": "—",
             "funnel-census-context": "No completed census yet",
             "funnel-observed": "—",
@@ -2993,14 +3309,16 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
             "funnel-two-dates-context": "Captured cohort unavailable",
             "funnel-sustained": "—",
             "funnel-sustained-context": "Captured cohort unavailable",
-            "funnel-warning": "Signer sampling has not started. No historical activity is inferred.",
+            "funnel-warning": (
+                "Signer sampling has not started. No historical activity is inferred."
+            ),
             "funnel-coverage": "No manifest-backed room coverage is available.",
             "tracked-dids": "No signer state recorded",
             "stall-alert": "",
             "collection-phase": "Collecting since",
             "collection-start": "collection start",
             "quality": (
-                f" · 0 accepted · {format_int(data.get('rejected_ticks', 0))} rejected "
+                f"0 accepted · {format_int(data.get('rejected_ticks', 0))} rejected "
                 "· 0 recorded gaps"
             ),
             "empty-state": (
@@ -3011,7 +3329,6 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
         }
 
     point = points[-1]
-    rates = point.get("rates") or {}
     rate_display = point.get("rate_display") or {}
     unavailable_rate = {"value_text": "—", "context": "Needs two gap-free observations"}
     room_tile = rate_display.get("public_rooms_per_second") or unavailable_rate
@@ -3019,10 +3336,23 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
     census_tile = point.get("census_display")
     if not isinstance(census_tile, dict):
         census_tile = census_display(None)
-    stillborn = point.get("stillborn_signal") or {}
-    capacity = point.get("capacity") or {}
-    notes = capacity.get("notes") or {}
-    rooms = capacity.get("rooms") or {}
+    stillborn = point.get("stillborn_display")
+    if not isinstance(stillborn, dict):
+        stillborn = stillborn_display(point.get("stillborn_signal"))
+    capacity_tiles = point.get("capacity_display")
+    if not isinstance(capacity_tiles, dict):
+        capacity_tiles = {}
+    notes = capacity_tiles.get("notes") or missing_capacity
+    rooms = capacity_tiles.get("rooms") or missing_capacity
+    series = point.get("series_display")
+    rooms_series = series.get("rooms") if isinstance(series, dict) else None
+    if not isinstance(rooms_series, dict):
+        rooms_series = {
+            "value_text": f"{format_int(point.get('observed_public_rooms'))} observed",
+            "summary": "No series summary was recorded for this observation.",
+        }
+    selected = point.get("selected_display")
+    selected = selected if isinstance(selected, dict) else {}
     funnel = point.get("signer_funnel")
     accepted = data.get("accepted_ticks", len(points))
     rejected = data.get("rejected_ticks", 0)
@@ -3031,7 +3361,18 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
 
     values = {
         "status": f"{format_int(accepted)} collected observations",
-        "hero-value": f"{format_int(point.get('observed_public_rooms'))} observed",
+        "collection-state": str(status.get("state_text") or "ACTIVE"),
+        "newest-age": str(status.get("age_text") or "newest tick age not recorded"),
+        "hero-value": str(rooms_series["value_text"]),
+        "chart-summary": str(rooms_series["summary"]),
+        "selected-observation": str(
+            selected.get("timestamp_text") or point.get("ts", "invalid timestamp")
+        ),
+        "selected-ordinal": str(
+            selected.get("ordinal_text") or "No raw observation retained"
+        ),
+        # The status timestamp is the newest accepted tick and never follows the
+        # scrubber; the selected observation above is the one that moves.
         "timestamp": str(point.get("ts", "invalid timestamp")),
         "room-rate": room_tile["value_text"],
         "room-rate-samples": room_tile["context"],
@@ -3042,38 +3383,27 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
         "identity-census-run": str(
             point.get("identity_census_run_display") or CENSUS_RUN_NOT_RECORDED
         ),
-        "stillborn": format_percent(stillborn.get("fraction")),
-        "stillborn-samples": (
-            f"{format_int(stillborn.get('first_message_only'))}/"
-            f"{format_int(stillborn.get('matched_new_rooms'))} matched new rooms"
-            if stillborn.get("matched_new_rooms")
-            else "No matched new rooms"
-        ),
+        "stillborn": stillborn["value_text"],
+        "stillborn-samples": stillborn["context"],
         **engagement_ssr(point.get("engagement_display")),
         **room_lifecycle_ssr(point.get("room_lifecycle_display")),
-        "notes-cap-count": f"{format_int(notes.get('total'))} / {format_int(notes.get('cap'))}",
-        "notes-headroom": (
-            f"{format_int(notes.get('headroom'))} headroom "
-            f"({format_percent(notes.get('headroom_fraction'))} of "
-            f"{format_int(notes.get('cap'))})"
-        ),
-        "notes-rate": capacity_rate_context(notes),
-        "rooms-cap-count": f"{format_int(rooms.get('total'))} / {format_int(rooms.get('cap'))}",
-        "rooms-headroom": (
-            f"{format_int(rooms.get('headroom'))} headroom "
-            f"({format_percent(rooms.get('headroom_fraction'))} of "
-            f"{format_int(rooms.get('cap'))})"
-        ),
-        "rooms-rate": capacity_rate_context(rooms),
+        "notes-cap-count": notes["count_text"],
+        "notes-headroom": notes["headroom_text"],
+        "notes-rate": notes["rate_text"],
+        "notes-cap-change": notes["cap_change_text"],
+        "rooms-cap-count": rooms["count_text"],
+        "rooms-headroom": rooms["headroom_text"],
+        "rooms-rate": rooms["rate_text"],
+        "rooms-cap-change": rooms["cap_change_text"],
         "stall-alert": str(data.get("collection_stall_banner") or ""),
         "collection-phase": str(data.get("collection_phase") or "Collecting since"),
         "collection-start": str(data.get("collection_started")),
         "quality": (
-            f" · {format_int(accepted)} accepted · {format_int(rejected)} rejected "
+            f"{format_int(accepted)} accepted · {format_int(rejected)} rejected "
             f"· {format_int(gap_count)} recorded gaps"
         ),
         "empty-state": "",
-        **sampling_ssr(point.get("room_sampling")),
+        **sampling_ssr(point.get("sampling_display")),
         **versions,
     }
 

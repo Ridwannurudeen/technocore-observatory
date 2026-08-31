@@ -1,22 +1,47 @@
 (() => {
   const root = document.documentElement;
-  const themeSelect = document.querySelector("#theme-select");
-  const storedTheme = localStorage.getItem("observatory-theme");
+  const themeToggle = document.querySelector("#theme-toggle");
+  const themes = ["system", "light", "dark"];
+
+  function readTheme() {
+    try {
+      const stored = localStorage.getItem("observatory-theme");
+      return themes.includes(stored) ? stored : "system";
+    } catch {
+      root.dataset.themeStorage = "unavailable";
+      return "system";
+    }
+  }
 
   function applyTheme(theme) {
     if (theme === "light" || theme === "dark") {
       root.dataset.theme = theme;
     } else {
-      delete root.dataset.theme;
+      root.removeAttribute("data-theme");
     }
-    if (themeSelect) themeSelect.value = theme;
+
+    if (themeToggle) {
+      const label = theme === "system" ? "auto" : theme;
+      themeToggle.textContent = `THEME ${label.toUpperCase()}`;
+      themeToggle.setAttribute("aria-label", `Theme: ${label}`);
+      themeToggle.dataset.themeValue = theme;
+    }
   }
 
-  applyTheme(storedTheme || "system");
-  if (themeSelect) {
-    themeSelect.addEventListener("change", () => {
-      const theme = themeSelect.value;
-      localStorage.setItem("observatory-theme", theme);
+  let theme = readTheme();
+  applyTheme(theme);
+
+  if (themeToggle) {
+    themeToggle.addEventListener("click", () => {
+      const nextIndex = (themes.indexOf(theme) + 1) % themes.length;
+      theme = themes[nextIndex];
+
+      try {
+        localStorage.setItem("observatory-theme", theme);
+      } catch {
+        root.dataset.themeStorage = "unavailable";
+      }
+
       applyTheme(theme);
     });
   }
@@ -24,15 +49,17 @@
   const search = document.querySelector(".room-search");
   const query = document.querySelector("#room-query");
   const feedback = document.querySelector("#search-feedback");
+
   if (search && query && feedback) {
     query.addEventListener("input", () => {
       const count = query.value.trim().length;
       feedback.textContent = count
-        ? `${count} characters · the submitted value is treated as an untrusted label.`
+        ? `${count} characters · submitted as an untrusted label.`
         : "";
     });
+
     search.addEventListener("submit", () => {
-      feedback.textContent = "Opening the local evidence register…";
+      feedback.textContent = "Opening the local evidence register.";
     });
   }
 })();

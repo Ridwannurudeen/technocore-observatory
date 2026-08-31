@@ -193,28 +193,91 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     rooms = (release / "rooms/index.html").read_text(encoding="utf-8")
     script = (release / "assets/site.js").read_text(encoding="utf-8")
 
-    assert 'href="#main-content"' in home
-    assert 'action="/rooms/"' in home
-    assert 'method="get"' in home
-    assert 'name="q"' in home
-    assert 'maxlength="80"' in home
+    shell_markers = (
+        '<a class="skip-link" href="#main-content">',
+        '<header class="site-header">',
+        "TECHNOCORE OBSERVATORY",
+        '<details class="site-index">',
+        "<summary>INDEX</summary>",
+        '<nav aria-label="Site index">',
+        '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>',
+        '<main id="main-content" class="page-shell" tabindex="-1">',
+        '<footer class="site-footer">',
+    )
+    for source in (home, rooms):
+        for marker in shell_markers:
+            assert marker in source
+        assert 'class="priority-nav"' not in source
+        form_match = re.search(
+            r'<form class="room-search"[^>]*>.*?</form>',
+            source,
+            re.S,
+        )
+        assert form_match is not None
+        form = form_match.group(0)
+        assert 'action="/rooms/"' in form
+        assert 'method="get"' in form
+        assert 'role="search"' in form
+        assert 'id="room-query"' in form
+        assert 'name="q"' in form
+        assert 'maxlength="80"' in form
+        assert 'id="search-feedback"' in form
+        assert 'aria-live="polite"' in form
+
     assert "Room name or 16-character record ID" not in home
     assert 'href="/changes/"' in home
     assert 'name="robots" content="noindex,nofollow,noarchive"' in rooms
-    assert 'maxlength="80"' in rooms
     assert "exact 16-character ID" not in rooms
     assert "/rooms/{16-hex}/" in rooms
+    assert "maximum 20 results" in (home + rooms).lower()
+    assert "zero origin reads" in rooms.lower()
+    assert "untrusted labels" in rooms.lower()
+    assert "not observed is not absent" in (home + rooms).lower()
     assert 'class="evidence-rail"' in home
-    assert "Collector tick observed" in home
+    assert "<dt>Observed</dt>" in home
+    assert "Collector tick observed" not in home
     assert "Index observed" not in home
     assert "2026-08-30T00:00:00Z" in home
     assert "2026-08-30T00:15:00Z" in home
     assert ">Fresh<" in home
     assert not re.search(r'<(?:script|link)\b[^>]*(?:src|href)="https?://', home)
+
+    assert 'const themes = ["system", "light", "dark"];' in script
+    assert "themeToggle.textContent = `THEME ${label.toUpperCase()}`;" in script
+    assert 'themeToggle.setAttribute("aria-label", `Theme: ${label}`);' in script
+    assert "themeToggle.dataset.themeValue = theme;" in script
+    assert 'localStorage.getItem("observatory-theme")' in script
+    assert 'localStorage.setItem("observatory-theme", theme)' in script
     assert ".innerHTML" not in script
     assert ".textContent" in script
     assert "\u00e2" not in home + rooms + script
     assert "\u00c2" not in home + rooms + script
+
+
+def test_query_unavailable_fallback_uses_the_shared_shell():
+    source = Path("deploy/fallback/query-unavailable.html").read_text(encoding="utf-8")
+
+    for marker in (
+        '<link rel="stylesheet" href="/assets/styles.css">',
+        '<a class="skip-link" href="#main-content">',
+        '<header class="site-header">',
+        "TECHNOCORE OBSERVATORY",
+        '<details class="site-index">',
+        "<summary>INDEX</summary>",
+        '<nav aria-label="Site index">',
+        '<main id="main-content" class="page-shell" tabindex="-1">',
+        '<footer class="site-footer">',
+    ):
+        assert marker in source
+    assert 'class="priority-nav"' not in source
+    assert "<script" not in source.lower()
+    assert 'id="theme-toggle"' not in source
+    assert "<h1>SEARCH IS UNAVAILABLE</h1>" in source
+    assert (
+        "The local query service is unavailable. Static evidence still serves."
+        in source
+    )
+    assert not re.search(r'<(?:script|link)\b[^>]*(?:src|href)="https?://', source)
 
 
 def test_discovery_documents_and_static_contracts_are_valid(built_release):
@@ -444,15 +507,55 @@ def test_observatory_source_has_phase_three_accessibility_contracts():
     assert 'id="composition-summary"' in source
     assert 'id="composition-data-table"' in source
     assert "aria-valuetext" in source
-    assert "const MAX_BAND_COLUMNS=" in source
-    assert "const SERIES_RATE_METRICS=" in source
+    assert "const MAX_BAND_COLUMNS = 96;" in source
+    assert "const SERIES_RATE_METRICS = {" in source
     assert "SERIES_RATE_METRICS[selectedSeries]" in source
-    assert "if(!reduceMotion&&points.length>1)play()" not in source
-    assert 'event.key==="ArrowRight"' in source
-    assert (
-        'textContent=totalSamples?formatPercent(totals[name]/totalSamples):"--"'
-        in source
-    )
+    assert 'event.key === "ArrowRight"' in source
+
+    # Playback is gone: the record is not a demo, so there is no control that
+    # animates it and no timer that could start one.
+    assert 'id="play"' not in source
+    assert "setInterval" not in source
+
+    # Every section of the report is deep-linkable, and the report column is
+    # one column of ruled rows, not cards.
+    for anchor in (
+        "status",
+        "about",
+        "instrument",
+        "growth",
+        "lifecycle",
+        "engagement",
+        "integrity",
+        "methodology",
+        "colophon",
+    ):
+        assert f'id="{anchor}"' in source
+
+    # The shell contract is the site's own: one INDEX control, one theme
+    # button with the shared storage key and value attribute.
+    assert '<details class="site-index">' in source
+    assert 'id="theme-toggle"' in source
+    assert 'data-theme-value="system"' in source
+    assert '"observatory-theme"' in source
+
+    # The newest-tick timestamp and the scrubbed observation are separate
+    # published values; scrubbing must never rewrite the status timestamp.
+    assert 'data-ssr="timestamp"' in source
+    assert 'data-ssr="selected-observation"' in source
+    assert 'byId("timestamp").textContent' in source
+    update_body = source.split("function update(")[1].split("\nfunction ")[0]
+    assert 'byId("timestamp")' not in update_body
+    assert 'byId("selected-observation").textContent' in update_body
+
+    # Locale-dependent display would break the byte-identical server-rendered
+    # and scripted views.
+    assert "new Intl.NumberFormat" not in source
+    assert "toLocaleString" not in source
+
+    # Composition shares come from the deriver, not from a browser-side
+    # division that the server-rendered pass cannot reproduce.
+    assert "share.textContent = entry.share_text;" in source
     assert "\u00e2" not in source
 
 
@@ -495,41 +598,142 @@ def test_theme_tokens_meet_text_chart_and_non_text_contrast_thresholds():
         return (lighter + 0.05) / (darker + 0.05)
 
     site = Path("site/assets/styles.css").read_text(encoding="utf-8")
-    for palette in (
-        tokens(site, ":root"),
-        tokens(site, ':root[data-theme="dark"]'),
+    light = {
+        "bg": "#F4F1E8",
+        "surface": "#FAF8F1",
+        "surface-muted": "#EEEADF",
+        "text": "#171B18",
+        "text-muted": "#535B55",
+        "line": "#747D76",
+        "line-subtle": "#D2CEC3",
+        "data-ink": "#27302A",
+        "accent": "#176B3A",
+        "accent-ink": "#FAF8F1",
+        "warning": "#875B0D",
+        "warning-bg": "#F4E8CE",
+        "danger": "#A63A34",
+        "danger-bg": "#F6DEDA",
+        "missing": "#70665A",
+    }
+    dark = {
+        "bg": "#0B0E0C",
+        "surface": "#111512",
+        "surface-muted": "#171C18",
+        "text": "#E7ECE8",
+        "text-muted": "#A8B0A9",
+        "line": "#606C63",
+        "line-subtle": "#343C36",
+        "data-ink": "#C7D0C9",
+        "accent": "#63D286",
+        "accent-ink": "#07100A",
+        "warning": "#E6B35A",
+        "warning-bg": "#211A0D",
+        "danger": "#F27D73",
+        "danger-bg": "#241110",
+        "missing": "#B7AA99",
+    }
+    assert "color-scheme: light dark;" in site
+    assert "@media (prefers-color-scheme: dark)" in site
+    assert ":root:not([data-theme])" in site
+    for selector, expected in (
+        (":root", light),
+        (':root[data-theme="light"]', light),
+        (':root[data-theme="dark"]', dark),
     ):
-        for name in ("ink", "ink-soft", "green", "green-bright", "amber", "red"):
-            assert contrast(palette[name], palette["paper"]) >= 4.5, name
-        for name in ("line", "line-strong", "focus"):
-            assert contrast(palette[name], palette["paper"]) >= 3, name
+        palette = tokens(site, selector)
+        assert {name: palette[name] for name in expected} == expected
+        for name in ("text", "text-muted", "data-ink", "accent", "missing"):
+            assert contrast(palette[name], palette["bg"]) >= 4.5, (selector, name)
+        assert contrast(palette["accent-ink"], palette["accent"]) >= 4.5, selector
+        assert contrast(palette["warning"], palette["warning-bg"]) >= 4.5, selector
+        assert contrast(palette["danger"], palette["danger-bg"]) >= 4.5, selector
+        assert (
+            contrast(
+                palette["line"],
+                palette["surface-muted"],
+                palette["surface-muted"],
+            )
+            >= 3
+        ), selector
 
+    # The observatory page is self-contained, so it carries its own copy of the
+    # tokens. The copy has to be the same system, value for value, or the two
+    # public surfaces drift apart.
     observatory = Path("index.html").read_text(encoding="utf-8")
-    for palette in (
-        tokens(observatory, ":root"),
-        tokens(observatory, ":root[data-theme=dark]"),
+    assert "color-scheme: light dark;" in observatory
+    assert "@media (prefers-color-scheme: dark)" in observatory
+    assert ":root:not([data-theme])" in observatory
+    for selector, expected in (
+        (":root", light),
+        (':root[data-theme="light"]', light),
+        (':root[data-theme="dark"]', dark),
     ):
-        for name in ("text", "muted", "accent", "warning"):
-            assert contrast(palette[name], palette["bg"]) >= 4.5, name
-        for name in (
-            "terracotta",
-            "sage",
-            "warm-grey",
-            "lavender",
-            "dusty-blue",
-            "ochre",
-        ):
-            assert contrast(palette[name], palette["bg"]) >= 3, name
-        for name in ("line", "line-light", "line-strong"):
-            assert contrast(palette[name], palette["bg"]) >= 3, name
-            assert (
-                contrast(
-                    palette[name],
-                    palette["surface-subtle"],
-                    palette["surface-subtle"],
+        palette = tokens(observatory, selector)
+        assert {name: palette[name] for name in expected} == expected, selector
+        for name in ("text", "text-muted", "data-ink", "accent", "missing"):
+            assert contrast(palette[name], palette["bg"]) >= 4.5, (selector, name)
+        assert contrast(palette["accent-ink"], palette["accent"]) >= 4.5, selector
+        assert contrast(palette["warning"], palette["warning-bg"]) >= 4.5, selector
+        assert contrast(palette["danger"], palette["danger-bg"]) >= 4.5, selector
+        assert (
+            contrast(
+                palette["line"],
+                palette["surface-muted"],
+                palette["surface-muted"],
+            )
+            >= 3
+        ), selector
+
+
+def test_observatory_ssr_and_scripted_views_agree_value_for_value(built_release):
+    """Every published value must read the same with and without scripting.
+
+    The page used to reformat timestamps, ratios and durations in the browser,
+    so a crawler and a reader saw different text for the same measurement.
+    """
+    sync_api = pytest.importorskip("playwright.sync_api")
+    release, _ = built_release
+    page_uri = (release / "observatory/index.html").resolve().as_uri()
+    read = (
+        "() => { const out = {};"
+        " document.querySelectorAll('[data-ssr]').forEach(el => {"
+        " out[el.getAttribute('data-ssr')] = el.textContent; });"
+        " return out; }"
+    )
+    with sync_api.sync_playwright() as playwright:
+        browser = None
+        for channel in ("chrome", "msedge", None):
+            try:
+                browser = (
+                    playwright.chromium.launch(channel=channel)
+                    if channel
+                    else playwright.chromium.launch()
                 )
-                >= 3
-            ), name
+                break
+            except Exception:
+                continue
+        if browser is None:
+            pytest.skip("no Chromium browser is installed")
+        try:
+            context = browser.new_context(
+                java_script_enabled=False, viewport={"width": 1280, "height": 900}
+            )
+            page = context.new_page()
+            page.goto(page_uri)
+            without_script = page.evaluate(read)
+            page.close()
+
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            page.goto(page_uri)
+            page.wait_for_timeout(400)
+            with_script = page.evaluate(read)
+            page.close()
+        finally:
+            browser.close()
+
+    assert without_script
+    assert set(without_script) == set(with_script)
+    assert without_script == with_script
 
 
 def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
@@ -550,7 +754,7 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
         if browser is None:
             pytest.skip("no Chromium browser is installed")
         try:
-            pages = (
+            static_pages = (
                 "index.html",
                 "status/index.html",
                 "rooms/index.html",
@@ -558,27 +762,73 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
                 "changes/index.html",
                 "methodology/index.html",
                 "about/index.html",
-                "observatory/index.html",
             )
             for width in (320, 1440):
                 page = browser.new_page(viewport={"width": width, "height": 900})
-                for relative in pages:
+                for relative in static_pages:
                     page.goto((release / relative).resolve().as_uri())
+                    page.evaluate("localStorage.removeItem('observatory-theme')")
+                    page.reload()
                     page.wait_for_timeout(50)
                     assert page.evaluate(
                         "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
                     ), relative
-                    page.locator("#theme-select").select_option("dark")
-                    assert page.locator("html").get_attribute("data-theme") == "dark"
-                    page.locator("#theme-select").select_option("light")
+
+                    toggle = page.locator("#theme-toggle")
+                    assert toggle.text_content() == "THEME AUTO"
+                    assert toggle.get_attribute("aria-label") == "Theme: auto"
+                    assert toggle.get_attribute("data-theme-value") == "system"
+                    assert page.locator("html").get_attribute("data-theme") is None
+                    toggle.click()
+                    assert toggle.text_content() == "THEME LIGHT"
+                    assert toggle.get_attribute("aria-label") == "Theme: light"
+                    assert toggle.get_attribute("data-theme-value") == "light"
                     assert page.locator("html").get_attribute("data-theme") == "light"
-                    short_controls = page.locator("button, select, input").evaluate_all(
+                    toggle.click()
+                    assert toggle.text_content() == "THEME DARK"
+                    assert toggle.get_attribute("aria-label") == "Theme: dark"
+                    assert toggle.get_attribute("data-theme-value") == "dark"
+                    assert page.locator("html").get_attribute("data-theme") == "dark"
+                    toggle.click()
+                    assert toggle.text_content() == "THEME AUTO"
+                    assert toggle.get_attribute("aria-label") == "Theme: auto"
+                    assert toggle.get_attribute("data-theme-value") == "system"
+                    assert page.locator("html").get_attribute("data-theme") is None
+
+                    short_controls = page.locator(
+                        "button, select, input, summary"
+                    ).evaluate_all(
                         "els => els.filter(el => { const r=el.getBoundingClientRect(); return r.width && r.height && (r.width < 44 || r.height < 44); }).map(el => el.id || el.textContent.trim())"
                     )
                     assert short_controls == [], relative
-                page.goto((release / "observatory/index.html").resolve().as_uri())
+
+                observatory = "observatory/index.html"
+                page.goto((release / observatory).resolve().as_uri())
+                page.evaluate("localStorage.removeItem('observatory-theme')")
+                page.reload()
                 page.wait_for_timeout(50)
-                assert page.locator("#play").text_content() == "Play"
+                assert page.evaluate(
+                    "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+                ), observatory
+
+                # The self-contained page drives the same theme contract as the
+                # templated shell, from its own inline script.
+                toggle = page.locator("#theme-toggle")
+                assert toggle.text_content() == "THEME AUTO"
+                assert page.locator("html").get_attribute("data-theme") is None
+                toggle.click()
+                assert toggle.get_attribute("data-theme-value") == "light"
+                assert page.locator("html").get_attribute("data-theme") == "light"
+                toggle.click()
+                assert toggle.get_attribute("data-theme-value") == "dark"
+                assert page.locator("html").get_attribute("data-theme") == "dark"
+
+                # No playback control: the record does not animate itself.
+                assert page.locator("#play").count() == 0
+                # The scrubber addresses raw retained observations only.
+                assert page.locator("#scrubber").get_attribute("max") == str(
+                    len(json.loads((release / "data.json").read_text())["points"]) - 1
+                )
                 page.close()
         finally:
             browser.close()

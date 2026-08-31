@@ -250,7 +250,13 @@ def lifecycle(*, failed=1, successful=8, second=3):
 def html_template():
     keys = (
         "status",
+        "collection-state",
+        "newest-age",
         "hero-value",
+        "chart-summary",
+        "selected-observation",
+        "selected-ordinal",
+        "raw-window",
         "timestamp",
         "room-rate",
         "room-rate-samples",
@@ -283,9 +289,11 @@ def html_template():
         "notes-cap-count",
         "notes-headroom",
         "notes-rate",
+        "notes-cap-change",
         "rooms-cap-count",
         "rooms-headroom",
         "rooms-rate",
+        "rooms-cap-change",
         "funnel-census",
         "funnel-census-context",
         "funnel-observed",
@@ -304,8 +312,11 @@ def html_template():
         "coverage-repeats",
         "coverage-failures",
         "coverage-selector",
+        "coverage-newest",
+        "coverage-total",
         "collector-version",
         "methodology-version",
+        "schema-version",
         "computed-at",
         "collection-start",
         "collection-phase",
@@ -315,6 +326,22 @@ def html_template():
         "empty-state",
         "resolution-label",
         "ledger-integrity",
+        "ledger-anchor",
+        "composition-summary",
+        "composition-classes",
+        "method-instrument",
+        "method-sampling",
+        "method-census",
+        "method-integrity-census",
+        "method-growth",
+        "method-growth-rate",
+        "method-lobby",
+        "method-capacity",
+        "method-lifecycle",
+        "method-first-message",
+        "method-engagement",
+        "method-composition",
+        "method-integrity",
     )
     width_keys = (
         "funnel-observed",
@@ -1661,10 +1688,11 @@ def test_census_run_ssr_and_javascript_read_the_same_finished_string(tmp_path):
     assert rendered_ssr(source, "identity-census-run") == display
 
     page_source = Path("index.html").read_text(encoding="utf-8")
-    assert "const censusRunDisplay=point.identity_census_run_display;" in page_source
+    assert "const censusRunDisplay = point.identity_census_run_display;" in page_source
     assert (
-        'byId("identity-census-run").textContent=typeof '
-        'censusRunDisplay==="string"' in page_source
+        'byId("identity-census-run").textContent =\n'
+        '    typeof censusRunDisplay === "string"\n'
+        "      ? censusRunDisplay\n" in page_source
     )
     assert ".innerHTML" not in page_source
 
@@ -1710,8 +1738,7 @@ def test_ssr_reads_the_shared_display_contract_verbatim():
     stages = {stage["key"]: stage for stage in display["stages"]}
     assert values["funnel-sustained-context"] == stages["sustained"]["context"]
     assert values["funnel-sustained-context"] == (
-        "80.0% of 25 observed in ≥2 sampled rooms also observed in a signed "
-        "A → B → A sequence"
+        "80.0% of 25 observed in ≥2 sampled rooms also observed in a signed A → B → A sequence"
     )
     assert values["funnel-warning"] == display["warning"]
     assert values["funnel-coverage"] == display["coverage_text"]
@@ -1784,8 +1811,7 @@ def test_fresh_v3_state_accepts_count_above_retired_cap_without_cap_usage_claim(
     result = derive_records([tick("2026-08-30T10:00:00Z", signer_funnel=current)])
     tracked_text = ssr_values(result)["tracked-dids"]
     assert tracked_text == (
-        "201,365 tracked DIDs · retired JSON-store cap 200,000 "
-        "(no longer gates insertion)"
+        "201,365 tracked DIDs · retired JSON-store cap 200,000 (no longer gates insertion)"
     )
     assert "% of the state cap used" not in tracked_text
 
@@ -1883,8 +1909,7 @@ def test_tracking_disclosure_reaches_shared_warning_and_methodology(tmp_path):
     assert "admissions stopped" not in values["funnel-observed-context"]
     assert "new observed DIDs are no longer added" not in values["funnel-warning"]
     assert values["tracked-dids"] == (
-        "201,365 tracked DIDs · retired JSON-store cap 200,000 "
-        "(no longer gates insertion)"
+        "201,365 tracked DIDs · retired JSON-store cap 200,000 (no longer gates insertion)"
     )
 
     path = tmp_path / "index.html"
@@ -2700,8 +2725,7 @@ def test_cap_hit_stage_two_caption_discloses_the_pinned_cap():
         "population from the census: neither contains the other"
     )
     assert values["funnel-two-ticks-context"] == (
-        "19.8% of 200,000 in the captured observed-signing cohort "
-        "(pinned at the tracking cap)"
+        "19.8% of 200,000 in the captured observed-signing cohort (pinned at the tracking cap)"
     )
     # The warning paragraph keeps its own cap sentence; the caption is additive.
     assert "state cap has been reached" in values["funnel-warning"]
@@ -2884,7 +2908,7 @@ def test_funnel_bars_scale_to_the_observed_cohort_not_the_census():
     assert ssr["funnel-two-ticks"] == 50.0
 
 
-def test_tiny_funnel_stage_keeps_its_visibility_floor():
+def test_tiny_funnel_stage_keeps_its_exact_width_and_zero_draws_nothing():
     result = derive_records(
         [
             tick(
@@ -2894,15 +2918,24 @@ def test_tiny_funnel_stage_keeps_its_visibility_floor():
                     two_ticks=3,
                     two_collection_dates=2,
                     two_rooms=1,
-                    counterparties=1,
+                    counterparties=0,
                 ),
             )
         ]
     )
     display = result["points"][0]["signer_funnel"]["display"]
     widths = {stage["key"]: stage["width_percent"] for stage in display["stages"]}
-    assert widths["two_ticks"] == 1.0
-    assert widths["sustained"] == 1.0
+    stages = {stage["key"]: stage for stage in display["stages"]}
+    # A subpixel positive count keeps its mathematical width; the printed count
+    # stays authoritative.
+    assert widths["two_ticks"] == 3 / 100_000 * 100
+    assert widths["two_ticks"] > 0
+    # A measured zero draws nothing at all: no visibility floor may make it
+    # look like a small positive count.
+    assert stages["sustained"]["value"] == 0
+    assert stages["sustained"]["value_text"] == "0"
+    assert widths["sustained"] == 0.0
+    assert derive.ssr_widths(result)["funnel-sustained"] == 0.0
 
 
 def test_funnel_census_block_reads_the_shared_display_contract_verbatim():

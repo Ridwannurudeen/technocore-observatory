@@ -1,20 +1,41 @@
     <header class="page-lede">
-      <p class="eyebrow">PULSE / status ledger</p>
-      <h1>What the instruments observed</h1>
-      <p>Origin reachability, collector cadence and endpoint attempts are independent evidence classes. There is no composite health score.</p>
+      <p class="eyebrow">STATUS / EVIDENCE LEDGER</p>
+      <h1>INSTRUMENT STATUS</h1>
+      <p>Origin reachability, collector cadence and endpoint attempts are separate evidence classes. There is no composite health score.</p>
     </header>
+
     <section class="ledger" aria-labelledby="components-title">
-      <div class="ledger-heading"><p class="figure-label">01 / Components</p><h2 id="components-title">Latest component observations</h2></div>
+      <div class="ledger-heading">
+        <div>
+          <p class="figure-label">01 / COMPONENTS</p>
+          <h2 id="components-title">Latest observations</h2>
+        </div>
+        <p>Each state retains its own observation and validity boundary.</p>
+      </div>
+      <div class="ledger-table">
 %%COMPONENT_ROWS%%
+      </div>
     </section>
+
     <section class="ledger" aria-labelledby="endpoints-title">
-      <div class="ledger-heading"><p class="figure-label">02 / Endpoints</p><h2 id="endpoints-title">Trailing attempt register</h2></div>
+      <div class="ledger-heading">
+        <div>
+          <p class="figure-label">02 / ENDPOINTS</p>
+          <h2 id="endpoints-title">Trailing attempt register</h2>
+        </div>
+        <p>Failures are observed attempts. They do not establish cause or network-wide availability.</p>
+      </div>
+      <div class="ledger-table">
 %%ENDPOINT_ROWS%%
+      </div>
     </section>
+
     <dl class="evidence-rail" aria-label="Status evidence metadata">
-      <div><dt>Source observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
-      <div><dt>Valid until</dt><dd>%%VALID_UNTIL%%</dd></div>
-      <div><dt>Published</dt><dd>%%PUBLISHED_AT%%</dd></div>
-      <div><dt>Freshness</dt><dd>%%FRESHNESS%%</dd></div>
+      <div><dt>Observed</dt><dd>%%SOURCE_OBSERVED_AT%% · %%FRESHNESS%%</dd></div>
+      <div><dt>Window</dt><dd>Valid until %%VALID_UNTIL%%</dd></div>
+      <div><dt>Coverage</dt><dd>Component and endpoint registers</dd></div>
+      <div><dt>Method</dt><dd>Versioned status snapshot</dd></div>
+      <div><dt>PUBLISHED</dt><dd>%%PUBLISHED_AT%%</dd></div>
     </dl>
-    <p class="machine-links"><a href="/api/v1/status.txt">Plain text</a><a href="/api/v1/status.json">JSON</a></p>
+
+    <p class="machine-links"><a href="/api/v1/status.txt">PLAIN TEXT</a><a href="/api/v1/status.json">JSON</a></p>
