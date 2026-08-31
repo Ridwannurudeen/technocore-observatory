@@ -3765,10 +3765,7 @@ def test_v2_migration_rejects_unbounded_tick_counts(tmp_path, invalid_value):
     metadata = tmp_path / "signers.json"
     source.write_text(payload, encoding="utf-8")
 
-    with (
-        mock.patch.object(json.JSONDecoder, "raw_decode", side_effect=RecursionError),
-        pytest.raises(CollectionError, match="signer JSON"),
-    ):
+    with pytest.raises(CollectionError, match="signer JSON"):
         migrate_signers(source, metadata)
 
     assert not metadata.exists()
@@ -3785,7 +3782,10 @@ def test_v2_migration_normalizes_recursive_json_failure(tmp_path):
     metadata = tmp_path / "signers.json"
     source.write_text(payload, encoding="utf-8")
 
-    with pytest.raises(CollectionError, match="signer JSON"):
+    with (
+        mock.patch.object(json.JSONDecoder, "raw_decode", side_effect=RecursionError),
+        pytest.raises(CollectionError, match="signer JSON"),
+    ):
         migrate_signers(source, metadata)
 
     assert not metadata.exists()
