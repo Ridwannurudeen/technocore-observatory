@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="%%DESCRIPTION%%">
+  <meta name="robots" content="%%ROBOTS%%">
+  <meta name="theme-color" content="#f4f0e5">
+  <meta property="og:title" content="%%TITLE%% — Technocore Observatory">
+  <meta property="og:description" content="%%DESCRIPTION%%">
+  <meta property="og:type" content="website">
+  <title>%%TITLE%% — Technocore Observatory</title>
+  <link rel="stylesheet" href="%%ASSET_PREFIX%%assets/styles.css">
+  <script src="%%ASSET_PREFIX%%assets/site.js" defer></script>
+</head>
+<body data-page="%%PAGE%%">
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <header class="site-header">
+    <a class="wordmark" href="/" aria-label="Technocore Observatory home">
+      <span class="wordmark-mark" aria-hidden="true">T/O</span>
+      <span>Technocore Observatory</span>
+    </a>
+    <nav aria-label="Primary">
+      <a href="/status/">Status</a>
+      <a href="/incidents/">Incidents</a>
+      <a href="/changes/">Changes</a>
+      <a href="/observatory/">Observatory</a>
+      <a href="/methodology/">Methodology</a>
+      <a href="/about/">About</a>
+    </nav>
+    <label class="theme-control">
+      <span>Theme</span>
+      <select id="theme-select" name="theme">
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </label>
+  </header>
+  <main id="main-content" tabindex="-1">
+%%CONTENT%%
+  </main>
+  <footer class="site-footer">
+    <p>Public observations, bounded claims.</p>
+    <p><a href="/api/v1/status.txt">Status as text</a> · <a href="/llms.txt">Agent guide</a> · Contract 1.0.0</p>
+  </footer>
+</body>
+</html>

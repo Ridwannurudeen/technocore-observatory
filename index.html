@@ -13,7 +13,7 @@
 <style>
 :root{
   --bg:#fff;--surface:#fff;--surface-subtle:#f7f6f3;--text:#191917;
-  --muted:#5b5853;--line:rgba(62,59,56,.3);--line-light:rgba(62,59,56,.1);
+  --muted:#5b5853;--line:#85817d;--line-light:#918e8a;
   --line-strong:#76716b;--accent:#284d32;--warning:#78501f;
   --warning-bg:#f6efe4;--terracotta:#a7644d;--sage:#778d72;
   --warm-grey:#999088;--lavender:#8d829d;--dusty-blue:#6f8796;
@@ -21,11 +21,19 @@
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace
 }
+:root[data-theme=dark]{
+  --bg:#161512;--surface:#161512;--surface-subtle:#201f1b;--text:#efede7;
+  --muted:#b9b4aa;--line:#77736c;
+  --line-light:#6c6963;--line-strong:#827e76;
+  --accent:#8fb798;--warning:#dfb36e;--warning-bg:#302719;
+  --terracotta:#c1836d;--sage:#91a68b;--warm-grey:#aaa099;
+  --lavender:#a99db8;--dusty-blue:#89a0ae;--ochre:#bd9b59
+}
 @media(prefers-color-scheme:dark){
-  :root{
+  :root:not([data-theme]){
     --bg:#161512;--surface:#161512;--surface-subtle:#201f1b;--text:#efede7;
-    --muted:#b9b4aa;--line:rgba(221,216,206,.36);
-    --line-light:rgba(221,216,206,.14);--line-strong:#827e76;
+    --muted:#b9b4aa;--line:#77736c;
+    --line-light:#6c6963;--line-strong:#827e76;
     --accent:#8fb798;--warning:#dfb36e;--warning-bg:#302719;
     --terracotta:#c1836d;--sage:#91a68b;--warm-grey:#aaa099;
     --lavender:#a99db8;--dusty-blue:#89a0ae;--ochre:#bd9b59
@@ -34,16 +42,21 @@
 *{box-sizing:border-box}
 html{background:var(--bg);scroll-behavior:smooth}
 body{margin:0;color:var(--text);background:var(--bg);font:15px/1.55 var(--sans)}
-button,input{font:inherit}
+button,input,select{font:inherit}
 button{color:inherit}
 a{color:inherit;text-underline-offset:3px}
 a:hover{color:var(--accent)}
-button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible{outline:3px solid var(--warning);outline-offset:3px}
+.skip-link{
+  position:fixed;z-index:20;top:12px;left:12px;min-height:44px;padding:11px 14px;
+  color:var(--surface);background:var(--text);transform:translateY(-180%)
+}
+.skip-link:focus{transform:translateY(0)}
 .sheet{width:min(1280px,calc(100% - 48px));margin:auto;border:0 solid var(--line);border-width:0 1px}
 .topbar,.card-header,.card-footer,.hero-toolbar{
   display:flex;align-items:center;justify-content:space-between;gap:24px
 }
-.topbar{min-height:58px;padding:0 24px;border-bottom:1px solid var(--line)}
+.topbar{min-height:64px;padding:0 24px;border-bottom:1px solid var(--line)}
 .wordmark{font:400 18px/1 var(--display)}
 .nav{display:flex;flex-wrap:wrap;gap:8px 24px}
 .nav a,.label,.meta,.timestamp,.samples,.method,.predicates,.conversion,
@@ -54,7 +67,9 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid var(-
 }
 .nav a,.label,.meta,.eyebrow,.announcement,.card-footer,.legend,
 .sampling-grid dt,.method-item h3{text-transform:uppercase}
-.nav a{font-size:11px;text-decoration:none}
+.nav a{min-height:44px;display:inline-flex;align-items:center;font-size:11px;text-decoration:none}
+.theme-picker{display:flex;align-items:center;gap:8px;color:var(--muted);font:10px/1 var(--mono);text-transform:uppercase}
+.theme-picker select{min-width:92px;min-height:44px;padding:0 26px 0 9px;border:1px solid var(--line-strong);border-radius:0;color:var(--text);background:var(--surface)}
 .announcement{
   min-height:42px;display:flex;align-items:center;justify-content:center;
   flex-wrap:wrap;gap:5px 12px;padding:10px 24px;border-bottom:1px solid var(--line);
@@ -76,7 +91,7 @@ h1{max-width:920px;margin:0;font:400 clamp(36px,5vw,62px)/1.04 var(--display);le
 .card-footer{min-height:44px;padding:10px 24px;border-top:1px solid var(--line-light);color:var(--muted);font-size:11px}
 .segmented{display:inline-grid;grid-template-columns:repeat(3,auto);border:1px solid var(--line-strong)}
 .segment-option,.play{
-  min-height:34px;padding:8px 12px;border:0;border-right:1px solid var(--line);
+  min-height:44px;padding:8px 12px;border:0;border-right:1px solid var(--line);
   border-radius:0;background:transparent;cursor:pointer;font-size:11px;text-transform:uppercase
 }
 .segment-option:last-child{border-right:0}
@@ -84,6 +99,7 @@ h1{max-width:920px;margin:0;font:400 clamp(36px,5vw,62px)/1.04 var(--display);le
 .hero-value{color:var(--accent);font-size:11px;text-align:right;text-transform:uppercase}
 .chart-wrap{
   position:relative;min-height:390px;border:1px solid var(--line-light);
+  overflow:hidden;
   background-image:radial-gradient(circle,var(--line-light) .8px,transparent .9px);
   background-size:12px 12px
 }
@@ -99,7 +115,15 @@ svg{display:block;width:100%;height:auto;overflow:visible}
 .empty:empty{display:none}
 .controls{display:grid;grid-template-columns:auto 1fr;gap:16px;align-items:center;margin-top:18px}
 .play{min-width:72px;border:1px solid var(--line-strong)}
-input[type=range]{width:100%;accent-color:var(--accent)}
+input[type=range]{width:100%;height:44px;accent-color:var(--accent)}
+.chart-summary{margin:18px 0 0;color:var(--muted)}
+.data-table{margin-top:16px;border:1px solid var(--line)}
+.data-table summary{min-height:44px;padding:11px 14px;cursor:pointer;font:11px/1.8 var(--mono);text-transform:uppercase}
+.table-scroll{max-width:100%;overflow-x:auto;border-top:1px solid var(--line)}
+.data-table table{width:100%;min-width:620px;border-collapse:collapse;text-align:left}
+.data-table caption{padding:12px 14px;color:var(--muted);text-align:left}
+.data-table th,.data-table td{padding:10px 14px;border-top:1px solid var(--line-light);vertical-align:top}
+.data-table th{font:10px/1.4 var(--mono);text-transform:uppercase}
 .stats{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--line)}
 .stat{min-height:140px;padding:20px 24px;border-right:1px solid var(--line)}
 .stat:last-child{border-right:0}
@@ -144,10 +168,11 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .sampling-grid dd,.methodology-meta dd{margin:8px 0 0;overflow-wrap:anywhere}
 .band{
   height:180px;display:flex;align-items:end;gap:2px;border:1px solid var(--line);
+  max-width:100%;overflow:hidden;
   background-image:radial-gradient(circle,var(--line-light) .8px,transparent .9px);
   background-size:12px 12px
 }
-.band-column{flex:1;min-width:2px;height:100%;display:flex;flex-direction:column-reverse}
+.band-column{flex:1 1 0;min-width:0;height:100%;display:flex;flex-direction:column-reverse}
 .segment{width:100%;min-height:1px}
 .incomplete{opacity:.44;background-image:repeating-linear-gradient(135deg,transparent 0,transparent 3px,var(--line) 3px,var(--line) 4px)}
 .legend{display:flex;flex-wrap:wrap;gap:9px 16px;margin-top:16px;color:var(--muted);font-size:10px}
@@ -178,16 +203,21 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   .sheet{width:100%;border:0}
   .topbar,.card-header,.card-body,.card-footer,.footer{padding-right:18px;padding-left:18px}
   .topbar,.card-header,.card-footer,.hero-toolbar,.limits-heading{align-items:flex-start;flex-direction:column}
+  .theme-picker{width:100%;justify-content:space-between}
   .census-ref{align-items:flex-start;flex-direction:column}
   .stats,.capacity-grid,.engagement-grid,.sampling-grid,.methodology-meta,.methodology-copy,.limits-copy{grid-template-columns:1fr}
   .capacity-card+.capacity-card{border-left:0;border-top:1px solid var(--line)}
   .funnel li{grid-template-columns:30px 1fr}
   .density,.funnel-value{grid-column:2}
 }
-@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+@media(prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+}
 </style>
 </head>
 <body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
 <div class="sheet">
 <header class="topbar">
   <div class="wordmark">Technocore Observatory</div>
@@ -199,6 +229,13 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     <a href="#engagement">Engagement</a>
     <a href="#methodology">Methodology</a>
   </nav>
+  <label class="theme-picker" for="theme-select">Theme
+    <select id="theme-select" name="theme">
+      <option value="system">System</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+  </label>
 </header>
 
 <div class="stall-alert" id="stall-alert" role="alert" data-ssr="stall-alert">COLLECTION STALLED — no observation for 1d 3h</div>
@@ -211,7 +248,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   <span>Last tick <span id="timestamp" class="timestamp" data-ssr="timestamp">2026-08-28T18:07:45Z</span></span>
 </div>
 
-<main>
+<main id="main-content" tabindex="-1">
 <section class="intro" aria-labelledby="page-title">
   <p class="eyebrow">Independent measurement, forward-collected</p>
   <h1 id="page-title">A live observatory of growth, headroom and signed activity across Technocore.</h1>
@@ -226,9 +263,9 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   <div class="card-body">
     <div class="hero-toolbar">
       <div class="segmented" role="radiogroup" aria-label="Hero chart series">
-        <button class="segment-option" type="button" role="radio" aria-checked="true" data-series="rooms">Rooms observed</button>
-        <button class="segment-option" type="button" role="radio" aria-checked="false" data-series="lobby">Lobby velocity</button>
-        <button class="segment-option" type="button" role="radio" aria-checked="false" data-series="notes">Notes growth</button>
+        <button class="segment-option" type="button" role="radio" aria-checked="true" tabindex="0" data-series="rooms">Rooms observed</button>
+        <button class="segment-option" type="button" role="radio" aria-checked="false" tabindex="-1" data-series="lobby">Lobby velocity</button>
+        <button class="segment-option" type="button" role="radio" aria-checked="false" tabindex="-1" data-series="notes">Notes growth</button>
       </div>
       <div class="hero-value" id="hero-value" data-ssr="hero-value">8,157 observed</div>
     </div>
@@ -248,8 +285,19 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     </div>
     <div class="controls">
       <button class="play" id="play" type="button">Play</button>
-      <input id="scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Observation">
+      <input id="scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Observation" aria-valuetext="2026-08-28T18:07:45Z — 8,157 observed rooms">
     </div>
+    <p class="chart-summary" id="chart-summary" aria-live="polite">At the latest observation, 8,157 public rooms had been observed since collection began.</p>
+    <details class="data-table">
+      <summary>Accessible chart data</summary>
+      <div class="table-scroll">
+        <table id="chart-data-table">
+          <caption>Bounded observations for the selected chart series</caption>
+          <thead><tr><th scope="col">Observed at</th><th scope="col">Series</th><th scope="col">Value</th><th scope="col">Interval evidence</th></tr></thead>
+          <tbody id="chart-data-body"><tr><td>2026-08-28T18:07:45Z</td><td>Rooms observed</td><td>8,157</td><td>Latest accepted collector tick</td></tr></tbody>
+        </table>
+      </div>
+    </details>
   </div>
   <div class="card-footer">
     <span id="resolution-label" data-ssr="resolution-label">Chart resolution unavailable; scrubber contains no raw observations</span>
@@ -350,7 +398,22 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 
 <section class="card" aria-labelledby="composition-title">
   <div class="card-header"><h2 id="composition-title">New-room class composition</h2><div class="meta">One column per observed interval</div></div>
-  <div class="card-body"><div id="band" class="band" role="img" aria-label="Stacked columns of new-room class composition, one column per observed interval; segment heights are each class's share of that interval's captured events, and hatched faded columns mark incomplete event windows described in the legend and notes below"></div><div id="legend" class="legend"></div><p class="method" id="coverage">Each column is one observed interval. Hatched, faded columns have an incomplete event window.</p></div>
+  <div class="card-body">
+    <div id="band" class="band" role="img" aria-describedby="composition-summary coverage" aria-label="Stacked columns of new-room class composition, one column per observed interval; segment heights are each class's share of that interval's captured events, and hatched faded columns mark incomplete event windows described in the legend and notes below"></div>
+    <div id="legend" class="legend"></div>
+    <p class="method" id="coverage">Each column is one observed interval. Hatched, faded columns have an incomplete event window.</p>
+    <p class="chart-summary" id="composition-summary" aria-live="polite">The latest captured interval classified 27 new-room events across the declared room-name classes.</p>
+    <details class="data-table">
+      <summary>Accessible composition data</summary>
+      <div class="table-scroll">
+        <table id="composition-data-table">
+          <caption>Class totals across the bounded composition display</caption>
+          <thead><tr><th scope="col">Room-name class</th><th scope="col">Captured events</th><th scope="col">Share</th></tr></thead>
+          <tbody id="composition-data-body"><tr><td>Table updates from the embedded observation ledger</td><td>—</td><td>—</td></tr></tbody>
+        </table>
+      </div>
+    </details>
+  </div>
 </section>
 
 <section class="card" id="methodology" aria-labelledby="methodology-title">
@@ -392,7 +455,23 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 const COLORS={unlisted:"var(--dusty-blue)",mailbox:"var(--lavender)",ownable:"var(--sage)",ephemeral:"var(--ochre)",bare_hex:"var(--terracotta)",human_or_other:"var(--warm-grey)"};
 const LABELS={unlisted:"unlisted p-",mailbox:"mailbox mb-",ownable:"ownable d-",ephemeral:"ephemeral e-",bare_hex:"bare 16-hex",human_or_other:"human / other"};
 const SAMPLING_COLLECTOR_VERSION="2.0.0";
+const MAX_BAND_COLUMNS=96;
+const SERIES_RATE_METRICS={rooms:"public_rooms_per_second",lobby:"lobby_messages_per_second",notes:"notes_per_second"};
 const reduceMotion=matchMedia("(prefers-reduced-motion: reduce)").matches;
+const themeSelect=document.getElementById("theme-select");
+function applyTheme(theme){
+  if(theme==="light"||theme==="dark")document.documentElement.dataset.theme=theme;
+  else delete document.documentElement.dataset.theme;
+  themeSelect.value=theme
+}
+function initialiseTheme(){
+  const saved=localStorage.getItem("observatory-theme")||"system";
+  applyTheme(saved);
+  themeSelect.addEventListener("change",()=>{
+    localStorage.setItem("observatory-theme",themeSelect.value);
+    applyTheme(themeSelect.value)
+  })
+}
 let data;
 let dataValid=false;
 try{
@@ -452,7 +531,7 @@ const rawChartPoints=points.map((point,index)=>({
 }));
 const chartPoints=[...historicalPoints,...rawChartPoints];
 const seriesBaseline=chartPoints[0]||points[0]||null;
-let current=points.length?(reduceMotion?points.length-1:0):0;
+let current=points.length?points.length-1:0;
 let timer=null;
 let selectedSeries="rooms";
 const byId=id=>document.getElementById(id);
@@ -737,8 +816,25 @@ function renderMethodology(){
 function renderBand(){
   const band=byId("band");
   band.replaceChildren();
-  points.slice(1).forEach(point=>{
-    const composition=point.composition||{counts:{},samples:0,complete:false};
+  const source=points.slice(1);
+  const binSize=Math.max(1,Math.ceil(source.length/MAX_BAND_COLUMNS));
+  const bins=[];
+  for(let offset=0;offset<source.length;offset+=binSize){
+    const intervalPoints=source.slice(offset,offset+binSize);
+    const counts=Object.fromEntries(Object.keys(COLORS).map(name=>[name,0]));
+    let samples=0;
+    let expected=0;
+    let complete=true;
+    intervalPoints.forEach(point=>{
+      const composition=point.composition||{counts:{},samples:0,expected:0,complete:false};
+      Object.keys(COLORS).forEach(name=>{counts[name]+=Number(composition.counts&&composition.counts[name])||0});
+      samples+=Number(composition.samples)||0;
+      expected+=Number(composition.expected)||0;
+      complete=complete&&Boolean(composition.complete)
+    });
+    bins.push({counts,samples,expected,complete})
+  }
+  bins.forEach(composition=>{
     const column=document.createElement("div");
     column.className="band-column"+(composition.complete?"":" incomplete");
     Object.keys(COLORS).forEach(name=>{
@@ -752,6 +848,7 @@ function renderBand(){
     });
     band.appendChild(column)
   });
+  band.setAttribute("aria-label",`${formatInt(source.length)} observed intervals rendered as ${formatInt(bins.length)} bounded columns; hatched columns contain at least one incomplete event window.`);
   const legend=byId("legend");
   legend.replaceChildren();
   Object.keys(COLORS).forEach(name=>{
@@ -762,6 +859,59 @@ function renderBand(){
     item.appendChild(swatch);
     item.appendChild(document.createTextNode(LABELS[name]));
     legend.appendChild(item)
+  });
+  const totals=Object.fromEntries(Object.keys(COLORS).map(name=>[name,0]));
+  let totalSamples=0;
+  source.forEach(point=>{
+    const composition=point.composition||{counts:{},samples:0};
+    Object.keys(COLORS).forEach(name=>{totals[name]+=Number(composition.counts&&composition.counts[name])||0});
+    totalSamples+=Number(composition.samples)||0
+  });
+  byId("composition-summary").textContent=source.length
+    ?`${formatInt(totalSamples)} captured new-room events were classified across ${formatInt(source.length)} observed intervals. The display is binned to ${formatInt(bins.length)} columns without changing class totals.`
+    :"No class-composition interval has been observed yet.";
+  const body=byId("composition-data-body");
+  body.replaceChildren();
+  Object.keys(COLORS).forEach(name=>{
+    const row=document.createElement("tr");
+    const classCell=document.createElement("th");
+    const countCell=document.createElement("td");
+    const shareCell=document.createElement("td");
+    classCell.scope="row";
+    classCell.textContent=LABELS[name];
+    countCell.textContent=formatInt(totals[name]);
+    shareCell.textContent=totalSamples?formatPercent(totals[name]/totalSamples):"--";
+    row.append(classCell,countCell,shareCell);
+    body.appendChild(row)
+  })
+}
+function renderChartTable(point,copy){
+  const scrubber=byId("scrubber");
+  const value=seriesValue(point);
+  const readableValue=`${formatInt(value)}${copy.suffix}`;
+  scrubber.setAttribute("aria-valuetext",`${formatTime(point.ts)} — ${readableValue}`);
+  byId("chart-summary").textContent=`At ${formatTime(point.ts)}, the selected series measured ${readableValue}. This is observation ${formatInt(current+1)} of ${formatInt(points.length)} retained raw points.`;
+  const body=byId("chart-data-body");
+  body.replaceChildren();
+  points.slice(Math.max(0,current-99),current+1).forEach(record=>{
+    const row=document.createElement("tr");
+    const observed=document.createElement("td");
+    const series=document.createElement("td");
+    const seriesMeasure=document.createElement("td");
+    const evidence=document.createElement("td");
+    observed.textContent=String(record.ts);
+    series.textContent=copy.title;
+    seriesMeasure.textContent=`${formatInt(seriesValue(record))}${copy.suffix}`;
+    const metric=SERIES_RATE_METRICS[selectedSeries];
+    const display=record.rate_display&&record.rate_display[metric];
+    const rate=record.rates&&record.rates[metric];
+    evidence.textContent=display&&display.context
+      ?display.context
+      :rate&&Number.isFinite(rate.value)
+        ?`${formatRate(rate.value)} · ${formatInt(rate.samples)} samples over ${formatInt(rate.seconds)}s`
+        :"Accepted collector tick";
+    row.append(observed,series,seriesMeasure,evidence);
+    body.appendChild(row)
   })
 }
 function update(index){
@@ -775,6 +925,7 @@ function update(index){
   byId("hero-value").textContent=`${formatInt(seriesValue(point))}${copy.suffix}`;
   byId("chart-title").textContent=copy.title;
   byId("chart-description").textContent=copy.description;
+  renderChartTable(point,copy);
   setRate(point,"public_rooms_per_second","room-rate","room-rate-samples");
   setRate(point,"lobby_messages_per_second","lobby-rate","lobby-rate-samples");
 
@@ -821,15 +972,36 @@ function play(){
     update(current+1)
   },Math.max(90,8000/points.length))
 }
-function selectSeries(name){
+function selectSeries(name,focus=false){
   if(!["rooms","lobby","notes"].includes(name))return;
   selectedSeries=name;
-  document.querySelectorAll(".segment-option").forEach(button=>button.setAttribute("aria-checked",String(button.dataset.series===name)));
+  document.querySelectorAll(".segment-option").forEach(button=>{
+    const selected=button.dataset.series===name;
+    button.setAttribute("aria-checked",String(selected));
+    button.tabIndex=selected?0:-1;
+    if(selected&&focus)button.focus()
+  });
   drawGrid();
   update(current)
 }
+function handleSeriesKey(event){
+  const buttons=[...document.querySelectorAll(".segment-option")];
+  const index=buttons.indexOf(event.currentTarget);
+  let next=index;
+  if(event.key==="ArrowRight"||event.key==="ArrowDown")next=(index+1)%buttons.length;
+  else if(event.key==="ArrowLeft"||event.key==="ArrowUp")next=(index-1+buttons.length)%buttons.length;
+  else if(event.key==="Home")next=0;
+  else if(event.key==="End")next=buttons.length-1;
+  else return;
+  event.preventDefault();
+  selectSeries(buttons[next].dataset.series,true)
+}
 function initialise(){
-  document.querySelectorAll(".segment-option").forEach(button=>button.addEventListener("click",()=>selectSeries(button.dataset.series)));
+  initialiseTheme();
+  document.querySelectorAll(".segment-option").forEach(button=>{
+    button.addEventListener("click",()=>selectSeries(button.dataset.series));
+    button.addEventListener("keydown",handleSeriesKey)
+  });
   renderMethodology();
   if(!dataValid)return;
   byId("stall-alert").textContent=typeof data.collection_stall_banner==="string"?data.collection_stall_banner:"";
@@ -859,7 +1031,6 @@ function initialise(){
   update(current);
   byId("play").addEventListener("click",play);
   byId("scrubber").addEventListener("input",event=>{stop();update(Number(event.target.value))});
-  if(!reduceMotion&&points.length>1)play()
 }
 initialise();
 </script>

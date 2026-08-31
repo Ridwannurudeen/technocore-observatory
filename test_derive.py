@@ -201,8 +201,8 @@ def lifecycle(*, failed=1, successful=8, second=3):
         "rooms_with_second_message": second,
         "reads_attempted": attempts,
         "reads_failed": failed,
-        # The classes partition the rooms that actually had a second message,
-        # so they must sum to `second` — the validator rejects any excess.
+        # Current collectors classify every room that had a second message,
+        # so the classes partition `second` exactly.
         "second_sender_classes": {
             "signed_did": 1 if second >= 1 else 0,
             "unsigned_did": 1 if second >= 2 else 0,
@@ -213,15 +213,19 @@ def lifecycle(*, failed=1, successful=8, second=3):
         "created_rooms_observed_this_tick": 2,
         "due_this_tick": 2,
         "attempted_this_tick": 1,
+        "superseded_this_tick": 0,
+        "deferred_superseded_due_to_batch_limit": 0,
         "deferred_due_to_read_budget": 0,
         "deferred_due_to_deadline": 1,
         "deferred_due_to_budget": 1,
         "revisits": [
             {
                 "id": "0123456789abcdef",
+                "created_seq": 42,
                 "stage_seconds": 300,
                 "elapsed_since_creation_seconds": 450,
                 "success": True,
+                "outcome": "present_at_last_check",
                 "message_count": 2,
                 "has_second_message": True,
                 "second_sender_class": "signed_did",
@@ -321,7 +325,9 @@ def html_template():
         "rooms-fill",
     )
     elements = "".join(f'<span data-ssr="{key}">placeholder</span>' for key in keys)
-    bars = "".join(f'<span data-ssr-width="{key}" style="width:0%"></span>' for key in width_keys)
+    bars = "".join(
+        f'<span data-ssr-width="{key}" style="width:0%"></span>' for key in width_keys
+    )
     return (
         '<meta name="description" content="placeholder">'
         '<meta property="og:description" content="placeholder">'
@@ -350,9 +356,9 @@ def embedded_data(source):
     return json.loads(match.group(1))
 
 
-def test_methodology_version_is_bumped_for_wall_clock_bounded_revisits():
+def test_methodology_version_is_bumped_for_query_gated_room_disclosure():
     result = derive_records([])
-    assert derive.METHODOLOGY_VERSION == "1.11.0"
+    assert derive.METHODOLOGY_VERSION == "1.13.0"
     assert result["methodology_version"] == derive.METHODOLOGY_VERSION
     assert (
         "since collector 2.2.0 a sender without a nonce is never counted"
@@ -411,9 +417,7 @@ def test_room_sampling_grouping_sentence_matches_accumulator_key():
         "read_budget": "read budget",
     }
     mentioned_fields = {
-        field
-        for field, phrase in field_phrases.items()
-        if phrase in grouping.group(0)
+        field for field, phrase in field_phrases.items() if phrase in grouping.group(0)
     }
     assert mentioned_fields == set(key_fields)
 
@@ -483,17 +487,16 @@ def test_lifecycle_deferral_reasons_and_actual_elapsed_time_round_trip():
 
     assert lifecycle_value["deferred_due_to_read_budget"] == 0
     assert lifecycle_value["deferred_due_to_deadline"] == 1
+    assert lifecycle_value["deferred_superseded_due_to_batch_limit"] == 0
     assert lifecycle_value["deferred_due_to_budget"] == 1
-    assert (
-        lifecycle_value["revisits"][0]["elapsed_since_creation_seconds"]
-        == 450
-    )
+    assert lifecycle_value["superseded_this_tick"] == 0
+    assert lifecycle_value["revisits"][0]["created_seq"] == 42
+    assert lifecycle_value["revisits"][0]["outcome"] == "present_at_last_check"
+    assert lifecycle_value["revisits"][0]["elapsed_since_creation_seconds"] == 450
     assert "0 by the per-tick read cap" in display["coverage_text"]
-    assert "1 because the wall-clock deadline was reached" in (
-        display["coverage_text"]
-    )
-    assert "actual creation-to-attempt delay this tick 450s" in (
-        display["coverage_text"]
+    assert "1 because the wall-clock deadline was reached" in (display["coverage_text"])
+    assert (
+        "actual creation-to-attempt delay this tick 450s" in (display["coverage_text"])
     )
     assert "scheduling targets, not measured delays" in display["coverage_text"]
     assert ssr_values(result)["lifecycle-coverage"] == display["coverage_text"]
@@ -501,8 +504,12 @@ def test_lifecycle_deferral_reasons_and_actual_elapsed_time_round_trip():
 
 def test_legacy_lifecycle_does_not_infer_deferral_reasons_or_elapsed_time():
     value = lifecycle()
+    value.pop("superseded_this_tick")
+    value.pop("deferred_superseded_due_to_batch_limit")
     value.pop("deferred_due_to_read_budget")
     value.pop("deferred_due_to_deadline")
+    value["revisits"][0].pop("created_seq")
+    value["revisits"][0].pop("outcome")
     value["revisits"][0].pop("elapsed_since_creation_seconds")
     value["read_budget"] = {
         "base_reads": 82,
@@ -517,22 +524,24 @@ def test_legacy_lifecycle_does_not_infer_deferral_reasons_or_elapsed_time():
         "maximum_share": 0.15,
     }
 
-    result = derive_records(
-        [tick("2026-08-30T08:05:00Z", room_lifecycle=value)]
-    )
+    result = derive_records([tick("2026-08-30T08:05:00Z", room_lifecycle=value)])
     lifecycle_value = result["points"][0]["room_lifecycle"]
     display = result["points"][0]["room_lifecycle_display"]
 
     assert lifecycle_value["deferred_due_to_read_budget"] is None
     assert lifecycle_value["deferred_due_to_deadline"] is None
-    assert (
-        lifecycle_value["revisits"][0]["elapsed_since_creation_seconds"]
-        is None
-    )
+    assert lifecycle_value["superseded_this_tick"] is None
+    assert lifecycle_value["deferred_superseded_due_to_batch_limit"] is None
+    assert lifecycle_value["revisits"][0]["created_seq"] is None
+    assert lifecycle_value["revisits"][0]["outcome"] is None
+    assert lifecycle_value["revisits"][0]["elapsed_since_creation_seconds"] is None
     assert "reason split was not recorded" in display["coverage_text"]
-    assert "actual creation-to-attempt delay was not recorded" in (
-        display["coverage_text"]
+    assert (
+        "actual creation-to-attempt delay was not recorded"
+        in (display["coverage_text"])
     )
+    assert "creation-event sequence" not in display["ledger"]["context"]
+    assert "legacy collector" in display["ledger"]["context"]
     assert "450s" not in display["coverage_text"]
 
 
@@ -541,21 +550,316 @@ def test_failed_lifecycle_revisit_cannot_claim_absent_activity():
     value["rooms_revisited"] = 1
     value["revisits"][0] = {
         "id": "0123456789abcdef",
+        "created_seq": 42,
         "stage_seconds": 300,
         "elapsed_since_creation_seconds": 450,
         "success": False,
+        "outcome": "check_failed",
         "message_count": None,
         "has_second_message": None,
         "second_sender_class": None,
     }
-    result = derive_records(
-        [tick("2026-08-30T08:05:00Z", room_lifecycle=value)]
-    )
+    result = derive_records([tick("2026-08-30T08:05:00Z", room_lifecycle=value)])
     display = result["points"][0]["room_lifecycle_display"]
 
     assert display["conversion"]["value_text"] == "—"
     assert "failed reads are unknown outcomes" in display["conversion"]["context"]
     assert display["failures"]["value_text"] == "1"
+
+
+def test_room_generation_and_superseded_outcome_survive_static_evidence(tmp_path):
+    value = lifecycle(failed=0, successful=1, second=1)
+    stable_id = value["revisits"][0]["id"]
+    value["due_this_tick"] = 2
+    value["attempted_this_tick"] = 1
+    value["superseded_this_tick"] = 1
+    value["deferred_due_to_read_budget"] = 0
+    value["deferred_due_to_deadline"] = 0
+    value["deferred_due_to_budget"] = 0
+    value["revisits"][0]["created_seq"] = 999
+    value["revisits"].append(
+        {
+            "id": stable_id,
+            "created_seq": 10,
+            "stage_seconds": 300,
+            "elapsed_since_creation_seconds": None,
+            "success": False,
+            "outcome": "superseded_before_check",
+            "message_count": None,
+            "has_second_message": None,
+            "second_sender_class": None,
+        }
+    )
+
+    result = derive_records(
+        [
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=value,
+            )
+        ]
+    )
+    revisits = result["points"][0]["room_lifecycle"]["revisits"]
+    assert [revisit["id"] for revisit in revisits] == [stable_id, stable_id]
+    assert [revisit["created_seq"] for revisit in revisits] == [999, 10]
+    assert [revisit["outcome"] for revisit in revisits] == [
+        "present_at_last_check",
+        "superseded_before_check",
+    ]
+    assert result["points"][0]["room_lifecycle"]["superseded_this_tick"] == 1
+
+    path = tmp_path / "index.html"
+    path.write_text(html_template(), encoding="utf-8")
+    inject_html(path, result)
+    embedded_revisits = embedded_data(path.read_text(encoding="utf-8"))["points"][0][
+        "room_lifecycle"
+    ]["revisits"]
+    assert embedded_revisits == revisits
+    assert (
+        "1 older creation cohort finalized as superseded without an origin read"
+        in (result["points"][0]["room_lifecycle_display"]["coverage_text"])
+    )
+    assert (
+        "creation-event sequence"
+        in (result["points"][0]["room_lifecycle_display"]["ledger"]["context"])
+    )
+
+
+def test_current_room_lifecycle_rejects_a_duplicate_generation_stage():
+    value = lifecycle(failed=0, successful=2, second=2)
+    value["attempted_this_tick"] = 2
+    value["deferred_due_to_read_budget"] = 0
+    value["deferred_due_to_deadline"] = 0
+    value["deferred_due_to_budget"] = 0
+    value["read_budget"]["revisit_reads"] = 2
+    value["read_budget"]["total_reads"] = 84
+    value["read_budget"]["reads_per_minute"] = 84.0
+    value["read_budget"]["share"] = 84 / 600
+    value["revisits"].append(deepcopy(value["revisits"][0]))
+
+    with pytest.raises(ValueError, match="duplicate generation stage"):
+        validate_tick(
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=value,
+            )
+        )
+
+
+def test_current_room_lifecycle_sender_classes_partition_the_denominator():
+    value = lifecycle()
+    value["second_sender_classes"]["not_observed"] -= 1
+
+    with pytest.raises(ValueError, match="partition their room denominator"):
+        validate_tick(
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=value,
+            )
+        )
+
+
+def test_legacy_room_lifecycle_may_have_an_unclassified_second_sender():
+    value = lifecycle()
+    value["second_sender_classes"]["not_observed"] -= 1
+    value.pop("superseded_this_tick")
+    value.pop("deferred_superseded_due_to_batch_limit")
+    value["revisits"][0].pop("created_seq")
+    value["revisits"][0].pop("outcome")
+
+    validated = validate_tick(
+        tick(
+            "2026-08-30T08:05:00Z",
+            collector_version="2.10.0",
+            room_lifecycle=value,
+        )
+    )
+
+    assert (
+        sum(validated["room_lifecycle"]["second_sender_classes"].values())
+        < validated["room_lifecycle"]["rooms_with_second_message"]
+    )
+
+
+@pytest.mark.parametrize(
+    "created_seq",
+    (None, True, -1, derive.MAX_INTEGER + 1),
+)
+def test_current_room_lifecycle_requires_a_bounded_creation_sequence(created_seq):
+    value = lifecycle()
+    if created_seq is None:
+        value["revisits"][0].pop("created_seq")
+    else:
+        value["revisits"][0]["created_seq"] = created_seq
+
+    with pytest.raises(ValueError, match="creation sequence|created_seq"):
+        validate_tick(
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=value,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "superseded_this_tick",
+    (None, True, -1, derive.MAX_INTEGER + 1),
+)
+def test_current_room_lifecycle_requires_a_bounded_superseded_count(
+    superseded_this_tick,
+):
+    value = lifecycle()
+    if superseded_this_tick is None:
+        value.pop("superseded_this_tick")
+    else:
+        value["superseded_this_tick"] = superseded_this_tick
+
+    with pytest.raises(ValueError, match="superseded_this_tick"):
+        validate_tick(
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=value,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "deferred_superseded",
+    (None, True, -1, derive.MAX_INTEGER + 1),
+)
+def test_current_room_lifecycle_requires_a_bounded_superseded_batch_deferral(
+    deferred_superseded,
+):
+    value = lifecycle()
+    if deferred_superseded is None:
+        value.pop("deferred_superseded_due_to_batch_limit")
+    else:
+        value["deferred_superseded_due_to_batch_limit"] = deferred_superseded
+
+    with pytest.raises(
+        ValueError,
+        match="deferred_superseded_due_to_batch_limit",
+    ):
+        validate_tick(
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=value,
+            )
+        )
+
+
+def test_superseded_batch_deferral_partitions_due_work_and_is_disclosed():
+    value = lifecycle()
+    value["due_this_tick"] = 3
+    value["deferred_superseded_due_to_batch_limit"] = 1
+    value["deferred_due_to_budget"] = 2
+
+    result = derive_records(
+        [
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=value,
+            )
+        ]
+    )
+    lifecycle_value = result["points"][0]["room_lifecycle"]
+    coverage = result["points"][0]["room_lifecycle_display"]["coverage_text"]
+
+    assert lifecycle_value["deferred_due_to_budget"] == (
+        lifecycle_value["deferred_due_to_read_budget"]
+        + lifecycle_value["deferred_due_to_deadline"]
+        + lifecycle_value["deferred_superseded_due_to_batch_limit"]
+    )
+    assert "1 by the 305-record bounded local-finalization batch" in coverage
+    assert "not an origin-read or deadline failure" in coverage
+    assert (
+        "bounded local finalization"
+        in derive.methodology_definitions()["room_lifecycle"]
+    )
+
+
+def test_current_room_lifecycle_requires_an_explicit_outcome():
+    value = lifecycle()
+    value["revisits"][0].pop("outcome")
+
+    with pytest.raises(ValueError, match="outcome"):
+        validate_tick(
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=value,
+            )
+        )
+
+
+def test_collector_2_10_lifecycle_without_generation_fields_remains_accepted():
+    value = lifecycle()
+    value.pop("superseded_this_tick")
+    value.pop("deferred_superseded_due_to_batch_limit")
+    value["revisits"][0].pop("created_seq")
+    value["revisits"][0].pop("outcome")
+
+    validated = validate_tick(
+        tick(
+            "2026-08-30T08:05:00Z",
+            collector_version="2.10.0",
+            room_lifecycle=value,
+        )
+    )
+
+    assert validated["room_lifecycle"]["superseded_this_tick"] is None
+    assert validated["room_lifecycle"]["deferred_superseded_due_to_batch_limit"] is None
+    assert validated["room_lifecycle"]["revisits"][0]["created_seq"] is None
+    assert validated["room_lifecycle"]["revisits"][0]["outcome"] is None
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    (
+        ({"success": True, "outcome": "superseded_before_check"}, "outcome"),
+        ({"elapsed_since_creation_seconds": 450}, "without an origin read"),
+        ({"outcome": "unknown"}, "outcome"),
+    ),
+)
+def test_superseded_room_generation_rejects_contradictory_evidence(mutation, match):
+    value = lifecycle(failed=0, successful=0, second=0)
+    value["rooms_revisited"] = 0
+    value["attempted_this_tick"] = 0
+    value["superseded_this_tick"] = 1
+    value["deferred_due_to_budget"] = 1
+    value["deferred_due_to_deadline"] = 1
+    value["read_budget"]["revisit_reads"] = 0
+    value["read_budget"]["total_reads"] = 82
+    value["read_budget"]["reads_per_minute"] = 82.0
+    value["read_budget"]["share"] = 82 / 600
+    value["revisits"][0] = {
+        "id": "0123456789abcdef",
+        "created_seq": 42,
+        "stage_seconds": 300,
+        "elapsed_since_creation_seconds": None,
+        "success": False,
+        "outcome": "superseded_before_check",
+        "message_count": None,
+        "has_second_message": None,
+        "second_sender_class": None,
+        **mutation,
+    }
+
+    with pytest.raises(ValueError, match=match):
+        validate_tick(
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=value,
+            )
+        )
 
 
 def test_room_names_never_reach_lifecycle_payload_only_hashes():
@@ -605,9 +909,7 @@ def test_room_lifecycle_read_budget_is_validated_not_merely_displayed():
         ValueError,
         match="room_lifecycle read-budget accounting is inconsistent",
     ):
-        validate_tick(
-            tick("2026-08-30T08:05:00Z", room_lifecycle=value)
-        )
+        validate_tick(tick("2026-08-30T08:05:00Z", room_lifecycle=value))
 
 
 def test_rate_math_and_sample_counts():
@@ -813,8 +1115,7 @@ def test_legacy_sampling_manifest_is_not_bounded_to_twenty_entries():
 
 def test_legacy_sampling_manifest_remains_structurally_bounded():
     room_ids = [
-        f"{index:016x}"
-        for index in range(derive.ROOM_SAMPLING_STRUCTURAL_CEILING + 1)
+        f"{index:016x}" for index in range(derive.ROOM_SAMPLING_STRUCTURAL_CEILING + 1)
     ]
     value = manifest(*room_ids, frame_size=len(room_ids))
     with pytest.raises(
@@ -864,7 +1165,9 @@ def test_room_sampling_prose_distinguishes_recorded_and_legacy_budgets():
         ]
     )
 
-    recorded_coverage = recorded["points"][0]["signer_funnel"]["display"]["coverage_text"]
+    recorded_coverage = recorded["points"][0]["signer_funnel"]["display"][
+        "coverage_text"
+    ]
     legacy_coverage = legacy["points"][0]["signer_funnel"]["display"]["coverage_text"]
     methodology = recorded["methodology"]["room_sampling"]
 
@@ -1284,11 +1587,13 @@ def test_census_run_invocations_sum_only_read_costs_within_one_walk():
     assert published["shards_outstanding"] != 247 + 236
     assert result["points"][-1]["identity_total"] is None
     assert result["points"][-1]["census_display"]["value"] is None
-    assert "2 collector deadline expirations" in (
-        result["points"][-1]["identity_census_run_display"]
+    assert (
+        "2 collector deadline expirations"
+        in (result["points"][-1]["identity_census_run_display"])
     )
-    assert "40 service HTTP 503 responses" in (
-        result["points"][-1]["identity_census_run_display"]
+    assert (
+        "40 service HTTP 503 responses"
+        in (result["points"][-1]["identity_census_run_display"])
     )
 
 
@@ -1359,8 +1664,7 @@ def test_census_run_ssr_and_javascript_read_the_same_finished_string(tmp_path):
     assert "const censusRunDisplay=point.identity_census_run_display;" in page_source
     assert (
         'byId("identity-census-run").textContent=typeof '
-        'censusRunDisplay==="string"'
-        in page_source
+        'censusRunDisplay==="string"' in page_source
     )
     assert ".innerHTML" not in page_source
 
@@ -1473,15 +1777,11 @@ def test_fresh_v3_state_accepts_count_above_retired_cap_without_cap_usage_claim(
     )
     current["signer_state_version"] = 3
 
-    validated = validate_tick(
-        tick("2026-08-30T10:00:00Z", signer_funnel=current)
-    )
+    validated = validate_tick(tick("2026-08-30T10:00:00Z", signer_funnel=current))
     assert validated["signer_funnel"]["tracked_dids"] == 201_365
     assert validated["signer_funnel"]["tracking_disclosure"] is None
 
-    result = derive_records(
-        [tick("2026-08-30T10:00:00Z", signer_funnel=current)]
-    )
+    result = derive_records([tick("2026-08-30T10:00:00Z", signer_funnel=current)])
     tracked_text = ssr_values(result)["tracked-dids"]
     assert tracked_text == (
         "201,365 tracked DIDs · retired JSON-store cap 200,000 "
@@ -1490,14 +1790,34 @@ def test_fresh_v3_state_accepts_count_above_retired_cap_without_cap_usage_claim(
     assert "% of the state cap used" not in tracked_text
 
 
+def test_v6_state_accepts_count_above_retired_cap_without_cap_usage_claim():
+    current = funnel(
+        observed=201_365,
+        two_ticks=127_177,
+        two_collection_dates=65_515,
+        two_rooms=47_409,
+        counterparties=47_306,
+        cap_hit=True,
+    )
+    current["signer_state_version"] = 6
+
+    validated = validate_tick(tick("2026-08-30T10:00:00Z", signer_funnel=current))
+    assert validated["signer_funnel"]["tracked_dids"] == 201_365
+
+    result = derive_records([tick("2026-08-30T10:00:00Z", signer_funnel=current)])
+    tracked_text = ssr_values(result)["tracked-dids"]
+    assert tracked_text.startswith("201,365 tracked DIDs")
+    assert "retired JSON-store cap 200,000" in tracked_text
+    assert tracked_text.endswith("(no longer gates insertion)")
+    assert "% of the state cap used" not in tracked_text
+
+
 def test_v2_state_above_its_cap_is_refused():
     version_two = funnel(observed=200_001)
     version_two["signer_state_version"] = 2
 
     with pytest.raises(ValueError, match="tracked DID count exceeds its cap"):
-        validate_tick(
-            tick("2026-08-30T10:00:00Z", signer_funnel=version_two)
-        )
+        validate_tick(tick("2026-08-30T10:00:00Z", signer_funnel=version_two))
 
 
 def test_legacy_state_without_version_or_disclosure_remains_cap_gated():
@@ -1520,9 +1840,7 @@ def test_pre_version_disclosure_retains_uncapped_interpretation():
         tracking_disclosure=saturation_disclosure(),
     )
 
-    validated = validate_tick(
-        tick("2026-08-30T10:00:00Z", signer_funnel=disclosed)
-    )
+    validated = validate_tick(tick("2026-08-30T10:00:00Z", signer_funnel=disclosed))
     assert validated["signer_funnel"]["tracked_dids"] == 201_365
     assert validated["signer_funnel"]["signer_state_version"] is None
     assert validated["signer_funnel"]["tracking_disclosure"] == saturation_disclosure()
@@ -1574,16 +1892,13 @@ def test_tracking_disclosure_reaches_shared_warning_and_methodology(tmp_path):
     inject_html(path, result)
     source = path.read_text(encoding="utf-8")
     embedded = embedded_data(source)
-    assert rendered_ssr(source, "funnel-warning") == (
-        embedded["points"][0]["signer_funnel"]["display"]["warning"]
+    assert (
+        rendered_ssr(source, "funnel-warning")
+        == (embedded["points"][0]["signer_funnel"]["display"]["warning"])
     )
-    assert embedded["methodology"]["signer_funnel"].endswith(
-        disclosure["methodology"]
-    )
+    assert embedded["methodology"]["signer_funnel"].endswith(disclosure["methodology"])
 
-    legacy = derive_records(
-        [tick("2026-08-30T10:00:00Z", signer_funnel=funnel())]
-    )
+    legacy = derive_records([tick("2026-08-30T10:00:00Z", signer_funnel=funnel())])
     legacy_funnel_point = legacy["points"][0]["signer_funnel"]
     legacy_warning = legacy_funnel_point["display"]["warning"]
     assert legacy_funnel_point["tracking_disclosure"] is None
@@ -1595,9 +1910,7 @@ def test_tracking_disclosure_reaches_shared_warning_and_methodology(tmp_path):
     assert disclosure["methodology"] not in legacy["methodology"]["signer_funnel"]
 
 
-def test_collector_assembled_current_and_legacy_ticks_validate(
-    tmp_path, monkeypatch
-):
+def test_collector_assembled_current_and_legacy_ticks_validate(tmp_path, monkeypatch):
     tick_ts = "2026-08-30T10:00:00Z"
     monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
     signer_state_path = tmp_path / "signers.json"
@@ -1620,6 +1933,7 @@ def test_collector_assembled_current_and_legacy_ticks_validate(
                             "seq": 1,
                             "ts": tick_ts,
                             "from": f"did:key:z6Mk{'1' * 20}",
+                            "text": "signed observation",
                             "nonce": "1",
                         }
                     ]
@@ -1659,6 +1973,7 @@ def test_collector_assembled_current_and_legacy_ticks_validate(
                         "seq": 2,
                         "ts": tick_ts,
                         "from": f"did:key:z6Mk{'2' * 20}",
+                        "text": "signed observation",
                         "nonce": "2",
                     }
                 ]
@@ -1666,6 +1981,7 @@ def test_collector_assembled_current_and_legacy_ticks_validate(
         ),
         "/r/events?format=json&limit=200": json.dumps(
             {
+                "room": "events",
                 "messages": [
                     {
                         "seq": 1,
@@ -1673,7 +1989,7 @@ def test_collector_assembled_current_and_legacy_ticks_validate(
                         "from": "server",
                         "text": "created baseline",
                     }
-                ]
+                ],
             }
         ),
     }
@@ -1693,7 +2009,9 @@ def test_collector_assembled_current_and_legacy_ticks_validate(
     assert record["signer_funnel"]["census_started_at"] == "2026-08-29T10:23:01Z"
     assert record["signer_funnel"]["tracked_dids"] == 2
     assert record["signer_funnel"]["tracked_cap"] == 1
-    assert record["signer_funnel"]["signer_state_version"] == collect.SIGNER_STATE_VERSION
+    assert (
+        record["signer_funnel"]["signer_state_version"] == collect.SIGNER_STATE_VERSION
+    )
     assert record["signer_funnel"]["tracking_disclosure"] == (
         collect.tracking_disclosure(state)
     )
@@ -1704,9 +2022,7 @@ def test_collector_assembled_current_and_legacy_ticks_validate(
     assert record["room_lifecycle"]["read_budget"]["revisit_reads"] == 0
     validated = validate_tick(record)
     assert validated["identity_census_started"] == "2026-08-29T10:23:01Z"
-    assert validated["signer_funnel"]["census_started_at"] == (
-        "2026-08-29T10:23:01Z"
-    )
+    assert validated["signer_funnel"]["census_started_at"] == ("2026-08-29T10:23:01Z")
     assert validated["signer_funnel"]["tracked_dids"] == 2
     assert validated["signer_funnel"]["signer_state_version"] == (
         collect.SIGNER_STATE_VERSION
@@ -1819,7 +2135,9 @@ def test_server_rendered_values_match_embedded_newest_observation(tmp_path):
     embedded = embedded_data(source)
     newest = embedded["points"][-1]
     assert rendered_ssr(source, "status") == "2 collected observations"
-    assert rendered_ssr(source, "hero-value") == (f"{newest['observed_public_rooms']:,} observed")
+    assert rendered_ssr(source, "hero-value") == (
+        f"{newest['observed_public_rooms']:,} observed"
+    )
     assert rendered_ssr(source, "identity-total") == f"{newest['identity_total']:,}"
     assert rendered_ssr(source, "notes-cap-count") == (
         f"{newest['capacity']['notes']['total']:,} / {newest['capacity']['notes']['cap']:,}"
@@ -1923,6 +2241,14 @@ def test_short_series_stays_short():
     assert result["points"][0]["composition"]["samples"] == 0
     assert result["points"][0]["capacity"]["notes"]["trailing_rate"] is None
     assert result["points"][0]["capacity"]["notes"]["trailing_window"]["samples"] == 0
+
+
+def test_history_retention_rejects_an_unsupported_minimum_timestamp():
+    result = derive_records([tick("0001-01-01T00:00:00Z")])
+
+    assert result["accepted_ticks"] == 0
+    assert result["rejected_ticks"] == 1
+    assert result["points"] == []
 
 
 def test_raw_points_are_retained_only_inside_the_declared_window():
@@ -2069,12 +2395,10 @@ def test_rollup_object_count_is_bounded_as_history_grows():
     shorter = derive_records(records(400))
     longer = derive_records(records(800))
     shorter_buckets = sum(
-        len(level["buckets"])
-        for level in shorter["history"]["rollup_levels"]
+        len(level["buckets"]) for level in shorter["history"]["rollup_levels"]
     )
     longer_buckets = sum(
-        len(level["buckets"])
-        for level in longer["history"]["rollup_levels"]
+        len(level["buckets"]) for level in longer["history"]["rollup_levels"]
     )
 
     assert shorter_buckets <= 1 + 365 + 30 * 24
@@ -2086,7 +2410,9 @@ def test_malformed_tick_is_rejected():
     valid = tick("2026-08-28T08:00:00Z")
     malformed = deepcopy(valid)
     malformed["rooms_total"] = "25752"
-    accepted, rejected = read_jsonl([json.dumps(valid), json.dumps(malformed), "{not json}"])
+    accepted, rejected = read_jsonl(
+        [json.dumps(valid), json.dumps(malformed), "{not json}"]
+    )
     result = derive_records(accepted, rejected_ticks=rejected)
     assert result["accepted_ticks"] == 1
     assert result["rejected_ticks"] == 2
@@ -2101,7 +2427,9 @@ def test_no_tick_is_fabricated():
     ]
     result = derive_records(source)
     assert len(result["points"]) == len(source)
-    assert [point["ts"] for point in result["points"]] == [record["ts"] for record in source]
+    assert [point["ts"] for point in result["points"]] == [
+        record["ts"] for record in source
+    ]
     assert result["points"][0]["observed_public_rooms"] == 0
     assert result["points"][-1]["observed_public_rooms"] == 200
 
@@ -2197,9 +2525,7 @@ def test_empty_payload_reports_no_stall():
     assert values["collection-phase"] == "Collecting since"
 
 
-def test_stall_banner_is_server_rendered_and_empty_when_healthy(
-    tmp_path, monkeypatch
-):
+def test_stall_banner_is_server_rendered_and_empty_when_healthy(tmp_path, monkeypatch):
     monkeypatch.setattr(derive, "utc_now", lambda: "2026-08-28T15:12:00Z")
     stalled = derive_records([tick("2026-08-28T08:00:00Z")])
     path = tmp_path / "stalled.html"
@@ -2248,7 +2574,13 @@ def test_computed_interval_rate_caption_is_shared_between_ssr_and_display():
     result = derive_records(
         [
             tick("2026-08-28T08:00:00Z"),
-            tick("2026-08-28T08:01:00Z", event_seq=30_012, lobby=5_120, rooms=106, notes=1_030),
+            tick(
+                "2026-08-28T08:01:00Z",
+                event_seq=30_012,
+                lobby=5_120,
+                rooms=106,
+                notes=1_030,
+            ),
         ]
     )
     point = result["points"][-1]
@@ -2267,8 +2599,20 @@ def test_counter_decrease_carries_last_rate_forward_with_reason():
     result = derive_records(
         [
             tick("2026-08-28T08:00:00Z"),
-            tick("2026-08-28T08:01:00Z", event_seq=30_012, lobby=5_120, rooms=106, notes=1_030),
-            tick("2026-08-28T08:02:00Z", event_seq=30_024, lobby=5_240, rooms=90, notes=1_060),
+            tick(
+                "2026-08-28T08:01:00Z",
+                event_seq=30_012,
+                lobby=5_120,
+                rooms=106,
+                notes=1_030,
+            ),
+            tick(
+                "2026-08-28T08:02:00Z",
+                event_seq=30_024,
+                lobby=5_240,
+                rooms=90,
+                notes=1_060,
+            ),
         ]
     )
     point = result["points"][-1]
@@ -2295,7 +2639,13 @@ def test_polling_gap_with_no_prior_rate_keeps_an_honest_empty_state():
     result = derive_records(
         [
             tick("2026-08-28T08:00:00Z"),
-            tick("2026-08-28T08:20:00Z", event_seq=30_020, lobby=5_200, rooms=110, notes=1_100),
+            tick(
+                "2026-08-28T08:20:00Z",
+                event_seq=30_020,
+                lobby=5_200,
+                rooms=110,
+                notes=1_100,
+            ),
         ],
         gap_seconds=300,
     )
@@ -2521,7 +2871,12 @@ def test_funnel_bars_scale_to_the_observed_cohort_not_the_census():
     # Bars are proportions of the observed-signing cohort, so the visual no
     # longer asserts the census contains the observed population.
     widths = {stage["key"]: stage["width_percent"] for stage in display["stages"]}
-    assert widths == {"observed": 100.0, "two_ticks": 50.0, "two_dates": 25.0, "sustained": 10.0}
+    assert widths == {
+        "observed": 100.0,
+        "two_ticks": 50.0,
+        "two_dates": 25.0,
+        "sustained": 10.0,
+    }
 
     ssr = derive.ssr_widths(result)
     assert "funnel-census" not in ssr

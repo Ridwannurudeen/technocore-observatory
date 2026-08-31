@@ -145,7 +145,7 @@ past `valid_until` as stale regardless of its stored label.
   observation time, coverage boundary; per result: 16-hex id, untrusted name, match type,
   first-observed time, last lifecycle check and tri-state outcome. Room state is never a bare
   `alive` boolean — only `present_at_last_check` / `absent_at_last_check` / `check_failed` /
-  `not_yet_checked` / `unknown`.
+  `superseded_before_check` / `not_yet_checked` / `unknown`.
 - `GET /api/v1/rooms/{16-hex}` — the evidence record: creation observation, each scheduled
   checkpoint and its outcome, second-message and sender-class observations including unknown states,
   presence in the most recent local newest-200 snapshot. No raw content.

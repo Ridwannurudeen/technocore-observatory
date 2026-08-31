@@ -1,0 +1,34 @@
+[Unit]
+Description=Technocore Observatory bounded query service
+After=network.target
+ConditionPathExists=/home/technocore/observatory/signers.sqlite3
+ConditionPathExists=/opt/technocore-observatory/current
+
+[Service]
+Type=simple
+User=technocore-query
+Group=technocore-query
+SupplementaryGroups=technocore
+WorkingDirectory=/home/technocore/observatory
+UMask=0077
+ExecStart=/usr/bin/python3 /home/technocore/observatory/query_service.py --database /home/technocore/observatory/signers.sqlite3 --snapshot-root /opt/technocore-observatory/current --host 127.0.0.1 --port 8765 --collector-version 2.11.0 --methodology-version 1.13.0
+Restart=on-failure
+RestartSec=5s
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/home/technocore/observatory /opt/technocore-observatory
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

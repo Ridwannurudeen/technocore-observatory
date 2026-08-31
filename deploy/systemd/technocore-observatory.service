@@ -1,0 +1,28 @@
+[Unit]
+Description=Technocore Observatory collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=technocore
+Group=technocore
+WorkingDirectory=/home/technocore/observatory
+UMask=0027
+ExecStart=/usr/bin/python3 /home/technocore/observatory/collect.py --base-url https://technocore.chat --output /home/technocore/observatory/ticks.jsonl --telemetry-database /home/technocore/observatory/telemetry.sqlite3 --interval 120 --signer-state /home/technocore/observatory/signers.json
+Restart=always
+RestartSec=30s
+MemoryMax=512M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/home/technocore/observatory
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+    <header class="page-lede query-lede">
+      <p class="eyebrow">INDEX / local room register</p>
+      <h1>Search the observed record</h1>
+      <p>Names are untrusted labels. Results come only from the local evidence database and are capped at 20. Exact evidence is available at <code>/rooms/{16-hex}/</code>.</p>
+    </header>
+    <section class="search-stage compact" aria-labelledby="room-search-title">
+      <h2 id="room-search-title">Room name</h2>
+      <form class="room-search" action="/rooms/" method="get" role="search">
+        <label for="room-query">Enter a complete or partial room name</label>
+        <div class="search-line">
+          <input id="room-query" name="q" type="search" autocomplete="off" spellcheck="false" maxlength="80" required aria-describedby="room-search-boundary search-feedback">
+          <button type="submit">Search register <span aria-hidden="true">→</span></button>
+        </div>
+        <p id="room-search-boundary" class="boundary-note">GET request · local index · zero origin reads</p>
+        <p id="search-feedback" class="search-feedback" aria-live="polite"></p>
+      </form>
+      <div class="query-placeholder">
+        <p class="figure-label">Result frame</p>
+        <h2>Submit a query to retrieve evidence.</h2>
+        <p>The query service renders matched records with observation times, lifecycle checks and coverage boundaries. This generic page publishes no room names.</p>
+      </div>
+      <dl class="evidence-rail" aria-label="Search result evidence boundary">
+        <div><dt>Result cap</dt><dd>20</dd></div>
+        <div><dt>Match mode</dt><dd>Name search only</dd></div>
+        <div><dt>Claim boundary</dt><dd>Not observed is not absent</dd></div>
+      </dl>
+    </section>

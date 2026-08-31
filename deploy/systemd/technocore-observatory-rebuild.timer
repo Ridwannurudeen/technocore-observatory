@@ -1,0 +1,11 @@
+[Unit]
+Description=Publish a Technocore Observatory static release every ten minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=5s
+Unit=technocore-observatory-rebuild.service
+
+[Install]
+WantedBy=timers.target

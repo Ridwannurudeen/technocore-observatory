@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -28,6 +27,7 @@ from typing import Any, TextIO
 
 from collect import (
     SIGNER_STATE_VERSION,
+    SQLITE_INTEGER_MAX,
     CollectionError,
     connect_signer_database,
     parse_timestamp,
@@ -89,7 +89,10 @@ class StreamingJsonReader:
 
     def skip_whitespace(self) -> None:
         while True:
-            while self.position < len(self.buffer) and self.buffer[self.position].isspace():
+            while (
+                self.position < len(self.buffer)
+                and self.buffer[self.position].isspace()
+            ):
                 self.position += 1
             if self.position < len(self.buffer) or self.eof:
                 return
@@ -116,9 +119,15 @@ class StreamingJsonReader:
                 value, end = self.decoder.raw_decode(self.buffer, self.position)
             except json.JSONDecodeError as error:
                 if self.eof:
-                    raise CollectionError("signer JSON contains an invalid value") from error
+                    raise CollectionError(
+                        "signer JSON contains an invalid value"
+                    ) from error
                 self._read_more()
                 continue
+            except (ValueError, RecursionError) as error:
+                raise CollectionError(
+                    "signer JSON contains an invalid value"
+                ) from error
 
             if end == len(self.buffer) and not self.eof:
                 self._read_more()
@@ -147,9 +156,11 @@ def validate_source_record(
         isinstance(tick_count, bool)
         or not isinstance(tick_count, int)
         or tick_count < 0
+        or tick_count > SQLITE_INTEGER_MAX
         or isinstance(collection_dates, bool)
         or not isinstance(collection_dates, int)
         or collection_dates < 0
+        or collection_dates > SQLITE_INTEGER_MAX
         or not isinstance(rooms, list)
         or len(rooms) > 8
         or not all(isinstance(room, str) for room in rooms)
@@ -264,7 +275,9 @@ def stream_source(
             if not isinstance(key, str):
                 raise CollectionError("signer JSON contains a non-string top-level key")
             if key in seen_keys:
-                raise CollectionError(f"signer JSON contains duplicate top-level key {key}")
+                raise CollectionError(
+                    f"signer JSON contains duplicate top-level key {key}"
+                )
             seen_keys.add(key)
             reader.consume(":")
 
@@ -334,6 +347,7 @@ def migrate_signers(
             )
 
         metadata["version"] = SIGNER_STATE_VERSION
+        metadata["latest_room_listing_observed_at"] = None
         if cap_hit:
             release = released_at or utc_now()
             try:
@@ -354,9 +368,7 @@ def migrate_signers(
         validate_signer_metadata(metadata)
         sqlite_counts = signer_funnel_counts(connection)
         for name in FUNNEL_NAMES:
-            print(
-                f"{name}: source={source_counts[name]} sqlite={sqlite_counts[name]}"
-            )
+            print(f"{name}: source={source_counts[name]} sqlite={sqlite_counts[name]}")
         if source_counts != sqlite_counts:
             raise CollectionError("source and SQLite funnel counts do not match")
 
@@ -365,9 +377,6 @@ def migrate_signers(
         connection.close()
         connection = None
         save_atomic_json(metadata_path, metadata)
-        print(f"metadata: {metadata_path}")
-        print(f"sqlite: {database_path}")
-        return source_counts, sqlite_counts
     except Exception:
         if connection is not None:
             connection.rollback()
@@ -375,6 +384,10 @@ def migrate_signers(
         remove_database_files(database_path)
         metadata_path.with_name(metadata_path.name + ".tmp").unlink(missing_ok=True)
         raise
+
+    print(f"metadata: {metadata_path}")
+    print(f"sqlite: {database_path}")
+    return source_counts, sqlite_counts
 
 
 def absolute_path(value: str) -> Path:

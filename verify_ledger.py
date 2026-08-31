@@ -116,7 +116,7 @@ def verify_ledger(path: Path) -> dict[str, Any]:
     unchained_prefix_ticks = 0
     genesis_line: int | None = None
     genesis_ts: str | None = None
-    previous_record: dict[str, Any] | None = None
+    previous_canonical_bytes: bytes | None = None
     tip_sha256: str | None = None
 
     if not path.exists():
@@ -155,10 +155,7 @@ def verify_ledger(path: Path) -> dict[str, Any]:
                 )
                 if not isinstance(record, dict):
                     raise ValueError("tick is not an object")
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-                if genesis_line is None:
-                    unchained_prefix_ticks += 1
-                    continue
+            except (UnicodeDecodeError, ValueError, RecursionError) as error:
                 return _report(
                     ok=False,
                     ticks=ticks,
@@ -183,6 +180,19 @@ def verify_ledger(path: Path) -> dict[str, Any]:
                         first_break=line_number,
                         message="tick is missing ledger_chain after genesis",
                     )
+                try:
+                    canonical_tick_bytes(record)
+                except (ValueError, UnicodeEncodeError, RecursionError) as error:
+                    return _report(
+                        ok=False,
+                        ticks=ticks,
+                        unchained_prefix_ticks=unchained_prefix_ticks,
+                        genesis_line=None,
+                        genesis_ts=None,
+                        tip_sha256=None,
+                        first_break=line_number,
+                        message=f"unchained tick does not canonicalize: {error}",
+                    )
                 unchained_prefix_ticks += 1
                 continue
 
@@ -199,9 +209,22 @@ def verify_ledger(path: Path) -> dict[str, Any]:
                     message=error,
                 )
 
-            expected_tick_hash = hashlib.sha256(
-                canonical_tick_hash_bytes(record)
-            ).hexdigest()
+            try:
+                tick_hash_bytes = canonical_tick_hash_bytes(record)
+                tick_bytes = canonical_tick_bytes(record)
+            except (ValueError, UnicodeEncodeError, RecursionError) as error:
+                return _report(
+                    ok=False,
+                    ticks=ticks,
+                    unchained_prefix_ticks=unchained_prefix_ticks,
+                    genesis_line=genesis_line,
+                    genesis_ts=genesis_ts,
+                    tip_sha256=tip_sha256,
+                    first_break=line_number,
+                    message=f"tick does not canonicalize: {error}",
+                )
+
+            expected_tick_hash = hashlib.sha256(tick_hash_bytes).hexdigest()
             if chain["tick_sha256"] != expected_tick_hash:
                 return _report(
                     ok=False,
@@ -230,7 +253,9 @@ def verify_ledger(path: Path) -> dict[str, Any]:
                         message="first chained tick does not declare a null-link genesis",
                     )
                 genesis_line = line_number
-                genesis_ts = record.get("ts") if isinstance(record.get("ts"), str) else None
+                genesis_ts = (
+                    record.get("ts") if isinstance(record.get("ts"), str) else None
+                )
             else:
                 if chain["previous_sha256"] is None:
                     return _report(
@@ -243,9 +268,7 @@ def verify_ledger(path: Path) -> dict[str, Any]:
                         first_break=line_number,
                         message="unexpected second chain genesis",
                     )
-                expected_previous = hashlib.sha256(
-                    canonical_tick_bytes(previous_record)
-                ).hexdigest()
+                expected_previous = hashlib.sha256(previous_canonical_bytes).hexdigest()
                 if chain["previous_sha256"] != expected_previous:
                     return _report(
                         ok=False,
@@ -261,8 +284,8 @@ def verify_ledger(path: Path) -> dict[str, Any]:
                         ),
                     )
 
-            previous_record = record
-            tip_sha256 = hashlib.sha256(canonical_tick_bytes(record)).hexdigest()
+            previous_canonical_bytes = tick_bytes
+            tip_sha256 = hashlib.sha256(tick_bytes).hexdigest()
 
     return _report(
         ok=True,
