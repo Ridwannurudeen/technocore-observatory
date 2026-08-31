@@ -789,12 +789,8 @@ class QueryApplication:
                     "— · NOT RECORDED"
                 )
             )
-            method = html.escape(
-                str(payload["methodology_version"] or "not recorded")
-            )
-            match_mode = html.escape(
-                str(payload["match_mode"]).replace("_", " ")
-            )
+            method = html.escape(str(payload["methodology_version"] or "not recorded"))
+            match_mode = html.escape(str(payload["match_mode"]).replace("_", " "))
             more = " · MORE MATCHES RECORDED" if payload["capped"] else ""
             rail = (
                 f"<div><dt>OBSERVED</dt><dd>{observed}</dd></div>"
@@ -811,9 +807,7 @@ class QueryApplication:
                     str(result["latest_lifecycle_state"]).replace("_", " ")
                 )
                 created_at = html.escape(str(result["created_at"]))
-                first_observed_at = html.escape(
-                    str(result["first_observed_at"])
-                )
+                first_observed_at = html.escape(str(result["first_observed_at"]))
                 entries.append(
                     '<article class="result-record">'
                     f'<span class="result-index" aria-hidden="true">{index:02d}</span>'
@@ -1023,9 +1017,7 @@ class QueryApplication:
         for index, check in enumerate(room["scheduled_checks"], start=1):
             stage_seconds = html.escape(str(check["stage_seconds"]))
             due_at = html.escape(str(check["due_at"]))
-            lifecycle_state = html.escape(
-                str(check["state"]).replace("_", " ")
-            )
+            lifecycle_state = html.escape(str(check["state"]).replace("_", " "))
             attempted_at = (
                 html.escape(str(check["attempted_at"]))
                 if check["attempted_at"] is not None
@@ -1053,9 +1045,7 @@ class QueryApplication:
                 "No scheduled checkpoint is recorded.</p>"
             )
         safe_name = html.escape(escape_plain_text(room["name"]))
-        first_observed_at = html.escape(
-            str(room["creation"]["first_observed_at"])
-        )
+        first_observed_at = html.escape(str(room["creation"]["first_observed_at"]))
         source_observed_at = payload["source_observed_at"]
         observed = (
             html.escape(str(source_observed_at))
@@ -1065,9 +1055,7 @@ class QueryApplication:
                 "— · NOT RECORDED"
             )
         )
-        methodology = html.escape(
-            str(payload["methodology_version"] or "not recorded")
-        )
+        methodology = html.escape(str(payload["methodology_version"] or "not recorded"))
         latest_state = html.escape(
             str(room["latest_lifecycle_state"]).replace("_", " ")
         )

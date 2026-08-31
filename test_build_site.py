@@ -102,7 +102,11 @@ def built_release(tmp_path):
 
 def test_static_build_is_complete_versioned_and_contains_no_room_names(built_release):
     release, hostile_name = built_release
-    files = {path.relative_to(release).as_posix() for path in release.rglob("*") if path.is_file()}
+    files = {
+        path.relative_to(release).as_posix()
+        for path in release.rglob("*")
+        if path.is_file()
+    }
 
     assert release.parent.name == "releases"
     assert EXPECTED_FILES <= files
@@ -127,7 +131,9 @@ def test_build_release_records_an_external_unpublished_sidecar(built_release):
     assert not any(path.name == sidecar.name for path in release.rglob("*"))
 
 
-def test_finalize_public_tree_applies_exact_directory_and_file_modes(tmp_path, monkeypatch):
+def test_finalize_public_tree_applies_exact_directory_and_file_modes(
+    tmp_path, monkeypatch
+):
     root = tmp_path / "release"
     nested = root / "assets"
     nested.mkdir(parents=True)
@@ -267,7 +273,10 @@ def test_query_unavailable_fallback_uses_the_shared_shell():
     assert "<script" not in source.lower()
     assert 'id="theme-toggle"' not in source
     assert "<h1>SEARCH IS UNAVAILABLE</h1>" in source
-    assert "The local query service is unavailable. Static evidence still serves." in source
+    assert (
+        "The local query service is unavailable. Static evidence still serves."
+        in source
+    )
     assert not re.search(r'<(?:script|link)\b[^>]*(?:src|href)="https?://', source)
 
 
@@ -290,7 +299,9 @@ def test_discovery_documents_and_static_contracts_are_valid(built_release):
         assert {"get", "head"} <= openapi["paths"][route].keys()
     search = openapi["paths"]["/api/v1/rooms/search"]["get"]
     query = next(item for item in search["parameters"] if item["name"] == "q")
-    search_format = next(item for item in search["parameters"] if item["name"] == "format")
+    search_format = next(
+        item for item in search["parameters"] if item["name"] == "format"
+    )
     assert query["schema"]["maxLength"] == 80
     assert search_format["schema"] == {
         "type": "string",
@@ -565,13 +576,16 @@ def test_theme_tokens_meet_text_chart_and_non_text_contrast_thresholds():
         alpha = float(match.group(4))
         backdrop = channels(background, background)
         return tuple(
-            alpha * front + (1 - alpha) * back for front, back in zip(foreground, backdrop)
+            alpha * front + (1 - alpha) * back
+            for front, back in zip(foreground, backdrop)
         )
 
     def luminance(value, background):
         rgb = channels(value, background)
         adjusted = [
-            channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
             for channel in rgb
         ]
         return 0.2126 * adjusted[0] + 0.7152 * adjusted[1] + 0.0722 * adjusted[2]
@@ -781,7 +795,9 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
                     assert toggle.get_attribute("data-theme-value") == "system"
                     assert page.locator("html").get_attribute("data-theme") is None
 
-                    short_controls = page.locator("button, select, input, summary").evaluate_all(
+                    short_controls = page.locator(
+                        "button, select, input, summary"
+                    ).evaluate_all(
                         "els => els.filter(el => { const r=el.getBoundingClientRect(); return r.width && r.height && (r.width < 44 || r.height < 44); }).map(el => el.id || el.textContent.trim())"
                     )
                     assert short_controls == [], relative

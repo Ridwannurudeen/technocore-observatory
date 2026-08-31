@@ -1287,7 +1287,7 @@ def test_progressive_room_html_escapes_names_and_uses_generic_previews(running_s
         '<header class="site-header">',
         "TECHNOCORE OBSERVATORY",
         '<details class="site-index">',
-        '<summary>INDEX</summary>',
+        "<summary>INDEX</summary>",
         '<nav aria-label="Site index">',
         '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>',
         '<main id="main-content" class="page-shell" tabindex="-1">',
@@ -1430,7 +1430,10 @@ def test_trace_is_exact_only_and_html_page_uses_generic_metadata(running_server)
     assert '<header class="site-header">' in source
     assert '<details class="site-index">' in source
     assert '<nav aria-label="Site index">' in source
-    assert '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>' in source
+    assert (
+        '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>'
+        in source
+    )
     assert 'class="priority-nav"' not in source
     assert '<main id="main-content" class="page-shell" tabindex="-1">' in source
     for prohibited in ("liveness", "quality", "verification"):

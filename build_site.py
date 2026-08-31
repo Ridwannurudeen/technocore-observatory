@@ -205,7 +205,9 @@ def change_rows(changes: list[dict[str, Any]]) -> str:
 def methodology_history_rows(revisions: list[dict[str, Any]]) -> str:
     rows = []
     for revision in revisions:
-        changes = "".join(f"<li>{escaped(change)}</li>" for change in revision["changes"])
+        changes = "".join(
+            f"<li>{escaped(change)}</li>" for change in revision["changes"]
+        )
         limitations = "".join(
             f"<li>{escaped(limitation)}</li>" for limitation in revision["limitations"]
         )
@@ -269,7 +271,9 @@ def finalize_public_tree(root: Path) -> None:
             if path.is_symlink():
                 raise ValueError(f"public release tree contains a symlink: {path}")
             if not path.is_dir():
-                raise ValueError(f"public release tree contains a non-directory: {path}")
+                raise ValueError(
+                    f"public release tree contains a non-directory: {path}"
+                )
             directories.append(path)
         for name in filenames:
             path = directory / name
@@ -305,7 +309,9 @@ def write_pages(root: Path, snapshots: dict[str, dict[str, Any]]) -> None:
             robots="index,follow,max-image-preview:large",
             values={
                 "PUBLISHED_DATE": escaped(published_date),
-                "SOURCE_OBSERVED_AT": escaped(status["collector"]["source_observed_at"]),
+                "SOURCE_OBSERVED_AT": escaped(
+                    status["collector"]["source_observed_at"]
+                ),
                 "COLLECTOR_VALID_UNTIL": escaped(status["collector"]["valid_until"]),
                 "COLLECTOR_FRESHNESS": escaped(
                     label(status["collector"]["freshness"]).capitalize()
@@ -316,8 +322,12 @@ def write_pages(root: Path, snapshots: dict[str, dict[str, Any]]) -> None:
                 "ORIGIN_OBSERVED_AT": escaped(status["origin"]["source_observed_at"]),
                 "COLLECTOR_TONE": safe_tone(status["collector"]["state"]),
                 "COLLECTOR_STATE": escaped(label(status["collector"]["state"])),
-                "COLLECTOR_OBSERVED_AT": escaped(status["collector"]["source_observed_at"]),
-                "ATTEMPT_COUNT": escaped(status_envelope["coverage"]["telemetry"]["attempts"]),
+                "COLLECTOR_OBSERVED_AT": escaped(
+                    status["collector"]["source_observed_at"]
+                ),
+                "ATTEMPT_COUNT": escaped(
+                    status_envelope["coverage"]["telemetry"]["attempts"]
+                ),
                 "WINDOW_LABEL": escaped(window_label),
             },
         ),
@@ -413,7 +423,9 @@ def write_pages(root: Path, snapshots: dict[str, dict[str, Any]]) -> None:
             ),
             robots="index,follow,max-image-preview:large",
             values={
-                "METHODOLOGY_VERSION": escaped(methodology_envelope["methodology_version"]),
+                "METHODOLOGY_VERSION": escaped(
+                    methodology_envelope["methodology_version"]
+                ),
                 "SCHEMA_VERSION": escaped(methodology_envelope["schema_version"]),
                 "HISTORY_BOUNDARY": escaped(
                     methodology_envelope["methodology"]["history_boundary"]
@@ -446,7 +458,9 @@ def discovery_documents() -> tuple[dict[str, Any], dict[str, Any], str, str]:
             {
                 "name": "format",
                 "in": "query",
-                "description": ("Omit for the default text response; use json for JSON."),
+                "description": (
+                    "Omit for the default text response; use json for JSON."
+                ),
                 "schema": {"type": "string", "enum": ["json"]},
             }
         ]
@@ -508,7 +522,9 @@ def discovery_documents() -> tuple[dict[str, Any], dict[str, Any], str, str]:
                 {
                     "name": "format",
                     "in": "query",
-                    "description": ("Omit for the default text response; use json for JSON."),
+                    "description": (
+                        "Omit for the default text response; use json for JSON."
+                    ),
                     "schema": {"type": "string", "enum": ["json"]},
                 },
             ],
@@ -546,7 +562,9 @@ def discovery_documents() -> tuple[dict[str, Any], dict[str, Any], str, str]:
             "description": "Bounded exact local evidence",
             "content": {
                 "text/plain": {"schema": {"type": "string"}},
-                "application/json": {"schema": {"type": "object", "additionalProperties": True}},
+                "application/json": {
+                    "schema": {"type": "object", "additionalProperties": True}
+                },
             },
         }
     }
@@ -606,13 +624,17 @@ def discovery_documents() -> tuple[dict[str, Any], dict[str, Any], str, str]:
     agent = {
         "schema_version": "1.0",
         "name": "Technocore Observatory",
-        "description": ("Read-only public evidence register for Technocore observations."),
+        "description": (
+            "Read-only public evidence register for Technocore observations."
+        ),
         "url": "https://technocore.gudman.xyz/",
         "auth": {"type": "none"},
         "interfaces": {
             "plain_text": "https://technocore.gudman.xyz/llms.txt",
             "openapi": "https://technocore.gudman.xyz/openapi.json",
-            "room_search": ("https://technocore.gudman.xyz/api/v1/rooms/search?q={query}"),
+            "room_search": (
+                "https://technocore.gudman.xyz/api/v1/rooms/search?q={query}"
+            ),
             "room_evidence": ("https://technocore.gudman.xyz/api/v1/rooms/{room_id}"),
             "trace": "https://technocore.gudman.xyz/api/v1/dids/{did}",
         },
@@ -688,7 +710,9 @@ def derive_public_data(
     if data["collection_ended"] is not None:
         age = max(
             0.0,
-            (parse_utc(derived_at) - parse_utc(data["collection_ended"])).total_seconds(),
+            (
+                parse_utc(derived_at) - parse_utc(data["collection_ended"])
+            ).total_seconds(),
         )
         data["collection_age_seconds"] = age
         data["collection_stalled"] = age > data["collection_stall_threshold_seconds"]
@@ -710,7 +734,8 @@ def derive_public_data(
 
 def release_identifier(snapshots: dict[str, dict[str, Any]], published_at: str) -> str:
     material = b"".join(
-        json_bytes(snapshots[name]) for name in ("status", "incidents", "changes", "methodology")
+        json_bytes(snapshots[name])
+        for name in ("status", "incidents", "changes", "methodology")
     )
     digest = hashlib.sha256(material).hexdigest()[:12]
     timestamp = re.sub(r"[^0-9]", "", published_at)[:14]
@@ -742,7 +767,9 @@ def build_release(
     published_time = snapshots["status"]["published_at"]
     identifier = release_id or release_identifier(snapshots, published_time)
     if RELEASE_NAME.fullmatch(identifier) is None:
-        raise ValueError("release_id must contain only letters, digits, dot, dash or underscore")
+        raise ValueError(
+            "release_id must contain only letters, digits, dot, dash or underscore"
+        )
 
     output = Path(output_root).resolve()
     releases = output / "releases"
@@ -785,7 +812,12 @@ def build_release(
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
-        if sidecar_created and not renamed and not target.exists() and not target.is_symlink():
+        if (
+            sidecar_created
+            and not renamed
+            and not target.exists()
+            and not target.is_symlink()
+        ):
             sidecar.unlink()
     return target
 
