@@ -1141,17 +1141,6 @@ figure {
 }
 
 @media (max-width: 560px) {
-  .wordmark {
-    width: 44px;
-    font-size: 0;
-  }
-
-  .wordmark::before {
-    font-size: var(--type-xs);
-    line-height: var(--leading-xs);
-    content: "T/O";
-  }
-
   .site-index summary {
     min-width: 56px;
     padding-inline: var(--space-micro);
@@ -1252,6 +1241,21 @@ figure {
     text-align: left;
   }
 }
+
+/* Only where the full name genuinely cannot fit: the header reserves 124px for
+   the wordmark at 320px, the full name needs 164px, "TECHNOCORE" needs 75px. */
+@media (max-width: 400px) {
+  .wordmark {
+    font-size: 0;
+  }
+
+  .wordmark::before {
+    font-size: var(--type-xs);
+    line-height: var(--leading-xs);
+    content: "TECHNOCORE";
+  }
+}
+
 
 @media (prefers-reduced-motion: reduce) {
   html {

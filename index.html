@@ -1013,8 +1013,6 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--missing) }
 }
 
 @media (max-width: 560px) {
-  .wordmark { width: 44px; font-size: 0 }
-  .wordmark::before { font-size: var(--type-xs); line-height: var(--leading-xs); content: "T/O" }
   .site-index summary { min-width: 56px; padding-inline: var(--space-micro) }
   .theme-control { min-width: 92px; padding-inline: var(--space-micro); font-size: var(--type-xs) }
 
@@ -1040,6 +1038,11 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--missing) }
   .segment-option { flex: 1 1 0; padding-inline: var(--space-1) }
   .ruled-table { min-width: 480px }
 }
+@media (max-width: 400px) {
+  .wordmark { font-size: 0 }
+  .wordmark::before { font-size: var(--type-xs); line-height: var(--leading-xs); content: "TECHNOCORE" }
+}
+
 
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto }
