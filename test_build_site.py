@@ -207,7 +207,7 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     for source in (home, rooms):
         for marker in shell_markers:
             assert marker in source
-        assert 'class="priority-nav"' not in source
+        assert '<nav class="priority-nav" aria-label="Primary">' in source
         form_match = re.search(
             r'<form class="room-search"[^>]*>.*?</form>',
             source,
@@ -269,7 +269,7 @@ def test_query_unavailable_fallback_uses_the_shared_shell():
         '<footer class="site-footer">',
     ):
         assert marker in source
-    assert 'class="priority-nav"' not in source
+    assert '<nav class="priority-nav" aria-label="Primary">' in source
     assert "<script" not in source.lower()
     assert 'id="theme-toggle"' not in source
     assert "<h1>SEARCH IS UNAVAILABLE</h1>" in source

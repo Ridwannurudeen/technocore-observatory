@@ -1539,6 +1539,11 @@ class QueryApplication:
             '<header class="site-header"><div class="site-header-inner">'
             '<a class="wordmark" href="/" aria-label="Technocore Observatory home">'
             "TECHNOCORE OBSERVATORY</a>"
+            '<nav class="priority-nav" aria-label="Primary">'
+            '<a href="/status/">STATUS</a>'
+            '<a href="/rooms/" aria-current="page">ROOMS</a>'
+            '<a href="/observatory/">OBSERVATORY</a>'
+            '<a href="/methodology/">METHODOLOGY</a></nav>'
             '<details class="site-index"><summary>INDEX</summary>'
             '<nav aria-label="Site index">'
             '<a href="/">REGISTER</a><a href="/status/">STATUS</a>'

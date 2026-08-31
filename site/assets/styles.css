@@ -243,7 +243,7 @@ figure {
   height: 56px;
   margin: 0;
   padding: 0 max(var(--space-4), calc((100% - var(--report-width)) / 2));
-  grid-template-columns: minmax(210px, 1fr) auto auto;
+  grid-template-columns: minmax(210px, 1fr) auto auto auto;
   gap: var(--space-1);
   align-items: center;
   border-bottom: 1px solid var(--line);
@@ -251,6 +251,7 @@ figure {
 }
 
 .wordmark,
+.priority-nav a,
 .site-index summary,
 .site-index nav a,
 .theme-control {
@@ -260,6 +261,31 @@ figure {
   letter-spacing: 0.035em;
   line-height: var(--leading-s);
 }
+
+.priority-nav {
+  display: flex;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.priority-nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  color: var(--text-muted);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+}
+
+.priority-nav a:hover {
+  color: var(--text);
+}
+
+.priority-nav a[aria-current="page"] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
 
 .wordmark {
   display: inline-flex;
@@ -1032,6 +1058,10 @@ figure {
 }
 
 @media (max-width: 900px) {
+  .priority-nav {
+    display: none;
+  }
+
   .site-header {
     padding-inline: var(--space-2);
     grid-template-columns: minmax(0, 1fr) auto auto;
