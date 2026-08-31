@@ -3215,10 +3215,10 @@ def _migrate_room_generation_schema(connection: sqlite3.Connection) -> None:
                 raise CollectionError(
                     "legacy room ledger contains an invalid timestamp"
                 ) from error
-            if first_observed < created or (
-                last_listed is not None and last_listed < created
-            ):
-                raise CollectionError("legacy room ledger has inconsistent timestamps")
+            if last_listed is not None and last_listed < first_observed:
+                raise CollectionError(
+                    "legacy room ledger has inconsistent observation timestamps"
+                )
             connection.execute(
                 """
                 INSERT INTO room_ledger_new (

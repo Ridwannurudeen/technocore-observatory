@@ -2891,7 +2891,9 @@ def test_v3_counterparty_flags_are_reset_during_v4_migration(tmp_path):
         migrated.close()
 
 
-def test_v5_to_v6_migration_preserves_rows_and_backfills_search(tmp_path):
+def test_v5_to_v6_migration_preserves_cross_clock_timestamps_and_backfills_search(
+    tmp_path,
+):
     path = tmp_path / "signers-v5.sqlite3"
     connection = sqlite3.connect(path)
     state = new_signer_state(100)
@@ -2935,7 +2937,7 @@ def test_v5_to_v6_migration_preserves_rows_and_backfills_search(tmp_path):
             collect.room_identifier("persistent-alpha-room"),
             42,
             "2026-08-29T08:00:00Z",
-            "2026-08-29T08:00:01Z",
+            "2026-08-29T07:59:59.441996Z",
         ),
     )
     connection.executemany(
@@ -2992,7 +2994,7 @@ def test_v5_to_v6_migration_preserves_rows_and_backfills_search(tmp_path):
             hashlib.sha256(b"persistent-alpha-room").hexdigest(),
             42,
             "2026-08-29T08:00:00.000000Z",
-            "2026-08-29T08:00:01.000000Z",
+            "2026-08-29T07:59:59.441996Z",
             None,
         )
         assert migrated.execute(
