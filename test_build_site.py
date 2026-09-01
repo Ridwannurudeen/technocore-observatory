@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import build_site
+import guards
 import snapshots
 from api_contract import MAX_RESPONSE_BYTES
 from build_site import build_release
@@ -976,3 +977,26 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
                 page.close()
         finally:
             browser.close()
+
+
+def test_render_guards_hold_on_a_built_release(built_release):
+    """Run the two browser guards that never run anywhere else.
+
+    `rebuild.sh` invokes them on the collector host, which has no browser, so
+    they SKIP on every deploy; nothing else calls them. They are the only
+    checks that look at the rendered page rather than the payload, and the
+    no-JS one exists because a crawler-facing divergence shipped past the
+    scripted check. CI installs Chromium, so this is where they can bite.
+    """
+    pytest.importorskip("playwright.sync_api")
+    release, _ = built_release
+    built = release / "observatory/index.html"
+    payload = json.loads((release / "data.json").read_text(encoding="utf-8"))
+
+    findings = guards.guard_zero_width_render(built) + guards.guard_no_js_state(
+        built, payload
+    )
+    skipped = [f for f in findings if f.startswith("SKIPPED:")]
+    if skipped:
+        pytest.skip(skipped[0])
+    assert findings == []
