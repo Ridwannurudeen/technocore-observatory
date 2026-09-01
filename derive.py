@@ -788,11 +788,14 @@ def validate_room_lifecycle_sampling(
                 f"{stage}.second_message_fraction.denominator"
             ),
         )
-        if denominator != validated["completed_checks"] or numerator > denominator:
+        if numerator > denominator or denominator > validated["completed_checks"]:
             raise ValueError(
                 "room_lifecycle_sampling second-message accounting is inconsistent"
             )
-        validated["checked_and_quiet"] = validated["completed_checks"] - numerator
+        # The collector counts second messages only for checks that found the room
+        # present, so the denominator is those present checks, not every completed
+        # check. A completed check that returned 404 observed no room to be quiet.
+        validated["checked_and_quiet"] = denominator - numerator
         validated["second_message_fraction"] = {
             "numerator": numerator,
             "denominator": denominator,
@@ -2068,8 +2071,9 @@ def room_lifecycle_display(
         sampling_evidence_text = (
             f" Sampling evidence: {format_int(selected_total)} / "
             f"{format_int(sampling['selection']['read_budget'])} lifecycle reads "
-            f"selected; {format_int(sampling['aged_out_unselected'])} eligible "
-            "checks aged out unselected across the three stages."
+            f"selected this tick; {format_int(sampling['aged_out_unselected'])} "
+            "eligible checks have aged out across the three stages since the ledger "
+            "began."
         )
 
     if sampling is not None:
@@ -2294,7 +2298,7 @@ def room_lifecycle_sampling_display(
         if fraction["denominator"] == 0:
             fraction_text = (
                 "second-message fraction not recorded because the "
-                "completed-check denominator is 0"
+                "present-check denominator is 0"
             )
         else:
             fraction_text = (
@@ -2308,11 +2312,11 @@ def room_lifecycle_sampling_display(
                 f"{format_int(coverage_fraction['denominator'])} completed"
             ),
             "context": (
-                f"{stage_labels[stage]} stage · "
+                f"{stage_labels[stage]} stage, since the ledger began · "
                 f"{format_int(coverage['deferred_checks'])} deferred · "
                 f"{format_int(coverage['failed_checks'])} failed · "
-                f"{format_int(coverage['aged_out_unselected'])} aged out unselected "
-                "without an attempt · "
+                f"{format_int(coverage['aged_out_unselected'])} aged out without a "
+                "timely attempt · "
                 f"{format_int(coverage['checked_and_quiet'])} checked and quiet · "
                 f"{fraction_text}"
             ),
@@ -2336,8 +2340,9 @@ def room_lifecycle_sampling_display(
         "aged_out": {
             "value_text": format_int(sampling["aged_out_unselected"]),
             "context": (
-                "eligible scheduled checks that were never selected or attempted "
-                "before their stage window expired · not a quiet check, failure, "
+                "eligible scheduled checks, since the ledger began, with no timely "
+                "in-window attempt; a check read after its window closed is counted "
+                "here and excluded from coverage · not a quiet check, failure, "
                 "or deferral"
             ),
         },
@@ -2979,10 +2984,15 @@ def methodology_definitions() -> dict[str, str]:
             "superseded_after_eligibility; and attempted_checks is exactly "
             "completed_checks plus failed_checks. The top-level aged_out_unselected "
             "is the sum across stages. Per-stage coverage is printed as completed "
-            "checks / eligible rooms, never as a bare percentage. Deferred checks, "
-            "failed checks, aged-out unselected checks and completed checks that were "
+            "checks / eligible rooms, never as a bare percentage. Every coverage_by_stage "
+            "figure, and the aged-out total drawn from it, counts every scheduled "
+            "check whose window has opened since the ledger began; the selection, "
+            "read-budget and due-count figures beside them describe only the tick "
+            "being reported. A running total and a single tick are never summed or "
+            "compared. Deferred checks, "
+            "failed checks, aged-out checks and present checks that were "
             "checked and quiet remain separate published states. A second-message "
-            "fraction is printed only with its numerator and completed-check "
+            "fraction is printed only with its numerator and present-check "
             "denominator; a zero denominator is reported as not recorded, never as "
             "0%. Selection evidence publishes the rank and eligibility descriptors, "
             "selector seed, tick timestamp, allocation rotation, initial per-stage "

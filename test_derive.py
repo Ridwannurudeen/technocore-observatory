@@ -3231,7 +3231,10 @@ def test_two_argument_lifecycle_display_renders_sampling_evidence_and_legacy_abs
     )
     current_coverage = current["points"][0]["room_lifecycle_display"]["coverage_text"]
     assert "Sampling evidence: 38 / 38 lifecycle reads selected" in current_coverage
-    assert "77,151 eligible checks aged out unselected" in current_coverage
+    assert (
+        "77,151 eligible checks have aged out across the three stages since the "
+        "ledger began" in current_coverage
+    )
 
     legacy = derive_records(
         [
@@ -3526,12 +3529,15 @@ def test_stage_coverage_keeps_each_outcome_state_distinct():
     one_hour = display["stages"]["3600"]
     aged_out = display["aged_out"]
 
-    assert "never selected or attempted" in aged_out["context"]
+    # A check read after its window closed lands here too, so the published text
+    # must not claim these were never attempted.
+    assert "no timely in-window attempt" in aged_out["context"]
+    assert "never selected or attempted" not in aged_out["context"]
     assert "not a quiet check, failure, or deferral" in aged_out["context"]
     assert one_hour["value_text"] == "13 / 39,478 completed"
     assert "1,792 deferred" in one_hour["context"]
     assert "0 failed" in one_hour["context"]
-    assert "37,673 aged out unselected" in one_hour["context"]
+    assert "37,673 aged out without a timely attempt" in one_hour["context"]
     assert "10 checked and quiet" in one_hour["context"]
     assert "3 / 13 recorded a second message (23.1%)" in one_hour["context"]
     assert one_hour["value_text"] != "0.0%"
@@ -3617,3 +3623,48 @@ def test_lifecycle_sampling_ssr_reads_shared_strings_verbatim(tmp_path):
     assert "function renderRoomLifecycleSampling(point)" in page_source
     assert "renderRoomLifecycleSampling(point);" in page_source
     assert ".innerHTML" not in page_source
+
+
+def test_a_completed_check_that_found_the_room_absent_is_not_quiet():
+    # The collector counts second messages only for checks that found the room
+    # present, so a 404 makes the present-check denominator smaller than
+    # completed_checks. Requiring equality refused every tick after the first
+    # timely 404, and since coverage is cumulative the refusal was permanent.
+    sampling = lifecycle_sampling()
+    stage = sampling["coverage_by_stage"]["3600"]
+    assert stage["completed_checks"] == 13
+    stage["second_message_fraction"]["denominator"] = 12
+
+    derived = validate_tick(
+        tick(
+            "2026-08-31T12:00:00Z",
+            collector_version="2.12.0",
+            room_lifecycle=lifecycle_2_12(),
+            room_lifecycle_sampling=sampling,
+        )
+    )
+
+    validated = derived["room_lifecycle_sampling"]["coverage_by_stage"]["3600"]
+    numerator = validated["second_message_fraction"]["numerator"]
+    # The absent room was checked, but there was no room there to be quiet.
+    assert validated["checked_and_quiet"] == 12 - numerator
+    assert validated["checked_and_quiet"] != 13 - numerator
+
+
+def test_second_message_denominator_cannot_exceed_completed_checks():
+    sampling = lifecycle_sampling()
+    stage = sampling["coverage_by_stage"]["3600"]
+    stage["second_message_fraction"]["denominator"] = stage["completed_checks"] + 1
+
+    with pytest.raises(
+        ValueError,
+        match="second-message accounting is inconsistent",
+    ):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=sampling,
+            )
+        )
