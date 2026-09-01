@@ -72,7 +72,7 @@ PREFIX_CLASSES = (
 )
 ROOM_READ_BUDGET = 80
 PUBLISHED_READS_PER_MINUTE = 600
-MAX_READ_SHARE = 0.15
+MAX_READ_SHARE = 0.20
 RATE_BUDGET_WINDOW_SECONDS = 60
 BASE_READ_BUDGET = ROOM_READ_BUDGET + 2
 TOTAL_READ_BUDGET = int(
@@ -85,7 +85,7 @@ ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
 CENSUS_MAX_PASSES = 5
 CENSUS_DEADLINE_SECONDS = 30 * 60
 CENSUS_STATE_VERSION = 2
-COLLECTOR_VERSION = "2.11.1"
+COLLECTOR_VERSION = "2.12.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
 SIGNER_STATE_VERSION = 6
@@ -4456,6 +4456,7 @@ def new_signer_state(tracked_cap: int) -> dict[str, Any]:
         "selector_epoch": -1,
         "selector_frame": [],
         "selector_position": 0,
+        "revisit_allocation_rotation": 0,
     }
 
 
@@ -4565,6 +4566,7 @@ def validate_signer_metadata(value: Any) -> dict[str, Any]:
         "selector_epoch",
         "selector_frame",
         "selector_position",
+        "revisit_allocation_rotation",
     )
     if not all(field in value for field in selector_fields):
         raise CollectionError("signer metadata has an incomplete room selector")
@@ -4591,6 +4593,10 @@ def validate_signer_metadata(value: Any) -> dict[str, Any]:
         or value["selector_position"] < 0
         or value["selector_position"] > SQLITE_INTEGER_MAX
         or value["selector_position"] > len(value["selector_frame"])
+        or isinstance(value["revisit_allocation_rotation"], bool)
+        or not isinstance(value["revisit_allocation_rotation"], int)
+        or value["revisit_allocation_rotation"]
+        not in range(len(ROOM_REVISIT_STAGES_SECONDS))
     ):
         raise CollectionError("signer metadata has an invalid room selector")
 
@@ -4697,6 +4703,12 @@ def load_signer_state(
         raise CollectionError(
             "signer database contains invalid metadata JSON"
         ) from error
+    if (
+        isinstance(value, dict)
+        and value.get("version") == SIGNER_STATE_VERSION
+        and "revisit_allocation_rotation" not in value
+    ):
+        value["revisit_allocation_rotation"] = 0
     validate_signer_metadata(value)
 
     disk_value: Any = None
@@ -4897,11 +4909,37 @@ def record_listed_rooms(
     state["latest_room_listing_observed_at"] = observed_at
 
 
+def room_revisit_rank(
+    selector_version: int,
+    selector_seed: str,
+    tick_timestamp: str,
+    stage_seconds: int,
+    created_seq: int,
+) -> bytes:
+    material = json.dumps(
+        {
+            "created_seq": created_seq,
+            "selector_seed": selector_seed,
+            "selector_version": selector_version,
+            "stage_seconds": stage_seconds,
+            "tick_timestamp": tick_timestamp,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(material).digest()
+
+
 def select_due_room_revisits(
     connection: sqlite3.Connection,
     now: str,
+    *,
+    selector_version: int,
+    selector_seed: str,
+    allocation_rotation: int,
     limit: int = ROOM_REVISIT_READ_BUDGET,
-) -> tuple[int, int, list[dict[str, Any]]]:
+) -> dict[str, Any]:
     if (
         isinstance(limit, bool)
         or not isinstance(limit, int)
@@ -4909,6 +4947,16 @@ def select_due_room_revisits(
         or limit > ROOM_REVISIT_READ_BUDGET
     ):
         raise CollectionError("room-revisit selection exceeds its enforced read budget")
+    if (
+        isinstance(selector_version, bool)
+        or selector_version != SELECTOR_VERSION
+        or not isinstance(selector_seed, str)
+        or re.fullmatch(r"[0-9a-f]{32}", selector_seed) is None
+        or isinstance(allocation_rotation, bool)
+        or not isinstance(allocation_rotation, int)
+        or allocation_rotation not in range(len(ROOM_REVISIT_STAGES_SECONDS))
+    ):
+        raise CollectionError("room-revisit selection has an invalid selector")
     try:
         now_timestamp = parse_timestamp(now)
     except (TypeError, ValueError) as error:
@@ -4962,34 +5010,7 @@ def select_due_room_revisits(
     if invalid is not None:
         raise CollectionError("room revisit store contains an invalid row")
 
-    due = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM room_revisits
-        WHERE attempted_at IS NULL AND due_at <= ?
-        """,
-        (normalized_now,),
-    ).fetchone()[0]
-    superseded_due = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM room_revisits
-        JOIN room_ledger
-            ON room_ledger.created_seq = room_revisits.room_created_seq
-        WHERE
-            room_revisits.attempted_at IS NULL
-            AND room_revisits.due_at <= ?
-            AND EXISTS (
-                SELECT 1
-                FROM room_ledger AS newer
-                WHERE
-                    newer.name = room_ledger.name
-                    AND newer.created_seq > room_ledger.created_seq
-            )
-        """,
-        (normalized_now,),
-    ).fetchone()[0]
-    superseded_rows = connection.execute(
+    rows = connection.execute(
         """
         SELECT
             room_revisits.room_created_seq,
@@ -4997,64 +5018,38 @@ def select_due_room_revisits(
             room_revisits.stage_seconds,
             room_revisits.due_at,
             room_ledger.created_at,
-            1
+            (
+                SELECT MIN(newer.created_at)
+                FROM room_ledger AS newer
+                WHERE
+                    newer.name = room_ledger.name
+                    AND newer.created_seq > room_ledger.created_seq
+                    AND newer.created_at <= ?
+            )
         FROM room_revisits
         JOIN room_ledger
             ON room_ledger.created_seq = room_revisits.room_created_seq
         WHERE
             room_revisits.attempted_at IS NULL
             AND room_revisits.due_at <= ?
-            AND EXISTS (
-                SELECT 1
-                FROM room_ledger AS newer
-                WHERE
-                    newer.name = room_ledger.name
-                    AND newer.created_seq > room_ledger.created_seq
-            )
-        ORDER BY
-            room_revisits.due_at,
-            room_revisits.room_created_seq,
-            room_revisits.stage_seconds
-        LIMIT ?
         """,
-        (normalized_now, ROOM_REVISIT_PUBLICATION_BATCH_LIMIT - limit),
+        (normalized_now, normalized_now),
     ).fetchall()
-    active_rows = connection.execute(
-        """
-        SELECT
-            room_revisits.room_created_seq,
-            room_ledger.name,
-            room_revisits.stage_seconds,
-            room_revisits.due_at,
-            room_ledger.created_at,
-            0
-        FROM room_revisits
-        JOIN room_ledger
-            ON room_ledger.created_seq = room_revisits.room_created_seq
-        WHERE
-            room_revisits.attempted_at IS NULL
-            AND room_revisits.due_at <= ?
-            AND NOT EXISTS (
-                SELECT 1
-                FROM room_ledger AS newer
-                WHERE
-                    newer.name = room_ledger.name
-                    AND newer.created_seq > room_ledger.created_seq
-            )
-        ORDER BY
-            room_revisits.due_at,
-            room_revisits.room_created_seq,
-            room_revisits.stage_seconds
-        LIMIT ?
-        """,
-        (normalized_now, limit),
-    ).fetchall()
-    rows = sorted(
-        [*superseded_rows, *active_rows],
-        key=lambda row: (row[3], row[0], row[2]),
-    )
-    selected = []
-    for created_seq, name, stage_seconds, due_at, created_at, superseded in rows:
+
+    active: dict[int, list[tuple[bytes, int, dict[str, Any]]]] = {
+        stage_seconds: [] for stage_seconds in ROOM_REVISIT_STAGES_SECONDS
+    }
+    superseded: list[tuple[datetime, int, int, dict[str, Any]]] = []
+    aged_out_unselected = 0
+
+    for (
+        created_seq,
+        name,
+        stage_seconds,
+        due_at,
+        created_at,
+        superseded_at,
+    ) in rows:
         if (
             isinstance(created_seq, bool)
             or not isinstance(created_seq, int)
@@ -5067,11 +5062,16 @@ def select_due_room_revisits(
             or stage_seconds not in ROOM_REVISIT_STAGES_SECONDS
             or not isinstance(due_at, str)
             or not isinstance(created_at, str)
+            or (superseded_at is not None and not isinstance(superseded_at, str))
         ):
             raise CollectionError("room revisit store contains an invalid row")
         try:
             created = parse_timestamp(created_at)
             due_timestamp = parse_timestamp(due_at)
+            eligible_until = due_timestamp + timedelta(seconds=stage_seconds)
+            newer_created = (
+                parse_timestamp(superseded_at) if superseded_at is not None else None
+            )
             expected_due = created + timedelta(seconds=stage_seconds)
         except (ValueError, OverflowError) as error:
             raise CollectionError(
@@ -5081,16 +5081,272 @@ def select_due_room_revisits(
             raise CollectionError(
                 "room revisit store contains an inconsistent due time"
             )
+
         entry = {
             "created_seq": created_seq,
             "name": name,
             "stage_seconds": stage_seconds,
             "created_at": created_at,
         }
-        if superseded:
+        if newer_created is not None and newer_created < eligible_until:
             entry["superseded"] = True
-        selected.append(entry)
-    return int(due), int(superseded_due), selected
+            superseded.append((due_timestamp, created_seq, stage_seconds, entry))
+            continue
+        if now_timestamp >= eligible_until:
+            aged_out_unselected += 1
+            continue
+
+        rank = room_revisit_rank(
+            selector_version,
+            selector_seed,
+            normalized_now,
+            stage_seconds,
+            created_seq,
+        )
+        active[stage_seconds].append((rank, created_seq, entry))
+
+    stage_count = len(ROOM_REVISIT_STAGES_SECONDS)
+    base_allocation, extra_slots = divmod(limit, stage_count)
+    initial_allocation = dict.fromkeys(
+        ROOM_REVISIT_STAGES_SECONDS,
+        base_allocation,
+    )
+    for offset in range(extra_slots):
+        stage_index = (allocation_rotation + 1 + offset) % stage_count
+        stage_seconds = ROOM_REVISIT_STAGES_SECONDS[stage_index]
+        initial_allocation[stage_seconds] += 1
+
+    initially_selected: list[tuple[bytes, int, int, dict[str, Any]]] = []
+    remaining: list[tuple[bytes, int, int, dict[str, Any]]] = []
+    for stage_seconds in ROOM_REVISIT_STAGES_SECONDS:
+        ranked = sorted(
+            active[stage_seconds],
+            key=lambda candidate: (candidate[0], candidate[1]),
+        )
+        allocation = initial_allocation[stage_seconds]
+        initially_selected.extend(
+            (rank, stage_seconds, created_seq, entry)
+            for rank, created_seq, entry in ranked[:allocation]
+        )
+        remaining.extend(
+            (rank, stage_seconds, created_seq, entry)
+            for rank, created_seq, entry in ranked[allocation:]
+        )
+
+    unused_slots = limit - len(initially_selected)
+    remaining.sort(key=lambda candidate: candidate[:3])
+    redistributed = remaining[:unused_slots]
+    ranked_selected = sorted(
+        [*initially_selected, *redistributed],
+        key=lambda candidate: candidate[:3],
+    )
+    selected = [candidate[3] for candidate in ranked_selected]
+    selected_by_stage = {
+        str(stage_seconds): sum(
+            entry["stage_seconds"] == stage_seconds for entry in selected
+        )
+        for stage_seconds in ROOM_REVISIT_STAGES_SECONDS
+    }
+
+    superseded.sort(key=lambda candidate: candidate[:3])
+    publication_capacity = ROOM_REVISIT_PUBLICATION_BATCH_LIMIT - len(selected)
+    selected_superseded = [
+        candidate[3] for candidate in superseded[:publication_capacity]
+    ]
+
+    selection = {
+        "selector_version": selector_version,
+        "selector_seed": selector_seed,
+        "tick_timestamp": normalized_now,
+        "eligibility": {
+            "lower_bound": "due_at <= tick_timestamp",
+            "upper_bound": "tick_timestamp < due_at + stage_seconds",
+        },
+        "rank": {
+            "algorithm": "sha256",
+            "canonicalization": (
+                "UTF-8 JSON; ensure_ascii=true; separators=(',',':'); sort_keys=true"
+            ),
+            "fields": [
+                "created_seq",
+                "selector_seed",
+                "selector_version",
+                "stage_seconds",
+                "tick_timestamp",
+            ],
+            "order": (
+                "digest ascending, then stage_seconds ascending, "
+                "then created_seq ascending"
+            ),
+        },
+        "allocation_rotation": allocation_rotation,
+        "short_stage_seconds": ROOM_REVISIT_STAGES_SECONDS[allocation_rotation],
+        "initial_allocation_by_stage": {
+            str(stage_seconds): initial_allocation[stage_seconds]
+            for stage_seconds in ROOM_REVISIT_STAGES_SECONDS
+        },
+        "selected_by_stage": selected_by_stage,
+        "redistributed_reads": len(redistributed),
+        "read_budget": limit,
+    }
+
+    return {
+        "due_this_tick": sum(len(candidates) for candidates in active.values()),
+        "superseded_due_this_tick": len(superseded),
+        "aged_out_unselected": aged_out_unselected,
+        "selected": selected,
+        "superseded": selected_superseded,
+        "selection": selection,
+    }
+
+
+def room_lifecycle_coverage_by_stage(
+    connection: sqlite3.Connection,
+    selection_time: str,
+) -> dict[str, dict[str, Any]]:
+    try:
+        selected_at = parse_timestamp(selection_time)
+    except (TypeError, ValueError) as error:
+        raise CollectionError(
+            "room lifecycle coverage has an invalid timestamp"
+        ) from error
+    normalized_selection_time = timestamp_text(selected_at)
+    rows = connection.execute(
+        """
+        SELECT
+            room_revisits.stage_seconds,
+            room_revisits.due_at,
+            room_revisits.attempted_at,
+            room_revisits.success,
+            room_revisits.outcome,
+            room_revisits.has_second_message,
+            (
+                SELECT MIN(newer.created_at)
+                FROM room_ledger AS newer
+                WHERE
+                    newer.name = room_ledger.name
+                    AND newer.created_seq > room_ledger.created_seq
+                    AND newer.created_at <= ?
+            )
+        FROM room_revisits
+        JOIN room_ledger
+            ON room_ledger.created_seq = room_revisits.room_created_seq
+        WHERE room_revisits.due_at <= ?
+        """,
+        (normalized_selection_time, normalized_selection_time),
+    ).fetchall()
+
+    coverage = {
+        str(stage_seconds): {
+            "scheduled_due_rooms": 0,
+            "ineligible_superseded_before_due": 0,
+            "eligible_rooms": 0,
+            "attempted_checks": 0,
+            "completed_checks": 0,
+            "failed_checks": 0,
+            "deferred_checks": 0,
+            "aged_out_unselected": 0,
+            "superseded_after_eligibility": 0,
+        }
+        for stage_seconds in ROOM_REVISIT_STAGES_SECONDS
+    }
+    successful_present_checks = dict.fromkeys(ROOM_REVISIT_STAGES_SECONDS, 0)
+    second_message_checks = dict.fromkeys(ROOM_REVISIT_STAGES_SECONDS, 0)
+
+    for (
+        stage_seconds,
+        due_at,
+        attempted_at,
+        success,
+        outcome,
+        has_second_message,
+        superseded_at,
+    ) in rows:
+        if (
+            isinstance(stage_seconds, bool)
+            or stage_seconds not in ROOM_REVISIT_STAGES_SECONDS
+            or not isinstance(due_at, str)
+            or (attempted_at is not None and not isinstance(attempted_at, str))
+            or (superseded_at is not None and not isinstance(superseded_at, str))
+        ):
+            raise CollectionError("room lifecycle coverage found an invalid row")
+        try:
+            due_timestamp = parse_timestamp(due_at)
+            eligible_until = due_timestamp + timedelta(seconds=stage_seconds)
+            attempt_timestamp = (
+                parse_timestamp(attempted_at) if attempted_at is not None else None
+            )
+            newer_created = (
+                parse_timestamp(superseded_at) if superseded_at is not None else None
+            )
+        except (ValueError, OverflowError) as error:
+            raise CollectionError(
+                "room lifecycle coverage found an invalid timestamp"
+            ) from error
+
+        counters = coverage[str(stage_seconds)]
+        counters["scheduled_due_rooms"] += 1
+        actual_attempt = (
+            attempt_timestamp is not None and outcome != "superseded_before_check"
+        )
+        timely_attempt = actual_attempt and attempt_timestamp < eligible_until
+
+        if timely_attempt:
+            counters["eligible_rooms"] += 1
+            counters["attempted_checks"] += 1
+            if outcome in (
+                "present_at_last_check",
+                "absent_at_last_check",
+            ):
+                counters["completed_checks"] += 1
+            elif outcome == "check_failed":
+                counters["failed_checks"] += 1
+            else:
+                raise CollectionError(
+                    "room lifecycle coverage found an invalid attempt outcome"
+                )
+            if success == 1:
+                successful_present_checks[stage_seconds] += 1
+                if has_second_message == 1:
+                    second_message_checks[stage_seconds] += 1
+            continue
+
+        if newer_created is not None and newer_created <= due_timestamp:
+            counters["ineligible_superseded_before_due"] += 1
+            continue
+
+        counters["eligible_rooms"] += 1
+        if newer_created is not None and newer_created < eligible_until:
+            counters["superseded_after_eligibility"] += 1
+        elif selected_at >= eligible_until:
+            counters["aged_out_unselected"] += 1
+        else:
+            counters["deferred_checks"] += 1
+
+    for stage_seconds in ROOM_REVISIT_STAGES_SECONDS:
+        counters = coverage[str(stage_seconds)]
+        if (
+            counters["scheduled_due_rooms"]
+            != counters["ineligible_superseded_before_due"] + counters["eligible_rooms"]
+            or counters["eligible_rooms"]
+            != counters["attempted_checks"]
+            + counters["deferred_checks"]
+            + counters["aged_out_unselected"]
+            + counters["superseded_after_eligibility"]
+            or counters["attempted_checks"]
+            != counters["completed_checks"] + counters["failed_checks"]
+        ):
+            raise CollectionError("room lifecycle stage coverage is inconsistent")
+        counters["coverage_fraction"] = {
+            "numerator": counters["completed_checks"],
+            "denominator": counters["eligible_rooms"],
+        }
+        counters["second_message_fraction"] = {
+            "numerator": second_message_checks[stage_seconds],
+            "denominator": successful_present_checks[stage_seconds],
+        }
+
+    return coverage
 
 
 def classify_second_sender(message: dict[str, Any]) -> str:
@@ -5119,7 +5375,9 @@ def read_budget_summary(
     reads_per_minute = total_reads * 60 / RATE_BUDGET_WINDOW_SECONDS
     share = reads_per_minute / PUBLISHED_READS_PER_MINUTE
     if share > MAX_READ_SHARE:
-        raise CollectionError("collector logical read rate exceeds the 15% ceiling")
+        raise CollectionError(
+            "collector logical read rate exceeds the configured share ceiling"
+        )
     return {
         "base_reads": base_reads,
         "revisit_reads": revisit_reads,
@@ -5154,8 +5412,7 @@ def room_lifecycle_summary(
     deferred_superseded_due_to_batch_limit = (
         superseded_due_this_tick - superseded_this_tick
     )
-    active_due_this_tick = due_this_tick - superseded_due_this_tick
-    deferred_due_to_read_budget = active_due_this_tick - selected_this_tick
+    deferred_due_to_read_budget = due_this_tick - selected_this_tick
     deferred_due_to_deadline = selected_this_tick - attempted_this_tick
     if (
         deferred_superseded_due_to_batch_limit < 0
@@ -5190,9 +5447,7 @@ def room_lifecycle_summary(
             deferred_superseded_due_to_batch_limit
         ),
         "deferred_due_to_budget": (
-            deferred_due_to_read_budget
-            + deferred_due_to_deadline
-            + deferred_superseded_due_to_batch_limit
+            deferred_due_to_read_budget + deferred_due_to_deadline
         ),
         "revisits": revisits,
     }
@@ -5204,56 +5459,32 @@ def collect_room_revisits(
     tick_ts: str,
     *,
     sampled_room_reads: int,
+    selector_version: int,
+    selector_seed: str,
+    allocation_rotation: int,
     deadline: float,
 ) -> dict[str, Any]:
-    due, superseded_due, selected = select_due_room_revisits(connection, tick_ts)
-    selected_read_count = sum(
-        not revisit.get("superseded", False) for revisit in selected
+    selected = select_due_room_revisits(
+        connection,
+        tick_ts,
+        selector_version=selector_version,
+        selector_seed=selector_seed,
+        allocation_rotation=allocation_rotation,
     )
+    selected_reads = selected["selected"]
 
     # Enforce the maximum selected work before the first revisit read. The
     # final summary is recomputed from the reads that were actually issued.
-    read_budget_summary(sampled_room_reads, selected_read_count)
+    read_budget_summary(sampled_room_reads, len(selected_reads))
 
     published: list[dict[str, Any]] = []
-    for revisit in selected:
-        name = revisit["name"]
-        created_seq = revisit["created_seq"]
-        stage_seconds = revisit["stage_seconds"]
-        if revisit.get("superseded", False):
-            attempted_at = utc_now()
-            connection.execute(
-                """
-                UPDATE room_revisits
-                SET
-                    attempted_at = ?,
-                    success = 0,
-                    outcome = 'superseded_before_check',
-                    message_count = NULL,
-                    has_second_message = NULL,
-                    second_sender_class = NULL
-                WHERE room_created_seq = ? AND stage_seconds = ?
-                """,
-                (attempted_at, created_seq, stage_seconds),
-            )
-            published.append(
-                {
-                    "id": room_identifier(name),
-                    "created_seq": created_seq,
-                    "stage_seconds": stage_seconds,
-                    "elapsed_since_creation_seconds": None,
-                    "success": False,
-                    "outcome": "superseded_before_check",
-                    "message_count": None,
-                    "has_second_message": None,
-                    "second_sender_class": None,
-                }
-            )
-            continue
-
+    for revisit in selected_reads:
         if time.monotonic() >= deadline:
             continue
 
+        name = revisit["name"]
+        created_seq = revisit["created_seq"]
+        stage_seconds = revisit["stage_seconds"]
         attempted_at = utc_now()
         elapsed_since_creation_seconds = int(
             (
@@ -5346,14 +5577,58 @@ def collect_room_revisits(
         )
         published.append(public_result)
 
-    return room_lifecycle_summary(
+    # No-read supersession finalization follows the ranked read phase, so
+    # administrative publication cannot delay an eligible origin read.
+    for revisit in selected["superseded"]:
+        name = revisit["name"]
+        created_seq = revisit["created_seq"]
+        stage_seconds = revisit["stage_seconds"]
+        attempted_at = utc_now()
+        connection.execute(
+            """
+            UPDATE room_revisits
+            SET
+                attempted_at = ?,
+                success = 0,
+                outcome = 'superseded_before_check',
+                message_count = NULL,
+                has_second_message = NULL,
+                second_sender_class = NULL
+            WHERE room_created_seq = ? AND stage_seconds = ?
+            """,
+            (attempted_at, created_seq, stage_seconds),
+        )
+        published.append(
+            {
+                "id": room_identifier(name),
+                "created_seq": created_seq,
+                "stage_seconds": stage_seconds,
+                "elapsed_since_creation_seconds": None,
+                "success": False,
+                "outcome": "superseded_before_check",
+                "message_count": None,
+                "has_second_message": None,
+                "second_sender_class": None,
+            }
+        )
+
+    summary = room_lifecycle_summary(
         connection,
         created_this_tick=0,
-        due_this_tick=due,
-        selected_this_tick=selected_read_count,
+        due_this_tick=selected["due_this_tick"],
+        selected_this_tick=len(selected_reads),
         revisits=published,
-        superseded_due_this_tick=superseded_due,
+        superseded_due_this_tick=selected["superseded_due_this_tick"],
     )
+    coverage_by_stage = room_lifecycle_coverage_by_stage(connection, tick_ts)
+    summary["sampling"] = {
+        "aged_out_unselected": sum(
+            stage["aged_out_unselected"] for stage in coverage_by_stage.values()
+        ),
+        "selection": selected["selection"],
+        "coverage_by_stage": coverage_by_stage,
+    }
+    return summary
 
 
 def selector_frame_id(state: dict[str, Any]) -> str:
@@ -5845,6 +6120,47 @@ def collect_tick(
             connection.execute("BEGIN IMMEDIATE")
             names, room_sampling = room_sample_names(rooms["newest_rooms"], state)
 
+            events_path = "/r/events?format=json&limit=200"
+            events_last_seq, events, class_counts, primary_counts = (
+                parse_collected_response(
+                    client,
+                    events_path,
+                    parse_events,
+                    client.get(events_path),
+                )
+            )
+            tick_ts = utc_now()
+            created_this_tick = record_created_rooms(
+                connection,
+                events,
+                tick_ts,
+            )
+            record_listed_rooms(
+                connection,
+                rooms["newest_rooms"],
+                rooms_observed_at,
+                state,
+            )
+            room_lifecycle = collect_room_revisits(
+                client,
+                connection,
+                tick_ts,
+                sampled_room_reads=len(names),
+                selector_version=state["selector_version"],
+                selector_seed=state["selector_seed"],
+                allocation_rotation=state["revisit_allocation_rotation"],
+                deadline=tick_started + TICK_REVISIT_DEADLINE_SECONDS,
+            )
+            state["revisit_allocation_rotation"] = (
+                state["revisit_allocation_rotation"] + 1
+            ) % len(ROOM_REVISIT_STAGES_SECONDS)
+            room_lifecycle_sampling = room_lifecycle.pop("sampling")
+            room_lifecycle["created_rooms_observed_this_tick"] = created_this_tick
+            room_lifecycle["read_budget"] = read_budget_summary(
+                len(names),
+                room_lifecycle["attempted_this_tick"],
+            )
+
             sampled: list[tuple[str, list[dict[str, Any]]]] = []
             lobby_body: str | None = None
             lobby_last_seq: int | None = None
@@ -5881,39 +6197,6 @@ def collect_tick(
             if lobby_body is None or lobby_last_seq is None:
                 raise CollectionError("lobby was not sampled")
 
-            events_path = "/r/events?format=json&limit=200"
-            events_last_seq, events, class_counts, primary_counts = (
-                parse_collected_response(
-                    client,
-                    events_path,
-                    parse_events,
-                    client.get(events_path),
-                )
-            )
-            tick_ts = utc_now()
-            created_this_tick = record_created_rooms(
-                connection,
-                events,
-                tick_ts,
-            )
-            record_listed_rooms(
-                connection,
-                rooms["newest_rooms"],
-                rooms_observed_at,
-                state,
-            )
-            room_lifecycle = collect_room_revisits(
-                client,
-                connection,
-                tick_ts,
-                sampled_room_reads=len(names),
-                deadline=tick_started + TICK_REVISIT_DEADLINE_SECONDS,
-            )
-            room_lifecycle["created_rooms_observed_this_tick"] = created_this_tick
-            room_lifecycle["read_budget"] = read_budget_summary(
-                len(names),
-                room_lifecycle["attempted_this_tick"],
-            )
             if identity_total is not None:
                 state["census"] = {
                     "total": identity_total,
@@ -5943,6 +6226,7 @@ def collect_tick(
                 "identity_census_run": census_run,
                 "signer_funnel": funnel,
                 "room_lifecycle": room_lifecycle,
+                "room_lifecycle_sampling": room_lifecycle_sampling,
             }
             outbox = _insert_tick_outbox(connection, tick)
             write_signer_metadata(connection, state)
