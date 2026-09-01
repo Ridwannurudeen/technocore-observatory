@@ -2898,6 +2898,7 @@ def _populate_every_coverage_class(signer_store, monkeypatch):
             created_event(7, "2026-08-30T07:00:00Z", "aged-room"),
             created_event(8, "2026-08-30T08:03:00Z", "deferred-room"),
             created_event(9, "2026-08-30T06:00:00Z", "long-aged-room"),
+            created_event(10, "2026-08-30T07:52:00Z", "boundary-room"),
         ],
         "2026-08-30T08:06:00Z",
     )
@@ -2943,6 +2944,21 @@ def _populate_every_coverage_class(signer_store, monkeypatch):
         WHERE room_created_seq = 4 AND stage_seconds = 300
         """
     )
+    # A read landing exactly on window close. Timeliness is a strict "<", so
+    # this must count late on both the trigger predicate and the Python
+    # reference; it is the one case the integer-microsecond arithmetic exists
+    # for, and it is only pinned if a row actually sits on the boundary.
+    signer_store.execute(
+        """
+        UPDATE room_revisits
+        SET attempted_at = '2026-08-30T08:02:00Z',
+            success = 1,
+            outcome = 'present_at_last_check',
+            message_count = 1,
+            has_second_message = 0
+        WHERE room_created_seq = 10 AND stage_seconds = 300
+        """
+    )
     tick_ts = "2026-08-30T08:06:00Z"
     monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
     monkeypatch.setattr(collect.time, "monotonic", lambda: 0.0)
@@ -2986,7 +3002,7 @@ def test_stage_coverage_reads_terminal_rows_from_the_rollup(
     signer_store.set_trace_callback(None)
 
     assert coverage["300"]["attempted_checks"] == 3
-    assert coverage["300"]["attempted_late"] == 1
+    assert coverage["300"]["attempted_late"] == 2
     selects = [
         statement
         for statement in statements
@@ -3030,7 +3046,9 @@ def test_lifecycle_rollup_counts_terminal_rows_per_stage(signer_store, monkeypat
         WHERE singleton = 1
         """
     ).fetchone()
-    assert stored == (2, 2, 1, 1, 1, 1, 1, 0, 4)
+    # late_attempts is 2: the 08:04:00 read past a closed window, and the read
+    # landing exactly on window close, which a strict "<" counts late.
+    assert stored == (2, 2, 1, 2, 1, 1, 1, 0, 5)
     collect.verify_lifecycle_rollup(signer_store)
 
     # Retention-style deletes decrement through the rollup delete triggers.
@@ -3042,7 +3060,7 @@ def test_lifecycle_rollup_counts_terminal_rows_per_stage(signer_store, monkeypat
         FROM room_lifecycle_totals
         WHERE singleton = 1
         """
-    ).fetchone() == (1, 0, 3)
+    ).fetchone() == (1, 0, 4)
     collect.verify_lifecycle_rollup(signer_store)
 
     # A counter that detaches from the attempt rollup is rejected at write

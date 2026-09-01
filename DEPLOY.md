@@ -468,6 +468,11 @@ eleven lifecycle triggers, rebuilds `room_lifecycle_totals` with the per-stage c
 revalidates the store — exactly once; that first tick is slower by one full-store validation pass.
 Deploy the tree, restart the collector, then rebuild.
 
+The first 2.14.0 tick will publish an unusually high `deferred_due_to_deadline`, possibly all of its
+revisit reads. The tick clock starts before the one-time migration runs, so the revalidation and
+totals recompute are charged against that tick's own deadline. The number is honest and the next
+tick returns to normal; do not read it as a collection failure.
+
 ### Reverting the collector from 2.14.0 to 2.13.0
 
 The trigger list is unchanged — the same eight room-revisit triggers under the same names — but

@@ -5549,6 +5549,14 @@ def room_lifecycle_coverage_by_stage(
     # populations are disjoint (a superseded row always carries attempted_at)
     # and each is fetched through its own partial index so neither side ever
     # rescans the terminal rows.
+    #
+    # This scan is bounded by neither the schedule nor a batch limit. Pending
+    # rows are held down by the window schedule and the finalization drain,
+    # but the superseded population only ever grows with room-name recreation,
+    # which the origin drives and this collector cannot cap. It is 2 rows
+    # today; a sustained wave of recreation would grow it without limit. The
+    # honest statement is that this change bounds the terminal populations,
+    # not that every scan is now bounded.
     unresolved_query = """
         SELECT
             room_revisits.stage_seconds,
