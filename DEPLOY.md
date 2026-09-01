@@ -458,6 +458,53 @@ extra `aged_out_at` column is invisible to its queries. The column and its parti
 in place; they cost nothing to a collector that never reads them, and they are still there if you
 roll forward again.
 
+### Deploy order at 2.14.0
+
+Nothing in the published payload changes: 2.14.0 only moves terminal revisit rows out of the
+per-tick coverage scan and into per-stage rollup counters, so the methodology version stays at
+1.15.0 and any deriver that accepts a 2.13.0 tick accepts a 2.14.0 tick. On its first start the
+2.14.0 collector detects the 2.13.0 trigger set by its missing per-stage tokens, rebuilds all
+eleven lifecycle triggers, rebuilds `room_lifecycle_totals` with the per-stage columns, and
+revalidates the store — exactly once; that first tick is slower by one full-store validation pass.
+Deploy the tree, restart the collector, then rebuild.
+
+The first 2.14.0 tick will publish an unusually high `deferred_due_to_deadline`, possibly all of its
+revisit reads. The tick clock starts before the one-time migration runs, so the revalidation and
+totals recompute are charged against that tick's own deadline. The number is honest and the next
+tick returns to normal; do not read it as a collection failure.
+
+### Reverting the collector from 2.14.0 to 2.13.0
+
+The trigger list is unchanged — the same eight room-revisit triggers under the same names — but
+two things now survive a plain binary revert. The 2.14.0 triggers maintain `stage_*` counter
+columns that a 2.13.0 collector's table does not have, and `room_lifecycle_totals` itself has the
+31-column 2.14.0 schema. A 2.13.0 collector opening that store passes its own trigger staleness
+check (its `aged_out_at` token is present in the 2.14.0 trigger text), then fails its rollup
+column check against the wider table and refuses every tick with "invalid lifecycle rollup
+schema". Dropping only the triggers does not help: the 2.13.0 backfill inserts thirteen values
+into the 31-column table and fails.
+
+Before starting a 2.13.0 collector, drop the same eight room-revisit triggers listed above **and
+the rollup table**:
+
+```sql
+DROP TRIGGER IF EXISTS room_revisits_validate_insert;
+DROP TRIGGER IF EXISTS room_revisits_validate_update;
+DROP TRIGGER IF EXISTS room_revisits_rollup_before_insert;
+DROP TRIGGER IF EXISTS room_revisits_rollup_after_insert;
+DROP TRIGGER IF EXISTS room_revisits_rollup_before_update;
+DROP TRIGGER IF EXISTS room_revisits_rollup_after_update;
+DROP TRIGGER IF EXISTS room_revisits_rollup_before_delete;
+DROP TRIGGER IF EXISTS room_revisits_rollup_after_delete;
+DROP TABLE IF EXISTS room_lifecycle_totals;
+```
+
+The 2.13.0 collector finds the trigger set incomplete and the table absent, recreates both in its
+own shape, and revalidates and backfills the store from the source rows. No revisit evidence is
+touched: the counters are derived state. The `room_revisits_superseded` partial index is left in
+place; SQLite maintains it under any writer and the 2.13.0 collector simply never reads it.
+Rolling forward to 2.14.0 again re-runs the one-time rebuild.
+
 For a static/publication rollback, take the same exclusive publication-root lock used by
 `rebuild.sh`, then point `current` at a previously verified versioned release with the same atomic
 link pattern and run `nginx -t`. This changes no collector, telemetry, or signer state. The
