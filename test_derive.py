@@ -3253,7 +3253,7 @@ def test_two_argument_lifecycle_display_renders_sampling_evidence_and_legacy_abs
 
 
 def collector_finalization_tick(tmp_path, monkeypatch):
-    """A real 2.13.0 tick produced by the collector, never hand-shaped.
+    """A real current-collector tick, never hand-shaped.
 
     One room is read late (selected inside its 5-minute window, the read
     recorded after the window closed); its remaining stages age out and are
@@ -3373,6 +3373,28 @@ def test_live_2_13_finalization_evidence_validates_and_derives_cleanly(
         in coverage_text
     )
     assert "0 aged-out checks remained unfinalized" in coverage_text
+
+
+def test_2_14_collector_tick_passes_the_2_13_sampling_gates(tmp_path, monkeypatch):
+    # Collector 2.14.0 changes only how the coverage numbers are computed —
+    # terminal rows come from rollup counters instead of a per-tick rescan —
+    # not the published payload, so a 2.14.0 tick must satisfy every sampling
+    # gate introduced at or before 2.13.0 without any deriver change.
+    record = collector_finalization_tick(tmp_path, monkeypatch)
+    assert record["collector_version"] == "2.14.0"
+    assert derive.collector_version_at_least(
+        record["collector_version"],
+        derive.ROOM_AGED_OUT_FINALIZATION_COLLECTOR_VERSION,
+    )
+
+    validated = validate_tick(record)
+    sampling = validated["room_lifecycle_sampling"]
+    assert sampling["aged_out_finalization"]["finalized_this_tick"] == 2
+    assert all(
+        stage["attempted_late"] is not None
+        for stage in sampling["coverage_by_stage"].values()
+    )
+    assert derive_records([validated])["accepted_ticks"] == 1
 
 
 def test_current_collector_requires_finalization_evidence():

@@ -86,7 +86,7 @@ ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
 CENSUS_MAX_PASSES = 5
 CENSUS_DEADLINE_SECONDS = 30 * 60
 CENSUS_STATE_VERSION = 2
-COLLECTOR_VERSION = "2.13.0"
+COLLECTOR_VERSION = "2.14.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
 SIGNER_STATE_VERSION = 6
@@ -3450,6 +3450,89 @@ LIFECYCLE_ROLLUP_TRIGGER_NAMES = (
     "room_ledger_rollup_after_first_observed_update",
 )
 
+LIFECYCLE_REVISIT_ROLLUP_TRIGGER_NAMES = LIFECYCLE_ROLLUP_TRIGGER_NAMES[2:8]
+
+# Tokens unique to the 2.14.0 trigger set. The 2.13.0 triggers already contain
+# "aged_out_at", so staleness detection for this release must key on text that
+# only the rebuilt triggers carry: the per-stage rollup columns in every
+# room-revisit rollup trigger, and the attempt-immutability clause in the
+# update validator. Detection on either token forces exactly one full rebuild
+# plus revalidation; the rebuilt set contains both tokens, so the next start
+# rebuilds nothing.
+LIFECYCLE_STAGE_ROLLUP_TOKEN = "stage_300_aged_out_finalized"
+LIFECYCLE_ATTEMPT_IMMUTABILITY_TOKEN = "attempted room revisit evidence is immutable"
+
+
+def _epoch_microseconds_sql(column: str) -> str:
+    # Integer microseconds since the epoch, exact for every timestamp this
+    # collector has ever written: utc_now() has always produced
+    # 'YYYY-MM-DDTHH:MM:SSZ' and timestamp_text() has only ever produced that
+    # form or 'YYYY-MM-DDTHH:MM:SS.ffffffZ'. julianday() rounds to
+    # milliseconds, so it cannot reproduce the per-row scan's strict
+    # microsecond comparison at the eligibility boundary; string arithmetic
+    # on the stored text can.
+    return (
+        f"(CAST(strftime('%s', substr({column}, 1, 19)) AS INTEGER) * 1000000 "
+        f"+ CAST(substr(rtrim(substr({column}, 21), 'Z') || '000000', 1, 6) "
+        "AS INTEGER))"
+    )
+
+
+def _timely_attempt_sql(stage_seconds: int) -> str:
+    # attempted_at < due_at + stage_seconds, the exact comparison
+    # room_lifecycle_coverage_by_stage historically made in Python with
+    # microsecond datetimes.
+    return (
+        f"{_epoch_microseconds_sql('attempted_at')} "
+        f"< {_epoch_microseconds_sql('due_at')} + {stage_seconds} * 1000000"
+    )
+
+
+def _stage_counter_specs() -> tuple[tuple[str, str], ...]:
+    # One shared source for the per-stage terminal-row counters: the totals
+    # schema, the rollup trigger adjustments and the backfill computation all
+    # derive from these (name, predicate) pairs, so the stored and recomputed
+    # values cannot diverge by construction. Every predicate classifies a row
+    # whose class can never change again: attempt evidence is immutable once
+    # attempted_at is set, and a finalized aged-out row stays finalized.
+    specs: list[tuple[str, str]] = []
+    for stage_seconds in ROOM_REVISIT_STAGES_SECONDS:
+        timely = _timely_attempt_sql(stage_seconds)
+        attempt = "attempted_at IS NOT NULL AND outcome <> 'superseded_before_check'"
+        stage = f"stage_seconds = {stage_seconds}"
+        specs.extend(
+            (
+                (
+                    f"stage_{stage_seconds}_aged_out_finalized",
+                    f"{stage} AND aged_out_at IS NOT NULL",
+                ),
+                (
+                    f"stage_{stage_seconds}_timely_completed",
+                    f"{stage} AND {attempt} AND outcome <> 'check_failed' AND {timely}",
+                ),
+                (
+                    f"stage_{stage_seconds}_timely_failed",
+                    f"{stage} AND outcome = 'check_failed' AND {timely}",
+                ),
+                (
+                    f"stage_{stage_seconds}_late_attempts",
+                    f"{stage} AND {attempt} AND NOT ({timely})",
+                ),
+                (
+                    f"stage_{stage_seconds}_timely_present",
+                    f"{stage} AND success = 1 AND {timely}",
+                ),
+                (
+                    f"stage_{stage_seconds}_timely_second_message",
+                    f"{stage} AND success = 1 AND has_second_message = 1 AND {timely}",
+                ),
+            )
+        )
+    return tuple(specs)
+
+
+LIFECYCLE_STAGE_COUNTER_SPECS = _stage_counter_specs()
+
 
 def _validate_room_lifecycle_store(connection: sqlite3.Connection) -> None:
     invalid = connection.execute(
@@ -3682,7 +3765,15 @@ def _computed_room_lifecycle_totals(
     ledger_started_at = connection.execute(
         "SELECT MIN(first_observed_at) FROM room_ledger"
     ).fetchone()[0]
-    return (*counts, ledger_started_at)
+    stage_counts = connection.execute(
+        "SELECT "
+        + ", ".join(
+            f"COUNT(CASE WHEN {predicate} THEN 1 END)"
+            for _, predicate in LIFECYCLE_STAGE_COUNTER_SPECS
+        )
+        + " FROM room_revisits"
+    ).fetchone()
+    return (*counts, ledger_started_at, *stage_counts)
 
 
 def _stored_room_lifecycle_totals(
@@ -3702,7 +3793,10 @@ def _stored_room_lifecycle_totals(
             second_sender_server,
             second_sender_other,
             second_sender_not_observed,
-            ledger_started_at
+            ledger_started_at,
+        """
+        + ",\n".join(name for name, _ in LIFECYCLE_STAGE_COUNTER_SPECS)
+        + """
         FROM room_lifecycle_totals
         WHERE singleton = 1
         """
@@ -3947,8 +4041,15 @@ def _lifecycle_rollup_adjustments(
                         'server',
                         'other'
                     )
-            ) THEN 1 ELSE 0 END
-    """
+            ) THEN 1 ELSE 0 END,
+    """ + ",\n".join(
+        f"""
+        {name} = {name} {operator} (
+            SELECT COUNT(*) FROM room_revisits
+            WHERE room_created_seq = {room_created_seq} AND {predicate}
+        )"""
+        for name, predicate in LIFECYCLE_STAGE_COUNTER_SPECS
+    )
 
 
 def _create_room_lifecycle_triggers(connection: sqlite3.Connection) -> None:
@@ -3970,6 +4071,30 @@ def _create_room_lifecycle_triggers(connection: sqlite3.Connection) -> None:
             SELECT CASE
                 WHEN NEW.room_created_seq <> OLD.room_created_seq
                 THEN RAISE(ABORT, 'room revisit identity is immutable')
+            END;
+            SELECT CASE
+                WHEN OLD.attempted_at IS NOT NULL
+                    AND (
+                        NEW.attempted_at IS NOT OLD.attempted_at
+                        OR NEW.stage_seconds IS NOT OLD.stage_seconds
+                        OR NEW.due_at IS NOT OLD.due_at
+                        OR NEW.success IS NOT OLD.success
+                        OR NEW.outcome IS NOT OLD.outcome
+                        OR NEW.message_count IS NOT OLD.message_count
+                        OR NEW.has_second_message IS NOT OLD.has_second_message
+                        OR NEW.second_sender_class
+                            IS NOT OLD.second_sender_class
+                    )
+                THEN RAISE(ABORT, 'attempted room revisit evidence is immutable')
+            END;
+            SELECT CASE
+                WHEN OLD.aged_out_at IS NOT NULL
+                    AND (
+                        NEW.aged_out_at IS NOT OLD.aged_out_at
+                        OR NEW.stage_seconds IS NOT OLD.stage_seconds
+                        OR NEW.due_at IS NOT OLD.due_at
+                    )
+                THEN RAISE(ABORT, 'finalized aged-out revisit is immutable')
             END;
             SELECT CASE WHEN {validation}
                 THEN RAISE(ABORT, 'invalid room revisit state') END;
@@ -4043,39 +4168,31 @@ def _create_room_lifecycle_triggers(connection: sqlite3.Connection) -> None:
     )
 
 
-def _initialize_room_lifecycle_rollup(connection: sqlite3.Connection) -> None:
-    table_existed = (
-        connection.execute(
-            """
-        SELECT 1 FROM sqlite_master
-        WHERE type = 'table' AND name = 'room_lifecycle_totals'
-        """
-        ).fetchone()
-        is not None
+def _room_lifecycle_totals_ddl() -> str:
+    stage_columns = "".join(
+        f"            {name} INTEGER NOT NULL CHECK ({name} >= 0),\n"
+        for name, _ in LIFECYCLE_STAGE_COUNTER_SPECS
     )
-    existing_trigger_sql = {
-        row[0]: row[1]
-        for row in connection.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
-        )
-        if row[0] in LIFECYCLE_ROLLUP_TRIGGER_NAMES
-    }
-    # Validation triggers created before terminal aged-out finalization
-    # cannot guard the aged_out_at contract; rebuild the whole trigger set
-    # and revalidate the store once.
-    validation_is_stale = any(
-        not isinstance(existing_trigger_sql.get(name), str)
-        or "aged_out_at" not in existing_trigger_sql[name]
-        for name in ("room_revisits_validate_insert", "room_revisits_validate_update")
-        if name in existing_trigger_sql
+    stage_checks = "".join(
+        f"            CHECK (stage_{stage}_timely_present"
+        f" <= stage_{stage}_timely_completed),\n"
+        f"            CHECK (stage_{stage}_timely_second_message"
+        f" <= stage_{stage}_timely_present),\n"
+        for stage in ROOM_REVISIT_STAGES_SECONDS
     )
-    if validation_is_stale:
-        for trigger in LIFECYCLE_ROLLUP_TRIGGER_NAMES:
-            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-        existing_trigger_sql = {}
-    existing_triggers = set(existing_trigger_sql)
-    connection.execute(
-        """
+    # Every attempted non-superseded row is exactly one of timely-completed,
+    # timely-failed or late in exactly one stage, so the per-stage counters
+    # must always sum to the attempt rollup the store has carried since the
+    # rollup existed. This ties the new counters to independently maintained
+    # state: a trigger set that stops maintaining one side aborts the next
+    # write instead of publishing a silent undercount.
+    attempt_sum = "\n                + ".join(
+        f"stage_{stage}_timely_completed"
+        f" + stage_{stage}_timely_failed"
+        f" + stage_{stage}_late_attempts"
+        for stage in ROOM_REVISIT_STAGES_SECONDS
+    )
+    return f"""
         CREATE TABLE IF NOT EXISTS room_lifecycle_totals (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             rooms_in_ledger INTEGER NOT NULL CHECK (rooms_in_ledger >= 0),
@@ -4097,7 +4214,7 @@ def _initialize_room_lifecycle_rollup(connection: sqlite3.Connection) -> None:
             second_sender_not_observed INTEGER NOT NULL
                 CHECK (second_sender_not_observed >= 0),
             ledger_started_at TEXT,
-            CHECK (rooms_revisited <= rooms_in_ledger),
+{stage_columns}            CHECK (rooms_revisited <= rooms_in_ledger),
             CHECK (rooms_successfully_revisited <= rooms_revisited),
             CHECK (rooms_with_second_message <= rooms_successfully_revisited),
             CHECK (reads_failed <= reads_attempted),
@@ -4112,10 +4229,61 @@ def _initialize_room_lifecycle_rollup(connection: sqlite3.Connection) -> None:
             CHECK (
                 (rooms_in_ledger = 0 AND ledger_started_at IS NULL)
                 OR (rooms_in_ledger > 0 AND ledger_started_at IS NOT NULL)
+            ),
+{stage_checks}            CHECK (
+                {attempt_sum}
+                = reads_attempted
             )
         )
         """
+
+
+def _initialize_room_lifecycle_rollup(connection: sqlite3.Connection) -> None:
+    table_existed = (
+        connection.execute(
+            """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'room_lifecycle_totals'
+        """
+        ).fetchone()
+        is not None
     )
+    existing_trigger_sql = {
+        row[0]: row[1]
+        for row in connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+        )
+        if row[0] in LIFECYCLE_ROLLUP_TRIGGER_NAMES
+    }
+    # Validation triggers created before terminal aged-out finalization
+    # cannot guard the aged_out_at contract, and the 2.13.0 set already
+    # contains "aged_out_at" everywhere, so 2.14.0 staleness must key on
+    # tokens unique to its own trigger text: the per-stage terminal counters
+    # in every room-revisit rollup trigger, and the attempt-immutability
+    # clause in the update validator. A miss on any token rebuilds the whole
+    # set and revalidates the store exactly once; the rebuilt set carries
+    # every token, so the next start rebuilds nothing.
+    required_trigger_tokens: dict[str, tuple[str, ...]] = {
+        "room_revisits_validate_insert": ("aged_out_at",),
+        "room_revisits_validate_update": (
+            "aged_out_at",
+            LIFECYCLE_ATTEMPT_IMMUTABILITY_TOKEN,
+        ),
+    }
+    for name in LIFECYCLE_REVISIT_ROLLUP_TRIGGER_NAMES:
+        required_trigger_tokens[name] = (LIFECYCLE_STAGE_ROLLUP_TOKEN,)
+    trigger_set_is_stale = any(
+        not isinstance(existing_trigger_sql.get(name), str)
+        or any(token not in existing_trigger_sql[name] for token in tokens)
+        for name, tokens in required_trigger_tokens.items()
+        if name in existing_trigger_sql
+    )
+    if trigger_set_is_stale:
+        for trigger in LIFECYCLE_ROLLUP_TRIGGER_NAMES:
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        existing_trigger_sql = {}
+    existing_triggers = set(existing_trigger_sql)
+    connection.execute(_room_lifecycle_totals_ddl())
     expected_columns = {
         "singleton",
         "rooms_in_ledger",
@@ -4130,13 +4298,28 @@ def _initialize_room_lifecycle_rollup(connection: sqlite3.Connection) -> None:
         "second_sender_other",
         "second_sender_not_observed",
         "ledger_started_at",
-    }
+    } | {name for name, _ in LIFECYCLE_STAGE_COUNTER_SPECS}
     actual_columns = {
         row[1]
         for row in connection.execute("PRAGMA table_info('room_lifecycle_totals')")
     }
     if actual_columns != expected_columns:
-        raise CollectionError("signer database has an invalid lifecycle rollup schema")
+        # A pre-2.14.0 rollup schema. The table holds only derived state, so
+        # rebuild it from the source rows: drop the trigger set with it so
+        # the backfill below reseeds and revalidates the store once.
+        for trigger in LIFECYCLE_ROLLUP_TRIGGER_NAMES:
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        existing_triggers = set()
+        connection.execute("DROP TABLE room_lifecycle_totals")
+        connection.execute(_room_lifecycle_totals_ddl())
+        actual_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info('room_lifecycle_totals')")
+        }
+        if actual_columns != expected_columns:
+            raise CollectionError(
+                "signer database has an invalid lifecycle rollup schema"
+            )
 
     stored_rows = connection.execute(
         "SELECT COUNT(*) FROM room_lifecycle_totals"
@@ -4150,16 +4333,30 @@ def _initialize_room_lifecycle_rollup(connection: sqlite3.Connection) -> None:
         _validate_room_lifecycle_store(connection)
         totals = _computed_room_lifecycle_totals(connection)
         connection.execute("DELETE FROM room_lifecycle_totals")
+        placeholders = ", ".join("?" for _ in totals)
         connection.execute(
-            """
-            INSERT INTO room_lifecycle_totals VALUES (
-                1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
-            """,
+            f"INSERT INTO room_lifecycle_totals VALUES (1, {placeholders})",
             totals,
         )
     _create_room_lifecycle_triggers(connection)
     stored = _stored_room_lifecycle_totals(connection)
+    stage_totals_are_valid = stored is not None and len(stored[12:]) == len(
+        LIFECYCLE_STAGE_COUNTER_SPECS
+    )
+    attempt_total = 0
+    if stage_totals_are_valid:
+        for offset in range(12, len(stored), 6):
+            finalized, completed, failed, late, present, second = stored[
+                offset : offset + 6
+            ]
+            if (
+                min(finalized, completed, failed, late, present, second) < 0
+                or present > completed
+                or second > present
+            ):
+                stage_totals_are_valid = False
+                break
+            attempt_total += completed + failed + late
     if (
         stored is None
         or stored[2] > stored[1]
@@ -4168,6 +4365,8 @@ def _initialize_room_lifecycle_rollup(connection: sqlite3.Connection) -> None:
         or stored[5] > stored[4]
         or sum(stored[6:11]) != stored[3]
         or (stored[0] == 0) != (stored[11] is None)
+        or not stage_totals_are_valid
+        or attempt_total != stored[4]
     ):
         raise CollectionError("signer database has an invalid lifecycle rollup")
 
@@ -4398,6 +4597,20 @@ def initialize_signer_database(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS room_revisits_aged_out "
         "ON room_revisits (stage_seconds, due_at, aged_out_at) "
         "WHERE aged_out_at IS NOT NULL"
+    )
+    # The stage-coverage scan now derives every terminal row (attempted, or
+    # finalized as aged out) from the rollup counters, so its per-row work is
+    # limited to rows whose class can still change: never-attempted rows
+    # (served by the pending partial index above) and superseded-before-check
+    # rows, whose bucket depends on the earliest newer generation observed so
+    # far. This partial index keeps the superseded side of that scan
+    # proportional to the superseded population instead of the whole table,
+    # without offering the planner an alternative to the pending index on the
+    # selection path.
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS room_revisits_superseded "
+        "ON room_revisits (due_at) "
+        "WHERE outcome = 'superseded_before_check'"
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS room_ledger_room_id "
@@ -5270,15 +5483,79 @@ def room_lifecycle_coverage_by_stage(
             "room lifecycle coverage has an invalid timestamp"
         ) from error
     normalized_selection_time = timestamp_text(selected_at)
-    rows = connection.execute(
-        """
+
+    # Terminal rows never re-enter the per-row scan: an attempted check's
+    # timely/late split and outcome are immutable once written (enforced by
+    # the update validator), and a finalized aged-out check stays aged out.
+    # Their cumulative coverage comes from the trigger-maintained per-stage
+    # rollup. Dropping the historical `due_at <= selection_time` bound on
+    # them is sound because every terminal row was written inside a
+    # committed tick whose selection had already required
+    # `due_at <= tick_timestamp`, and update_signer_state aborts (and rolls
+    # back) any tick whose timestamp precedes the persisted checkpoint, so
+    # the current tick's selection time can never fall below a stored
+    # terminal row's due time.
+    stored = _stored_room_lifecycle_totals(connection)
+    if stored is None:
+        raise CollectionError("room lifecycle rollup is missing")
+    stage_totals = dict(
+        zip((name for name, _ in LIFECYCLE_STAGE_COUNTER_SPECS), stored[12:])
+    )
+    if len(stage_totals) != len(LIFECYCLE_STAGE_COUNTER_SPECS) or any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in stage_totals.values()
+    ):
+        raise CollectionError("room lifecycle rollup is missing its stage counters")
+
+    coverage = {}
+    counted_attempts = 0
+    for stage_seconds in ROOM_REVISIT_STAGES_SECONDS:
+        finalized = stage_totals[f"stage_{stage_seconds}_aged_out_finalized"]
+        completed = stage_totals[f"stage_{stage_seconds}_timely_completed"]
+        failed = stage_totals[f"stage_{stage_seconds}_timely_failed"]
+        late = stage_totals[f"stage_{stage_seconds}_late_attempts"]
+        present = stage_totals[f"stage_{stage_seconds}_timely_present"]
+        second_message = stage_totals[f"stage_{stage_seconds}_timely_second_message"]
+        counted_attempts += completed + failed + late
+        coverage[str(stage_seconds)] = {
+            "scheduled_due_rooms": finalized + completed + failed + late,
+            "ineligible_superseded_before_due": 0,
+            "eligible_rooms": finalized + completed + failed + late,
+            "attempted_checks": completed + failed,
+            "completed_checks": completed,
+            "failed_checks": failed,
+            "attempted_late": late,
+            "deferred_checks": 0,
+            "aged_out_unselected": finalized,
+            "superseded_after_eligibility": 0,
+            "second_message_fraction": {
+                "numerator": second_message,
+                "denominator": present,
+            },
+        }
+    # Fail closed if the counters have detached from the attempt rollup the
+    # store has always carried: publishing a coverage figure whose terminal
+    # side silently reads zero would understate what was measured.
+    if counted_attempts != stored[4]:
+        raise CollectionError(
+            "room lifecycle stage counters do not match the attempt rollup"
+        )
+
+    # Only rows whose class can still change are scanned: never-attempted
+    # unfinalized rows, and superseded-before-check rows, whose bucket
+    # depends on the earliest newer generation observed so far — a later
+    # tick can observe an earlier recreation and move them between the
+    # superseded buckets, so they cannot be rolled up terminally. The two
+    # populations are disjoint (a superseded row always carries attempted_at)
+    # and each is fetched through its own partial index so neither side ever
+    # rescans the terminal rows.
+    unresolved_query = """
         SELECT
             room_revisits.stage_seconds,
             room_revisits.due_at,
             room_revisits.attempted_at,
-            room_revisits.success,
             room_revisits.outcome,
-            room_revisits.has_second_message,
+            room_revisits.aged_out_at,
             (
                 SELECT MIN(newer.created_at)
                 FROM room_ledger AS newer
@@ -5292,76 +5569,52 @@ def room_lifecycle_coverage_by_stage(
             ON room_ledger.created_seq = room_revisits.room_created_seq
         WHERE
             room_revisits.due_at <= ?
-            AND room_revisits.aged_out_at IS NULL
-        """,
+            AND {population}
+        """
+    rows = connection.execute(
+        unresolved_query.format(
+            population=(
+                "room_revisits.attempted_at IS NULL AND room_revisits.aged_out_at IS NULL"
+            )
+        ),
         (normalized_selection_time, normalized_selection_time),
     ).fetchall()
-
-    coverage = {
-        str(stage_seconds): {
-            "scheduled_due_rooms": 0,
-            "ineligible_superseded_before_due": 0,
-            "eligible_rooms": 0,
-            "attempted_checks": 0,
-            "completed_checks": 0,
-            "failed_checks": 0,
-            "attempted_late": 0,
-            "deferred_checks": 0,
-            "aged_out_unselected": 0,
-            "superseded_after_eligibility": 0,
-        }
-        for stage_seconds in ROOM_REVISIT_STAGES_SECONDS
-    }
-
-    # Rows finalized as terminally aged out were validated at write time:
-    # never attempted, window closed, no supersession observed inside the
-    # window. They keep their cumulative place in coverage without another
-    # per-row scan.
-    finalized_rows = connection.execute(
-        """
-        SELECT stage_seconds, COUNT(*)
-        FROM room_revisits
-        WHERE aged_out_at IS NOT NULL AND due_at <= ?
-        GROUP BY stage_seconds
-        """,
-        (normalized_selection_time,),
+    rows += connection.execute(
+        unresolved_query.format(
+            population=(
+                "room_revisits.outcome = 'superseded_before_check' "
+                "AND room_revisits.aged_out_at IS NULL"
+            )
+        ),
+        (normalized_selection_time, normalized_selection_time),
     ).fetchall()
-    for stage_seconds, finalized_count in finalized_rows:
-        if (
-            isinstance(stage_seconds, bool)
-            or stage_seconds not in ROOM_REVISIT_STAGES_SECONDS
-        ):
-            raise CollectionError("room lifecycle coverage found an invalid row")
-        counters = coverage[str(stage_seconds)]
-        counters["scheduled_due_rooms"] += finalized_count
-        counters["eligible_rooms"] += finalized_count
-        counters["aged_out_unselected"] += finalized_count
-    successful_present_checks = dict.fromkeys(ROOM_REVISIT_STAGES_SECONDS, 0)
-    second_message_checks = dict.fromkeys(ROOM_REVISIT_STAGES_SECONDS, 0)
 
     for (
         stage_seconds,
         due_at,
         attempted_at,
-        success,
         outcome,
-        has_second_message,
+        aged_out_at,
         superseded_at,
     ) in rows:
         if (
             isinstance(stage_seconds, bool)
             or stage_seconds not in ROOM_REVISIT_STAGES_SECONDS
             or not isinstance(due_at, str)
-            or (attempted_at is not None and not isinstance(attempted_at, str))
             or (superseded_at is not None and not isinstance(superseded_at, str))
         ):
             raise CollectionError("room lifecycle coverage found an invalid row")
+        if aged_out_at is not None or (
+            attempted_at is not None and outcome != "superseded_before_check"
+        ):
+            # A terminal row reached the scan: its contribution is already in
+            # the rollup counters, so counting it again would overstate
+            # coverage. This cannot happen while the scan predicate and the
+            # counter definitions partition the same rows.
+            raise CollectionError("room lifecycle coverage scanned a terminal row")
         try:
             due_timestamp = parse_timestamp(due_at)
             eligible_until = due_timestamp + timedelta(seconds=stage_seconds)
-            attempt_timestamp = (
-                parse_timestamp(attempted_at) if attempted_at is not None else None
-            )
             newer_created = (
                 parse_timestamp(superseded_at) if superseded_at is not None else None
             )
@@ -5372,39 +5625,6 @@ def room_lifecycle_coverage_by_stage(
 
         counters = coverage[str(stage_seconds)]
         counters["scheduled_due_rooms"] += 1
-        actual_attempt = (
-            attempt_timestamp is not None and outcome != "superseded_before_check"
-        )
-        timely_attempt = actual_attempt and attempt_timestamp < eligible_until
-
-        if actual_attempt:
-            if outcome not in (
-                "present_at_last_check",
-                "absent_at_last_check",
-                "check_failed",
-            ):
-                raise CollectionError(
-                    "room lifecycle coverage found an invalid attempt outcome"
-                )
-            counters["eligible_rooms"] += 1
-            if timely_attempt:
-                counters["attempted_checks"] += 1
-                if outcome == "check_failed":
-                    counters["failed_checks"] += 1
-                else:
-                    counters["completed_checks"] += 1
-                if success == 1:
-                    successful_present_checks[stage_seconds] += 1
-                    if has_second_message == 1:
-                        second_message_checks[stage_seconds] += 1
-            else:
-                # An origin read happened, only after the eligibility window
-                # closed. That is neither a timely check nor a check that
-                # never happened, so it counts in its own state and stays
-                # out of the timely coverage and second-message
-                # denominators.
-                counters["attempted_late"] += 1
-            continue
 
         if newer_created is not None and newer_created <= due_timestamp:
             counters["ineligible_superseded_before_due"] += 1
@@ -5436,10 +5656,6 @@ def room_lifecycle_coverage_by_stage(
         counters["coverage_fraction"] = {
             "numerator": counters["completed_checks"],
             "denominator": counters["eligible_rooms"],
-        }
-        counters["second_message_fraction"] = {
-            "numerator": second_message_checks[stage_seconds],
-            "denominator": successful_present_checks[stage_seconds],
         }
 
     return coverage

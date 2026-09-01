@@ -6,6 +6,7 @@ import sys
 import time
 import types
 from contextlib import nullcontext
+from datetime import timedelta
 from unittest import mock
 
 import pytest
@@ -2244,12 +2245,32 @@ def test_lifecycle_rollup_assigns_one_sender_class_per_generation(signer_store):
         "not_observed": 0,
     }
 
-    with pytest.raises(sqlite3.IntegrityError, match="invalid room revisit state"):
+    # Since 2.14.0 an attempted row's evidence is immutable outright, so the
+    # rewrite is refused before the sender-class validation is even reached.
+    with pytest.raises(
+        sqlite3.IntegrityError, match="attempted room revisit evidence is immutable"
+    ):
         signer_store.execute(
             """
             UPDATE room_revisits
             SET second_sender_class = 'unsigned_did'
             WHERE room_created_seq = 10 AND stage_seconds = 3600
+            """
+        )
+    # The one-concrete-class-per-generation rule still guards the live write
+    # path: a fresh attempt on the remaining unattempted stage cannot record
+    # a second concrete sender class.
+    with pytest.raises(sqlite3.IntegrityError, match="invalid room revisit state"):
+        signer_store.execute(
+            """
+            UPDATE room_revisits
+            SET attempted_at = due_at,
+                success = 1,
+                outcome = 'present_at_last_check',
+                message_count = 2,
+                has_second_message = 1,
+                second_sender_class = 'unsigned_did'
+            WHERE room_created_seq = 10 AND stage_seconds = 86400
             """
         )
 
@@ -2723,6 +2744,508 @@ def test_stale_lifecycle_triggers_are_rebuilt_with_finalization_rules(tmp_path):
         assert "aged_out_at" in sql
     finally:
         reopened.close()
+
+
+def _reference_stage_coverage(connection, selection_time):
+    """The pre-2.14.0 per-row computation, retained as the specification.
+
+    Every row with an open scheduled window is re-derived from scratch: the
+    finalized count query plus a full per-row scan over every non-finalized
+    row, attempted rows included. The rollup-backed computation must
+    reproduce these numbers exactly on the same store.
+    """
+    selected_at = collect.parse_timestamp(selection_time)
+    normalized_selection_time = collect.timestamp_text(selected_at)
+    rows = connection.execute(
+        """
+        SELECT
+            room_revisits.stage_seconds,
+            room_revisits.due_at,
+            room_revisits.attempted_at,
+            room_revisits.success,
+            room_revisits.outcome,
+            room_revisits.has_second_message,
+            (
+                SELECT MIN(newer.created_at)
+                FROM room_ledger AS newer
+                WHERE
+                    newer.name = room_ledger.name
+                    AND newer.created_seq > room_ledger.created_seq
+                    AND newer.created_at <= ?
+            )
+        FROM room_revisits
+        JOIN room_ledger
+            ON room_ledger.created_seq = room_revisits.room_created_seq
+        WHERE
+            room_revisits.due_at <= ?
+            AND room_revisits.aged_out_at IS NULL
+        """,
+        (normalized_selection_time, normalized_selection_time),
+    ).fetchall()
+    coverage = {
+        str(stage_seconds): {
+            "scheduled_due_rooms": 0,
+            "ineligible_superseded_before_due": 0,
+            "eligible_rooms": 0,
+            "attempted_checks": 0,
+            "completed_checks": 0,
+            "failed_checks": 0,
+            "attempted_late": 0,
+            "deferred_checks": 0,
+            "aged_out_unselected": 0,
+            "superseded_after_eligibility": 0,
+        }
+        for stage_seconds in collect.ROOM_REVISIT_STAGES_SECONDS
+    }
+    finalized_rows = connection.execute(
+        """
+        SELECT stage_seconds, COUNT(*)
+        FROM room_revisits
+        WHERE aged_out_at IS NOT NULL AND due_at <= ?
+        GROUP BY stage_seconds
+        """,
+        (normalized_selection_time,),
+    ).fetchall()
+    for stage_seconds, finalized_count in finalized_rows:
+        counters = coverage[str(stage_seconds)]
+        counters["scheduled_due_rooms"] += finalized_count
+        counters["eligible_rooms"] += finalized_count
+        counters["aged_out_unselected"] += finalized_count
+    successful_present = dict.fromkeys(collect.ROOM_REVISIT_STAGES_SECONDS, 0)
+    second_message = dict.fromkeys(collect.ROOM_REVISIT_STAGES_SECONDS, 0)
+    for (
+        stage_seconds,
+        due_at,
+        attempted_at,
+        success,
+        outcome,
+        has_second_message,
+        superseded_at,
+    ) in rows:
+        due_timestamp = collect.parse_timestamp(due_at)
+        eligible_until = due_timestamp + timedelta(seconds=stage_seconds)
+        attempt_timestamp = (
+            collect.parse_timestamp(attempted_at) if attempted_at is not None else None
+        )
+        newer_created = (
+            collect.parse_timestamp(superseded_at)
+            if superseded_at is not None
+            else None
+        )
+        counters = coverage[str(stage_seconds)]
+        counters["scheduled_due_rooms"] += 1
+        actual_attempt = (
+            attempt_timestamp is not None and outcome != "superseded_before_check"
+        )
+        if actual_attempt:
+            counters["eligible_rooms"] += 1
+            if attempt_timestamp < eligible_until:
+                counters["attempted_checks"] += 1
+                if outcome == "check_failed":
+                    counters["failed_checks"] += 1
+                else:
+                    counters["completed_checks"] += 1
+                if success == 1:
+                    successful_present[stage_seconds] += 1
+                    if has_second_message == 1:
+                        second_message[stage_seconds] += 1
+            else:
+                counters["attempted_late"] += 1
+            continue
+        if newer_created is not None and newer_created <= due_timestamp:
+            counters["ineligible_superseded_before_due"] += 1
+            continue
+        counters["eligible_rooms"] += 1
+        if newer_created is not None and newer_created < eligible_until:
+            counters["superseded_after_eligibility"] += 1
+        elif selected_at >= eligible_until:
+            counters["aged_out_unselected"] += 1
+        else:
+            counters["deferred_checks"] += 1
+    for stage_seconds in collect.ROOM_REVISIT_STAGES_SECONDS:
+        counters = coverage[str(stage_seconds)]
+        counters["coverage_fraction"] = {
+            "numerator": counters["completed_checks"],
+            "denominator": counters["eligible_rooms"],
+        }
+        counters["second_message_fraction"] = {
+            "numerator": second_message[stage_seconds],
+            "denominator": successful_present[stage_seconds],
+        }
+    return coverage
+
+
+def _populate_every_coverage_class(signer_store, monkeypatch):
+    """Drive the collector through every stage-coverage population.
+
+    Timely present with a second message, timely absent, timely failure, a
+    late read, supersession before due and after eligibility, aged-out
+    checks finalized this tick, a deferred open window, and a room whose
+    window only closes after the tick (aged out unfinalized at any later
+    selection time) — all written through the same paths the live collector
+    uses. Returns the tick timestamp."""
+    record_created_rooms(
+        signer_store,
+        [
+            created_event(1, "2026-08-30T08:00:00.250000Z", "present-room"),
+            created_event(2, "2026-08-30T08:00:00Z", "absent-room"),
+            created_event(3, "2026-08-30T08:00:00Z", "failed-room"),
+            created_event(4, "2026-08-30T07:50:00Z", "late-room"),
+            created_event(5, "2026-08-30T08:00:00Z", "before-due"),
+            created_event(105, "2026-08-30T08:04:00Z", "before-due"),
+            created_event(6, "2026-08-30T08:00:00Z", "after-eligibility"),
+            created_event(106, "2026-08-30T08:05:30Z", "after-eligibility"),
+            created_event(7, "2026-08-30T07:00:00Z", "aged-room"),
+            created_event(8, "2026-08-30T08:03:00Z", "deferred-room"),
+            created_event(9, "2026-08-30T06:00:00Z", "long-aged-room"),
+        ],
+        "2026-08-30T08:06:00Z",
+    )
+    signer_store.execute(
+        """
+        UPDATE room_revisits
+        SET attempted_at = '2026-08-30T08:05:02Z',
+            success = 1,
+            outcome = 'present_at_last_check',
+            message_count = 3,
+            has_second_message = 1,
+            second_sender_class = 'signed_did'
+        WHERE room_created_seq = 1 AND stage_seconds = 300
+        """
+    )
+    signer_store.execute(
+        """
+        UPDATE room_revisits
+        SET attempted_at = '2026-08-30T08:05:03Z',
+            success = 0,
+            outcome = 'absent_at_last_check'
+        WHERE room_created_seq = 2 AND stage_seconds = 300
+        """
+    )
+    signer_store.execute(
+        """
+        UPDATE room_revisits
+        SET attempted_at = '2026-08-30T08:05:04Z',
+            success = 0,
+            outcome = 'check_failed'
+        WHERE room_created_seq = 3 AND stage_seconds = 300
+        """
+    )
+    # A read recorded after the 07:55:00-08:00:00 window closed.
+    signer_store.execute(
+        """
+        UPDATE room_revisits
+        SET attempted_at = '2026-08-30T08:04:00Z',
+            success = 1,
+            outcome = 'present_at_last_check',
+            message_count = 1,
+            has_second_message = 0
+        WHERE room_created_seq = 4 AND stage_seconds = 300
+        """
+    )
+    tick_ts = "2026-08-30T08:06:00Z"
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+    monkeypatch.setattr(collect.time, "monotonic", lambda: 0.0)
+
+    class MustNotReadClient:
+        def get(self, path, deadline=None):
+            raise AssertionError(f"unexpected origin read: {path}")
+
+    collect_revisits(
+        MustNotReadClient(),
+        signer_store,
+        tick_ts,
+        sampled_room_reads=1,
+        deadline=0.0,
+    )
+    return tick_ts
+
+
+def test_stage_coverage_matches_the_per_row_reference_computation(
+    signer_store,
+    monkeypatch,
+):
+    tick_ts = _populate_every_coverage_class(signer_store, monkeypatch)
+
+    for selection_time in (tick_ts, "2026-08-30T09:00:00Z", "2026-09-02T00:00:00Z"):
+        assert collect.room_lifecycle_coverage_by_stage(
+            signer_store,
+            selection_time,
+        ) == _reference_stage_coverage(signer_store, selection_time)
+
+
+def test_stage_coverage_reads_terminal_rows_from_the_rollup(
+    signer_store,
+    monkeypatch,
+):
+    tick_ts = _populate_every_coverage_class(signer_store, monkeypatch)
+
+    statements = []
+    signer_store.set_trace_callback(statements.append)
+    coverage = collect.room_lifecycle_coverage_by_stage(signer_store, tick_ts)
+    signer_store.set_trace_callback(None)
+
+    assert coverage["300"]["attempted_checks"] == 3
+    assert coverage["300"]["attempted_late"] == 1
+    selects = [
+        statement
+        for statement in statements
+        if statement.lstrip().lower().startswith("select")
+    ]
+    # The finalized population comes from the rollup: no per-tick query may
+    # re-count rows already finalized as aged out.
+    assert all("aged_out_at IS NOT NULL" not in statement for statement in selects)
+    # The per-row scan never revisits attempted evidence: each residual
+    # population is fetched through its own partial index, with no full-table
+    # scan of room_revisits.
+    scans = [statement for statement in selects if "MIN(newer.created_at)" in statement]
+    assert len(scans) == 2
+    for statement in scans:
+        plan = " ".join(
+            str(row[3])
+            for row in signer_store.execute(
+                "EXPLAIN QUERY PLAN " + statement
+            ).fetchall()
+        )
+        assert "room_revisits_pending" in plan or "room_revisits_superseded" in plan
+        assert "SCAN room_revisits" not in plan
+
+
+def test_lifecycle_rollup_counts_terminal_rows_per_stage(signer_store, monkeypatch):
+    _populate_every_coverage_class(signer_store, monkeypatch)
+
+    stored = signer_store.execute(
+        """
+        SELECT
+            stage_300_aged_out_finalized,
+            stage_300_timely_completed,
+            stage_300_timely_failed,
+            stage_300_late_attempts,
+            stage_300_timely_present,
+            stage_300_timely_second_message,
+            stage_3600_aged_out_finalized,
+            stage_86400_aged_out_finalized,
+            reads_attempted
+        FROM room_lifecycle_totals
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    assert stored == (2, 2, 1, 1, 1, 1, 1, 0, 4)
+    collect.verify_lifecycle_rollup(signer_store)
+
+    # Retention-style deletes decrement through the rollup delete triggers.
+    signer_store.execute("DELETE FROM room_revisits WHERE room_created_seq = 1")
+    signer_store.execute("DELETE FROM room_ledger WHERE created_seq = 1")
+    assert signer_store.execute(
+        """
+        SELECT stage_300_timely_completed, stage_300_timely_present, reads_attempted
+        FROM room_lifecycle_totals
+        WHERE singleton = 1
+        """
+    ).fetchone() == (1, 0, 3)
+    collect.verify_lifecycle_rollup(signer_store)
+
+    # A counter that detaches from the attempt rollup is rejected at write
+    # time, not published.
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        signer_store.execute(
+            "UPDATE room_lifecycle_totals "
+            "SET stage_300_timely_completed = stage_300_timely_completed + 1 "
+            "WHERE singleton = 1"
+        )
+
+
+def test_attempted_revisit_evidence_is_immutable(signer_store, monkeypatch):
+    _populate_every_coverage_class(signer_store, monkeypatch)
+
+    # Each rewrite below was a valid row shape under the pre-2.14.0
+    # validation, so only the immutability clause refuses it.
+    for mutation in (
+        "SET outcome = 'check_failed', message_count = NULL, "
+        "has_second_message = NULL, second_sender_class = NULL, success = 0 "
+        "WHERE room_created_seq = 2 AND stage_seconds = 300",
+        "SET attempted_at = '2026-08-30T08:05:59Z' "
+        "WHERE room_created_seq = 3 AND stage_seconds = 300",
+        "SET message_count = 4 WHERE room_created_seq = 1 AND stage_seconds = 300",
+        "SET attempted_at = NULL, success = NULL, outcome = NULL, "
+        "message_count = NULL, has_second_message = NULL, "
+        "second_sender_class = NULL "
+        "WHERE room_created_seq = 1 AND stage_seconds = 300",
+    ):
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="attempted room revisit evidence is immutable",
+        ):
+            signer_store.execute(f"UPDATE room_revisits {mutation}")
+
+    # A finalized aged-out check can never be definalized or re-dated.
+    finalized = signer_store.execute(
+        """
+        SELECT room_created_seq, stage_seconds
+        FROM room_revisits
+        WHERE aged_out_at IS NOT NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    assert finalized is not None
+    for mutation in (
+        "SET aged_out_at = NULL",
+        "SET aged_out_at = '2026-09-02T00:00:00Z'",
+    ):
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="finalized aged-out revisit is immutable",
+        ):
+            signer_store.execute(
+                f"UPDATE room_revisits {mutation} WHERE room_created_seq = ? AND stage_seconds = ?",
+                finalized,
+            )
+
+
+def test_stale_2_13_lifecycle_state_is_rebuilt_exactly_once(tmp_path, monkeypatch):
+    path = tmp_path / "signers.sqlite3"
+    connection = connect_signer_database(path)
+    record_created_rooms(
+        connection,
+        [created_event(10, "2026-08-30T08:00:00Z", "carried-room")],
+        "2026-08-30T08:00:01Z",
+    )
+    connection.execute(
+        """
+        UPDATE room_revisits
+        SET attempted_at = due_at,
+            success = 1,
+            outcome = 'present_at_last_check',
+            message_count = 2,
+            has_second_message = 1,
+            second_sender_class = 'server'
+        WHERE room_created_seq = 10 AND stage_seconds = 300
+        """
+    )
+    # Reshape the store the way a 2.13.0 collector left it: triggers whose
+    # text carries aged_out_at but none of the 2.14.0 tokens, and a totals
+    # table without the per-stage counters.
+    for trigger in collect.LIFECYCLE_ROLLUP_TRIGGER_NAMES:
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    connection.executescript(
+        """
+        CREATE TRIGGER room_revisits_validate_insert
+        BEFORE INSERT ON room_revisits BEGIN
+            SELECT CASE WHEN NEW.aged_out_at IS NOT NULL
+                AND NEW.attempted_at IS NOT NULL
+            THEN RAISE(ABORT, 'invalid room revisit state') END;
+        END;
+
+        CREATE TRIGGER room_revisits_validate_update
+        BEFORE UPDATE ON room_revisits BEGIN
+            SELECT CASE WHEN NEW.aged_out_at IS NOT NULL
+                AND NEW.attempted_at IS NOT NULL
+            THEN RAISE(ABORT, 'invalid room revisit state') END;
+        END;
+        """
+    )
+    # The six revisit rollup trigger names, spelled out rather than taken
+    # from a collector constant so this fixture also runs against a
+    # pre-2.14.0 collect module when proving the test fails there.
+    revisit_rollup_triggers = (
+        "room_revisits_rollup_before_insert",
+        "room_revisits_rollup_after_insert",
+        "room_revisits_rollup_before_update",
+        "room_revisits_rollup_after_update",
+        "room_revisits_rollup_before_delete",
+        "room_revisits_rollup_after_delete",
+    )
+    for name in revisit_rollup_triggers:
+        timing, _, event = name.removeprefix("room_revisits_rollup_").partition("_")
+        connection.execute(
+            f"CREATE TRIGGER {name} {timing} {event} ON room_revisits BEGIN SELECT 1; END"
+        )
+    for name in (
+        "room_ledger_rollup_after_insert",
+        "room_ledger_rollup_after_delete",
+        "room_ledger_rollup_after_first_observed_update",
+    ):
+        connection.execute(
+            f"CREATE TRIGGER {name} AFTER DELETE ON room_ledger BEGIN SELECT 1; END"
+        )
+    connection.execute("DROP TABLE room_lifecycle_totals")
+    connection.execute(
+        """
+        CREATE TABLE room_lifecycle_totals (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            rooms_in_ledger INTEGER NOT NULL,
+            rooms_revisited INTEGER NOT NULL,
+            rooms_successfully_revisited INTEGER NOT NULL,
+            rooms_with_second_message INTEGER NOT NULL,
+            reads_attempted INTEGER NOT NULL,
+            reads_failed INTEGER NOT NULL,
+            second_sender_signed_did INTEGER NOT NULL,
+            second_sender_unsigned_did INTEGER NOT NULL,
+            second_sender_server INTEGER NOT NULL,
+            second_sender_other INTEGER NOT NULL,
+            second_sender_not_observed INTEGER NOT NULL,
+            ledger_started_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO room_lifecycle_totals VALUES "
+        "(1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, '2026-08-30T08:00:01.000000Z')"
+    )
+    connection.commit()
+    connection.close()
+
+    statements_by_open = []
+    real_connect = sqlite3.connect
+
+    def tracing_connect(*args, **kwargs):
+        traced = real_connect(*args, **kwargs)
+        statements = []
+        statements_by_open.append(statements)
+        traced.set_trace_callback(statements.append)
+        return traced
+
+    monkeypatch.setattr(collect.sqlite3, "connect", tracing_connect)
+
+    reopened = connect_signer_database(path)
+    try:
+        collect.verify_lifecycle_rollup(reopened)
+        assert reopened.execute(
+            """
+            SELECT stage_300_timely_completed, stage_300_timely_present, reads_attempted
+            FROM room_lifecycle_totals
+            WHERE singleton = 1
+            """
+        ).fetchone() == (1, 1, 1)
+        for name, sql in reopened.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+        ):
+            if name in collect.LIFECYCLE_REVISIT_ROLLUP_TRIGGER_NAMES:
+                assert collect.LIFECYCLE_STAGE_ROLLUP_TOKEN in sql
+            if name == "room_revisits_validate_update":
+                assert collect.LIFECYCLE_ATTEMPT_IMMUTABILITY_TOKEN in sql
+    finally:
+        reopened.close()
+    assert any(
+        "DROP TRIGGER" in statement
+        for statements in statements_by_open
+        for statement in statements
+    )
+
+    statements_by_open.clear()
+    second = connect_signer_database(path)
+    try:
+        collect.verify_lifecycle_rollup(second)
+    finally:
+        second.close()
+    rebuild_markers = [
+        statement
+        for statements in statements_by_open
+        for statement in statements
+        if "DROP TRIGGER" in statement
+        or "DELETE FROM room_lifecycle_totals" in statement
+    ]
+    assert rebuild_markers == []
 
 
 def test_read_budget_ceiling_is_enforced_in_selection_and_arithmetic(signer_store):
