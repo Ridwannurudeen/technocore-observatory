@@ -945,6 +945,13 @@ def methodology_resource() -> dict[str, Any]:
                     "attempt evidence; a check finalized as aged out stays "
                     "aged out even if supersession evidence for its window is "
                     "observed later.",
+                    "A recorded origin read now outranks supersession "
+                    "evidence, so from collector 2.13.0 a late-read check "
+                    "whose name was recreated before the check fell due is "
+                    "counted as an eligible late attempt rather than as "
+                    "ineligible and superseded before due. This shifts the "
+                    "split between those two counts at the version boundary; "
+                    "earlier ticks keep their original split.",
                 ],
             },
             {
