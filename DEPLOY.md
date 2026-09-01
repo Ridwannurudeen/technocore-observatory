@@ -91,7 +91,7 @@ guards must already have passed on a browser-capable machine before the release 
 The Ruff invocation carries one explicit waiver for the pre-existing unused local in
 `derive.py:2808`; the roadmap release does not touch that dead-code finding.
 
-The current public contract is methodology 1.13.0. The query unit must pass that exact
+The current public contract is methodology 1.15.0. The query unit must pass that exact
 version so every dynamic response reports the same methodology as the generated snapshots.
 
 ## 2. Stage files without activating them

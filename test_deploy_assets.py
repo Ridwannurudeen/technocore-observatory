@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import collect
+import derive
 import guards
 from api_contract import text_bytes
 from build_site import build_release
@@ -319,8 +321,8 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     assert "--database /home/technocore/observatory/signers.sqlite3" in query
     assert "--snapshot-root /opt/technocore-observatory/current" in query
     assert "--host 127.0.0.1" in query
-    assert "--collector-version 2.11.1" in query
-    assert "--methodology-version 1.13.0" in query
+    assert f"--collector-version {collect.COLLECTOR_VERSION}" in query
+    assert f"--methodology-version {derive.METHODOLOGY_VERSION}" in query
     assert "ProtectSystem=strict" in query
     assert "ProtectHome=read-only" in query
     assert (
@@ -903,7 +905,7 @@ def test_docs_state_the_scoped_lint_waiver_and_failure_metadata_boundary():
         assert "1,008" in source
         assert "2 GiB" in source
         assert "immediate predecessor" in source
-        assert "methodology 1.13.0" in source
+        assert f"methodology {derive.METHODOLOGY_VERSION}" in source
     assert "silently" in deploy
     assert "filtered" in deploy
     assert "`.unpublished-<id>` sidecar before" in deploy
@@ -1123,3 +1125,16 @@ def test_nginx_runtime_validation_is_explicitly_deferred_on_windows():
     pytest.skip(
         "the vhost references target-only TLS and ACME files; run nginx -t on the target"
     )
+
+
+def test_query_unit_pins_the_versions_the_code_actually_publishes():
+    # The query service takes these versions on the command line and imports
+    # neither collect nor derive, so nothing else can notice when a release
+    # bumps a version and leaves this unit behind. A stale pin makes the API
+    # report a different methodology than the snapshots it serves beside.
+    unit = (SYSTEMD / "technocore-observatory-query.service").read_text(
+        encoding="utf-8"
+    )
+    pinned = dict(re.findall(r"--(collector|methodology)-version (\S+)", unit))
+    assert pinned["collector"] == collect.COLLECTOR_VERSION
+    assert pinned["methodology"] == derive.METHODOLOGY_VERSION
