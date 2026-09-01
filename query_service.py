@@ -52,6 +52,8 @@ STATE_VOCABULARY = (
     "absent_at_last_check",
     "check_failed",
     "superseded_before_check",
+    "deferred",
+    "aged_out_unselected",
 )
 SNAPSHOT_RESOURCES = {
     "status": None,
@@ -447,15 +449,67 @@ def requested_representation(target: str) -> str:
     return "json" if params.get("format") == "json" else "text"
 
 
+def pending_windows_by_room(
+    connection: sqlite3.Connection,
+    created_seqs: list[int],
+) -> dict[int, list[tuple[str, int]]]:
+    if not created_seqs:
+        return {}
+    placeholders = ",".join("?" * len(created_seqs))
+    rows = connection.execute(
+        "SELECT room_created_seq, due_at, stage_seconds "
+        "FROM room_revisits "
+        f"WHERE room_created_seq IN ({placeholders}) "
+        "AND attempted_at IS NULL",
+        created_seqs,
+    ).fetchall()
+    windows: dict[int, list[tuple[str, int]]] = {}
+    for row in rows:
+        windows.setdefault(row["room_created_seq"], []).append(
+            (row["due_at"], row["stage_seconds"])
+        )
+    return windows
+
+
 def state_from_outcome(
     outcome: str | None,
     success: int | None,
     attempted_at: str | None,
     *,
     has_scheduled_checks: bool = True,
+    pending_windows: list[tuple[str, int]] | None = None,
+    now: datetime | None = None,
 ) -> str:
     if attempted_at is None:
-        return "not_yet_checked" if has_scheduled_checks else "unknown"
+        if not has_scheduled_checks:
+            return "unknown"
+        # Without the windows we know a check is scheduled but not whether its
+        # eligibility has closed, so the caller keeps the older, weaker claim.
+        if not pending_windows:
+            return "not_yet_checked"
+        instant = now if now is not None else utc_datetime()
+        open_window = False
+        future_window = False
+        for due_at, stage_seconds in pending_windows:
+            try:
+                due = datetime.fromisoformat(
+                    due_at[:-1] + "+00:00" if due_at.endswith("Z") else due_at
+                )
+            except (TypeError, ValueError):
+                return "unknown"
+            if due.tzinfo is None:
+                return "unknown"
+            if instant < due:
+                future_window = True
+            elif instant < due + timedelta(seconds=stage_seconds):
+                open_window = True
+        if open_window:
+            return "deferred"
+        if future_window:
+            return "not_yet_checked"
+        # Every scheduled window closed with no attempt: this room was never
+        # checked at any stage and never will be. It is not pending.
+        return "aged_out_unselected"
     states = {
         "present_at_last_check": "present_at_last_check",
         "absent_at_last_check": "absent_at_last_check",
@@ -698,6 +752,10 @@ class QueryApplication:
                 source_observed_at=source_observed_at,
                 include_listing_observation=True,
             )
+            pending_windows = pending_windows_by_room(
+                connection,
+                [row["created_seq"] for row in rows],
+            )
             results: list[dict[str, Any]] = []
             for row in rows:
                 results.append(
@@ -714,6 +772,8 @@ class QueryApplication:
                             row["latest_success"],
                             row["latest_check_at"],
                             has_scheduled_checks=bool(row["has_scheduled_checks"]),
+                            pending_windows=pending_windows.get(row["created_seq"]),
+                            now=self.config.clock(),
                         ),
                     }
                 )
@@ -925,6 +985,8 @@ class QueryApplication:
                         check["outcome"],
                         check["success"],
                         check["attempted_at"],
+                        pending_windows=[(check["due_at"], check["stage_seconds"])],
+                        now=self.config.clock(),
                     ),
                     "message_count": check["message_count"],
                     "has_second_message": (

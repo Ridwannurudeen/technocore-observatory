@@ -74,7 +74,12 @@ Lifecycle state is one of:
 - `check_failed`: transport, timeout, decode, rate-limit or non-404 HTTP failure.
 - `superseded_before_check`: the room name was recreated in a newer creation cohort before this
   cohort's scheduled check, so no origin read was issued.
-- `not_yet_checked`: scheduled checkpoints exist but none has been attempted.
+- `not_yet_checked`: scheduled checkpoints exist, none has been attempted, and at least one is
+  still ahead of its due time.
+- `deferred`: a checkpoint's eligibility window is open and the read budget has not reached it
+  yet. It may still be checked.
+- `aged_out_unselected`: every scheduled window closed with no attempt. The room was never read at
+  those stages and never will be. This is not a pending state, and it is not evidence of absence.
 - `unknown`: legacy evidence cannot distinguish an outcome.
 
 Legacy `success=0` rows migrate to `check_failed`; they are never reinterpreted as absence. The

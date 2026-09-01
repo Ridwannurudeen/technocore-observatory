@@ -1217,6 +1217,8 @@ def test_room_evidence_includes_every_check_listing_presence_and_state_vocabular
         "absent_at_last_check",
         "check_failed",
         "superseded_before_check",
+        "deferred",
+        "aged_out_unselected",
     }
     assert (
         query_service.state_from_outcome(
@@ -2018,3 +2020,62 @@ def test_plain_text_escapes_unicode_line_and_format_controls():
         "contract_version: 1.0.0",
         "value: safe\\u2028contract_version: forged\\u2029end\\u202espoof",
     ]
+
+
+def test_search_reports_lifecycle_state_for_an_unattempted_room(running_server):
+    status, _, payload = json_request(
+        running_server,
+        "/api/v1/rooms/search?q=evidence-room&format=json",
+    )
+    assert status == 200
+    result = next(
+        entry for entry in payload["results"] if entry["name"] == "evidence-room"
+    )
+    assert result["latest_lifecycle_state"] in query_service.STATE_VOCABULARY
+
+
+def test_state_from_outcome_separates_deferred_from_aged_out():
+    now = datetime(2026, 8, 30, 9, 1, tzinfo=timezone.utc)
+
+    def state(windows):
+        return query_service.state_from_outcome(
+            None, None, None, pending_windows=windows, now=now
+        )
+
+    # The window is open and the read budget has not reached this room yet.
+    assert state([("2026-08-30T09:00:00Z", 3600)]) == "deferred"
+    # Every window closed with no attempt: never checked, and never will be.
+    assert state([("2026-08-30T08:00:00Z", 300)]) == "aged_out_unselected"
+    # A checkpoint still ahead of its due time is genuinely pending.
+    assert state([("2026-08-31T08:00:00Z", 86400)]) == "not_yet_checked"
+    # One closed stage does not age out a room that still has a later stage due.
+    assert (
+        state([("2026-08-30T08:00:00Z", 300), ("2026-08-31T08:00:00Z", 86400)])
+        == "not_yet_checked"
+    )
+    # An open window outranks a closed one.
+    assert (
+        state([("2026-08-30T08:00:00Z", 300), ("2026-08-30T09:00:00Z", 3600)])
+        == "deferred"
+    )
+
+
+def test_state_from_outcome_never_guesses_without_windows():
+    now = datetime(2026, 8, 30, 9, 1, tzinfo=timezone.utc)
+    # Without windows we know a check is scheduled but not whether it can still
+    # happen, so the older, weaker claim stands rather than a fabricated one.
+    assert (
+        query_service.state_from_outcome(None, None, None, now=now) == "not_yet_checked"
+    )
+    assert (
+        query_service.state_from_outcome(
+            None, None, None, has_scheduled_checks=False, now=now
+        )
+        == "unknown"
+    )
+    assert (
+        query_service.state_from_outcome(
+            None, None, None, pending_windows=[("not-a-timestamp", 300)], now=now
+        )
+        == "unknown"
+    )
