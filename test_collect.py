@@ -38,6 +38,7 @@ from verify_ledger import (
 
 DID = "did:key:z6Mk" + "a" * 40
 OTHER_DID = "did:key:z6Mk" + "b" * 40
+REVISIT_SELECTOR_SEED = "0123456789abcdef0123456789abcdef"
 
 
 @pytest.fixture
@@ -45,6 +46,44 @@ def signer_store(tmp_path):
     connection = connect_signer_database(tmp_path / "signers.sqlite3")
     yield connection
     connection.close()
+
+
+def select_revisits(
+    connection,
+    now,
+    *,
+    allocation_rotation=0,
+    limit=collect.ROOM_REVISIT_READ_BUDGET,
+):
+    return select_due_room_revisits(
+        connection,
+        now,
+        selector_version=collect.SELECTOR_VERSION,
+        selector_seed=REVISIT_SELECTOR_SEED,
+        allocation_rotation=allocation_rotation,
+        limit=limit,
+    )
+
+
+def collect_revisits(
+    client,
+    connection,
+    tick_ts,
+    *,
+    sampled_room_reads,
+    deadline,
+    allocation_rotation=0,
+):
+    return collect.collect_room_revisits(
+        client,
+        connection,
+        tick_ts,
+        sampled_room_reads=sampled_room_reads,
+        selector_version=collect.SELECTOR_VERSION,
+        selector_seed=REVISIT_SELECTOR_SEED,
+        allocation_rotation=allocation_rotation,
+        deadline=deadline,
+    )
 
 
 def test_signer_database_uses_delete_journal_without_sidecars(tmp_path):
@@ -588,9 +627,10 @@ def insert_record(
     )
 
 
-def test_collector_version_is_bumped_for_resilient_identity_census():
-    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 9, 0)
+def test_collector_version_is_bumped_for_lifecycle_sampling():
+    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 11, 1)
     assert collect.SIGNER_STATE_VERSION == 6
+    assert collect.TICK_REVISIT_DEADLINE_SECONDS == 300
 
 
 @pytest.mark.parametrize("timeout", (float("nan"), float("inf"), -float("inf")))
@@ -1774,17 +1814,21 @@ def test_created_room_preserves_fractional_revisit_schedule_precision(signer_sto
         "SELECT due_at FROM room_revisits "
         "WHERE room_created_seq = 10 AND stage_seconds = 300"
     ).fetchone() == ("2026-08-30T08:05:00.123456Z",)
-    assert select_due_room_revisits(
+    before_due = select_revisits(
         signer_store,
         "2026-08-30T08:05:00.123455Z",
-    ) == (0, 0, [])
-    assert (
-        select_due_room_revisits(
-            signer_store,
-            "2026-08-30T08:05:00.123456Z",
-        )[0]
-        == 1
     )
+    assert before_due["due_this_tick"] == 0
+    assert before_due["superseded_due_this_tick"] == 0
+    assert before_due["selected"] == []
+
+    at_due = select_revisits(
+        signer_store,
+        "2026-08-30T08:05:00.123456Z",
+    )
+    assert at_due["due_this_tick"] == 1
+    assert at_due["superseded_due_this_tick"] == 0
+    assert [row["created_seq"] for row in at_due["selected"]] == [10]
 
 
 def test_created_room_rejects_an_event_after_its_observation(signer_store):
@@ -1829,19 +1873,18 @@ def test_recreated_room_gets_an_independent_generation_and_schedule(signer_store
         "GROUP BY room_created_seq ORDER BY room_created_seq"
     ).fetchall() == [(10, 3), (999, 3)]
 
-    due, superseded_due, selected = select_due_room_revisits(
+    selection = select_revisits(
         signer_store,
         "2026-08-30T08:05:00.000001Z",
     )
-    assert due == 1
-    assert superseded_due == 1
-    assert selected == [
+    assert selection["due_this_tick"] == 1
+    assert selection["superseded_due_this_tick"] == 0
+    assert selection["selected"] == [
         {
             "created_seq": 10,
             "name": "reused-room",
             "stage_seconds": 300,
             "created_at": "2026-08-30T08:00:00.000001Z",
-            "superseded": True,
         }
     ]
 
@@ -1978,28 +2021,28 @@ def test_room_listing_updates_only_a_generation_visible_at_observation(signer_st
     ).fetchall() == [(10, "2026-08-30T08:04:00Z"), (20, None)]
 
 
-def test_room_revisit_schedule_selects_only_due_stages(signer_store):
+def test_room_revisit_schedule_selects_only_active_eligible_stages(signer_store):
     record_created_rooms(
         signer_store,
         [created_event(10, "2026-08-30T08:00:00Z", "scheduled-room")],
         "2026-08-30T08:00:01Z",
     )
 
-    due, superseded_due, selected = select_due_room_revisits(
+    before_due = select_revisits(
         signer_store,
         "2026-08-30T08:04:59Z",
     )
-    assert due == 0
-    assert superseded_due == 0
-    assert selected == []
+    assert before_due["due_this_tick"] == 0
+    assert before_due["superseded_due_this_tick"] == 0
+    assert before_due["selected"] == []
 
-    due, superseded_due, selected = select_due_room_revisits(
+    at_due = select_revisits(
         signer_store,
         "2026-08-30T08:05:00Z",
     )
-    assert due == 1
-    assert superseded_due == 0
-    assert selected == [
+    assert at_due["due_this_tick"] == 1
+    assert at_due["superseded_due_this_tick"] == 0
+    assert at_due["selected"] == [
         {
             "created_seq": 10,
             "name": "scheduled-room",
@@ -2041,7 +2084,7 @@ def test_room_revisit_selection_rejects_malformed_persisted_rows(
     signer_store.execute(statement, parameters)
 
     with pytest.raises(CollectionError, match="room revisit"):
-        select_due_room_revisits(signer_store, "2026-08-30T08:05:00Z")
+        select_revisits(signer_store, "2026-08-30T08:05:00Z")
 
 
 def test_room_revisit_selection_rejects_a_malformed_future_due_time(signer_store):
@@ -2217,19 +2260,22 @@ def test_lifecycle_rollup_assigns_one_sender_class_per_generation(signer_store):
         )
 
 
-def test_superseded_generation_is_finalized_without_an_origin_read(
+def test_superseded_generations_are_classified_by_eligibility(
     signer_store,
     monkeypatch,
 ):
     record_created_rooms(
         signer_store,
         [
-            created_event(10, "2026-08-30T08:00:00Z", "reused-room"),
-            created_event(20, "2026-08-30T08:04:00Z", "reused-room"),
+            created_event(10, "2026-08-30T08:00:00Z", "before-due"),
+            created_event(20, "2026-08-30T08:04:00Z", "before-due"),
+            created_event(30, "2026-08-30T08:00:00Z", "after-eligibility"),
+            created_event(40, "2026-08-30T08:06:00Z", "after-eligibility"),
         ],
-        "2026-08-30T08:04:01Z",
+        "2026-08-30T08:06:00Z",
     )
-    monkeypatch.setattr(collect, "utc_now", lambda: "2026-08-30T08:05:00Z")
+    tick_ts = "2026-08-30T08:06:00Z"
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
     calls = []
 
     class RecordingClient:
@@ -2237,91 +2283,128 @@ def test_superseded_generation_is_finalized_without_an_origin_read(
             calls.append(path)
             raise AssertionError("a superseded cohort must not be read")
 
-    lifecycle = collect.collect_room_revisits(
+    lifecycle = collect_revisits(
         RecordingClient(),
         signer_store,
-        "2026-08-30T08:05:00Z",
+        tick_ts,
         sampled_room_reads=1,
         deadline=time.monotonic() + 1,
     )
+    coverage = lifecycle["sampling"]["coverage_by_stage"]["300"]
 
     assert calls == []
-    assert lifecycle["due_this_tick"] == 1
+    assert lifecycle["due_this_tick"] == 0
     assert lifecycle["attempted_this_tick"] == 0
-    assert lifecycle["superseded_this_tick"] == 1
+    assert lifecycle["superseded_this_tick"] == 2
     assert lifecycle["deferred_due_to_budget"] == 0
-    assert lifecycle["revisits"] == [
-        {
-            "id": collect.room_identifier("reused-room"),
-            "created_seq": 10,
-            "stage_seconds": 300,
-            "elapsed_since_creation_seconds": None,
-            "success": False,
-            "outcome": "superseded_before_check",
-            "message_count": None,
-            "has_second_message": None,
-            "second_sender_class": None,
-        }
-    ]
-    assert signer_store.execute(
-        """
-        SELECT attempted_at, success, outcome
-        FROM room_revisits
-        WHERE room_created_seq = 10 AND stage_seconds = 300
-        """
-    ).fetchone() == ("2026-08-30T08:05:00Z", 0, "superseded_before_check")
-    assert lifecycle["rooms_in_ledger"] == 2
+    assert {revisit["created_seq"] for revisit in lifecycle["revisits"]} == {10, 30}
+    assert coverage["scheduled_due_rooms"] == 2
+    assert coverage["ineligible_superseded_before_due"] == 1
+    assert coverage["eligible_rooms"] == 1
+    assert coverage["superseded_after_eligibility"] == 1
     assert lifecycle["rooms_revisited"] == 0
     assert lifecycle["reads_attempted"] == 0
 
 
-def test_superseded_finalization_is_bounded_and_deferred_explicitly(
+def test_stage_coverage_distinguishes_sampling_outcomes(
     signer_store,
     monkeypatch,
 ):
-    old_events = [
-        created_event(
-            index,
-            "2026-08-28T08:00:00Z",
-            f"reused-room-{index:03d}",
-        )
-        for index in range(102)
-    ]
-    new_events = [
-        created_event(
-            1_000 + index,
-            "2026-08-29T08:00:00Z",
-            f"reused-room-{index:03d}",
-        )
-        for index in range(102)
-    ]
-    record_created_rooms(signer_store, old_events, "2026-08-28T08:00:01Z")
-    record_created_rooms(signer_store, new_events, "2026-08-29T08:00:01Z")
-    monkeypatch.setattr(collect, "utc_now", lambda: "2026-08-30T08:00:00Z")
+    record_created_rooms(
+        signer_store,
+        [
+            created_event(1, "2026-08-30T08:00:00Z", "completed-room"),
+            created_event(2, "2026-08-30T08:00:00Z", "absent-room"),
+            created_event(3, "2026-08-30T08:00:00Z", "failed-room"),
+            created_event(4, "2026-08-30T08:00:00Z", "deferred-room"),
+            created_event(5, "2026-08-30T07:55:00Z", "aged-room"),
+            created_event(6, "2026-08-30T08:00:00Z", "before-due"),
+            created_event(106, "2026-08-30T08:04:00Z", "before-due"),
+            created_event(7, "2026-08-30T08:00:00Z", "after-eligibility"),
+            created_event(
+                107,
+                "2026-08-30T08:05:30Z",
+                "after-eligibility",
+            ),
+        ],
+        "2026-08-30T08:06:00Z",
+    )
+    signer_store.execute(
+        """
+        UPDATE room_revisits
+        SET
+            attempted_at = due_at,
+            success = 1,
+            outcome = 'present_at_last_check',
+            message_count = 2,
+            has_second_message = 1,
+            second_sender_class = 'signed_did'
+        WHERE room_created_seq = 1 AND stage_seconds = 300
+        """
+    )
+    signer_store.execute(
+        """
+        UPDATE room_revisits
+        SET
+            attempted_at = due_at,
+            success = 0,
+            outcome = 'absent_at_last_check'
+        WHERE room_created_seq = 2 AND stage_seconds = 300
+        """
+    )
+    signer_store.execute(
+        """
+        UPDATE room_revisits
+        SET
+            attempted_at = due_at,
+            success = 0,
+            outcome = 'check_failed'
+        WHERE room_created_seq = 3 AND stage_seconds = 300
+        """
+    )
+    tick_ts = "2026-08-30T08:06:00Z"
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
     monkeypatch.setattr(collect.time, "monotonic", lambda: 0.0)
 
     class MustNotReadClient:
         def get(self, path, deadline=None):
-            raise AssertionError(f"unexpected origin read: {path}")
+            raise AssertionError(f"deadline-deferred read was issued: {path}")
 
-    lifecycle = collect.collect_room_revisits(
+    lifecycle = collect_revisits(
         MustNotReadClient(),
         signer_store,
-        "2026-08-30T08:00:00Z",
+        tick_ts,
         sampled_room_reads=1,
         deadline=0.0,
     )
+    sampling = lifecycle["sampling"]
+    coverage = sampling["coverage_by_stage"]["300"]
 
-    assert lifecycle["due_this_tick"] == 612
+    assert lifecycle["due_this_tick"] == 1
     assert lifecycle["attempted_this_tick"] == 0
-    assert lifecycle["superseded_this_tick"] == 297
-    assert len(lifecycle["revisits"]) == (
-        collect.ROOM_REVISIT_PUBLICATION_BATCH_LIMIT - collect.ROOM_REVISIT_READ_BUDGET
-    )
-    assert lifecycle["deferred_due_to_read_budget"] == 298
-    assert lifecycle["deferred_due_to_deadline"] == 8
-    assert lifecycle["deferred_superseded_due_to_batch_limit"] == 9
-    assert lifecycle["deferred_due_to_budget"] == 315
+    assert lifecycle["deferred_due_to_read_budget"] == 0
+    assert lifecycle["deferred_due_to_deadline"] == 1
+    assert lifecycle["deferred_due_to_budget"] == 1
+    assert sampling["aged_out_unselected"] == 1
+    assert coverage == {
+        "scheduled_due_rooms": 7,
+        "ineligible_superseded_before_due": 1,
+        "eligible_rooms": 6,
+        "attempted_checks": 3,
+        "completed_checks": 2,
+        "failed_checks": 1,
+        "deferred_checks": 1,
+        "aged_out_unselected": 1,
+        "superseded_after_eligibility": 1,
+        "coverage_fraction": {
+            "numerator": 2,
+            "denominator": 6,
+        },
+        "second_message_fraction": {
+            "numerator": 1,
+            "denominator": 1,
+        },
+    }
 
 
 def test_read_budget_ceiling_is_enforced_in_selection_and_arithmetic(signer_store):
@@ -2338,30 +2421,228 @@ def test_read_budget_ceiling_is_enforced_in_selection_and_arithmetic(signer_stor
         events,
         "2026-08-30T08:00:01Z",
     )
-    due, superseded_due, selected = select_due_room_revisits(
+    selection = select_revisits(
         signer_store,
         "2026-08-30T08:05:00Z",
     )
 
-    assert collect.ROOM_REVISIT_READ_BUDGET == 8
-    assert due == collect.ROOM_REVISIT_READ_BUDGET + 1
-    assert superseded_due == 0
-    assert len(selected) == collect.ROOM_REVISIT_READ_BUDGET
+    assert collect.ROOM_REVISIT_READ_BUDGET == 38
+    assert selection["due_this_tick"] == 39
+    assert selection["superseded_due_this_tick"] == 0
+    assert len(selection["selected"]) == 38
     budget = read_budget_summary(
         ROOM_READ_BUDGET,
-        len(selected),
+        len(selection["selected"]),
     )
-    assert budget["total_reads"] == collect.TOTAL_READ_BUDGET == 90
+    assert budget["total_reads"] == collect.TOTAL_READ_BUDGET == 120
     assert budget["rate_window_seconds"] == 60
     assert budget["tick_revisit_deadline_seconds"] == 300
-    assert budget["reads_per_minute"] == pytest.approx(90.0)
-    assert budget["share"] == pytest.approx(0.15)
+    assert budget["reads_per_minute"] == pytest.approx(120.0)
+    assert budget["share"] == pytest.approx(0.20)
+    assert budget["maximum_share"] == pytest.approx(0.20)
     with pytest.raises(CollectionError, match="exceeds its enforced read budget"):
-        select_due_room_revisits(
+        select_revisits(
             signer_store,
             "2026-08-30T08:05:00Z",
-            collect.ROOM_REVISIT_READ_BUDGET + 1,
+            limit=collect.ROOM_REVISIT_READ_BUDGET + 1,
         )
+
+
+def test_revisit_selection_is_deterministic_and_independent_of_room_age(tmp_path):
+    tick_ts = "2026-08-30T08:05:39Z"
+
+    def selected_sequences(path, created_seconds):
+        connection = connect_signer_database(path)
+        try:
+            record_created_rooms(
+                connection,
+                [
+                    created_event(
+                        index,
+                        f"2026-08-30T08:00:{second:02d}Z",
+                        f"ranked-room-{index:02d}",
+                    )
+                    for index, second in enumerate(created_seconds)
+                ],
+                "2026-08-30T08:00:40Z",
+            )
+            first = select_revisits(connection, tick_ts, limit=10)
+            second = select_revisits(connection, tick_ts, limit=10)
+            return (
+                [
+                    (row["created_seq"], row["stage_seconds"])
+                    for row in first["selected"]
+                ],
+                [
+                    (row["created_seq"], row["stage_seconds"])
+                    for row in second["selected"]
+                ],
+                first["selection"],
+                second["selection"],
+            )
+        finally:
+            connection.close()
+
+    chronological = selected_sequences(
+        tmp_path / "chronological.sqlite3",
+        range(40),
+    )
+    reversed_ages = selected_sequences(
+        tmp_path / "reversed.sqlite3",
+        reversed(range(40)),
+    )
+
+    assert chronological[0] == chronological[1]
+    assert chronological[2] == chronological[3]
+    assert reversed_ages[0] == reversed_ages[1]
+    assert reversed_ages[2] == reversed_ages[3]
+    assert chronological[0] == reversed_ages[0]
+
+
+def test_stage_outside_its_eligibility_window_is_never_selected(
+    signer_store,
+    monkeypatch,
+):
+    record_created_rooms(
+        signer_store,
+        [created_event(10, "2026-08-30T08:00:00Z", "expired-room")],
+        "2026-08-30T08:00:01Z",
+    )
+
+    still_eligible = select_revisits(
+        signer_store,
+        "2026-08-30T08:09:59.999999Z",
+    )
+    assert still_eligible["due_this_tick"] == 1
+    assert [row["created_seq"] for row in still_eligible["selected"]] == [10]
+
+    selection_time = "2026-08-30T08:10:00Z"
+    monkeypatch.setattr(collect, "utc_now", lambda: selection_time)
+
+    class MustNotReadClient:
+        def get(self, path, deadline=None):
+            raise AssertionError(f"expired stage was read: {path}")
+
+    lifecycle = collect_revisits(
+        MustNotReadClient(),
+        signer_store,
+        selection_time,
+        sampled_room_reads=1,
+        deadline=time.monotonic() + 1,
+    )
+    sampling = lifecycle["sampling"]
+
+    assert lifecycle["due_this_tick"] == 0
+    assert lifecycle["attempted_this_tick"] == 0
+    assert lifecycle["deferred_due_to_budget"] == 0
+    assert lifecycle["revisits"] == []
+    assert sampling["aged_out_unselected"] == 1
+    assert sampling["coverage_by_stage"]["300"]["aged_out_unselected"] == 1
+    assert signer_store.execute(
+        """
+        SELECT
+            attempted_at,
+            success,
+            outcome,
+            message_count,
+            has_second_message
+        FROM room_revisits
+        WHERE room_created_seq = 10 AND stage_seconds = 300
+        """
+    ).fetchone() == (None, None, None, None, None)
+
+
+def test_stage_allocation_rotates_and_redistributes_unused_slots(signer_store):
+    events = []
+    for start, count, created_at, prefix in (
+        (0, 20, "2026-08-30T11:55:00Z", "five-minute"),
+        (100, 20, "2026-08-30T11:00:00Z", "one-hour"),
+        (200, 20, "2026-08-29T12:00:00Z", "one-day"),
+    ):
+        events.extend(
+            created_event(
+                start + offset,
+                created_at,
+                f"{prefix}-{offset:02d}",
+            )
+            for offset in range(count)
+        )
+    record_created_rooms(
+        signer_store,
+        events,
+        "2026-08-30T12:00:00Z",
+    )
+
+    allocations = []
+    for rotation in range(3):
+        result = select_revisits(
+            signer_store,
+            "2026-08-30T12:00:00Z",
+            allocation_rotation=rotation,
+        )
+        counts = {
+            stage: sum(row["stage_seconds"] == stage for row in result["selected"])
+            for stage in collect.ROOM_REVISIT_STAGES_SECONDS
+        }
+        assert len(result["selected"]) == 38
+        assert sorted(counts.values()) == [12, 13, 13]
+        allocations.append(counts)
+
+    for stage in collect.ROOM_REVISIT_STAGES_SECONDS:
+        assert sum(allocation[stage] == 12 for allocation in allocations) == 1
+
+    signer_store.execute("DELETE FROM room_revisits")
+    signer_store.execute("DELETE FROM room_ledger")
+    sparse_events = [
+        *[
+            created_event(
+                offset,
+                "2026-08-30T11:55:00Z",
+                f"sparse-five-minute-{offset:02d}",
+            )
+            for offset in range(2)
+        ],
+        *[
+            created_event(
+                100 + offset,
+                "2026-08-30T11:00:00Z",
+                f"sparse-one-hour-{offset:02d}",
+            )
+            for offset in range(30)
+        ],
+        *[
+            created_event(
+                200 + offset,
+                "2026-08-29T12:00:00Z",
+                f"sparse-one-day-{offset:02d}",
+            )
+            for offset in range(30)
+        ],
+    ]
+    record_created_rooms(
+        signer_store,
+        sparse_events,
+        "2026-08-30T12:00:00Z",
+    )
+
+    first = select_revisits(
+        signer_store,
+        "2026-08-30T12:00:00Z",
+    )
+    second = select_revisits(
+        signer_store,
+        "2026-08-30T12:00:00Z",
+    )
+    redistributed = {
+        stage: sum(row["stage_seconds"] == stage for row in first["selected"])
+        for stage in collect.ROOM_REVISIT_STAGES_SECONDS
+    }
+
+    assert first["selected"] == second["selected"]
+    assert len(first["selected"]) == 38
+    assert first["selection"]["redistributed_reads"] == 10
+    assert redistributed[300] == 2
+    assert redistributed[3600] + redistributed[86400] == 36
 
 
 def test_failed_revisit_is_failure_not_absence_of_activity(
@@ -2379,7 +2660,7 @@ def test_failed_revisit_is_failure_not_absence_of_activity(
         def get(self, path, deadline=None):
             raise CollectionError(f"failed {path}")
 
-    lifecycle = collect.collect_room_revisits(
+    lifecycle = collect_revisits(
         FailingClient(),
         signer_store,
         "2026-08-30T08:05:00Z",
@@ -2430,7 +2711,7 @@ def test_malformed_revisit_message_is_check_failed_not_no_second_message(
         def get(self, path, deadline=None):
             return room_body(message(1, "server"), {"seq": 2, "from": "visitor"})
 
-    lifecycle = collect.collect_room_revisits(
+    lifecycle = collect_revisits(
         MalformedClient(),
         signer_store,
         "2026-08-30T08:05:00Z",
@@ -2475,7 +2756,7 @@ def test_http_404_revisit_is_absent_but_other_http_failures_are_failed(
                 path=path,
             )
 
-    lifecycle = collect.collect_room_revisits(
+    lifecycle = collect_revisits(
         StatusClient(),
         signer_store,
         "2026-08-30T08:05:00Z",
@@ -2526,11 +2807,11 @@ def test_deadline_defers_remainder_without_conflating_outcomes(
     class MixedClient:
         def get(self, path, deadline=None):
             calls.append(path)
-            if "a-failed" in path:
+            if len(calls) == 1:
                 raise CollectionError("failed read")
             return room_body(message(1, "server"))
 
-    lifecycle = collect.collect_room_revisits(
+    lifecycle = collect_revisits(
         MixedClient(),
         signer_store,
         "2026-08-30T08:07:30Z",
@@ -2560,12 +2841,11 @@ def test_deadline_defers_remainder_without_conflating_outcomes(
 
     assert signer_store.execute(
         """
-            SELECT attempted_at, success, message_count, has_second_message
-            FROM room_revisits
-            WHERE room_created_seq = ? AND stage_seconds = ?
-            """,
-        (12, 300),
-    ).fetchone() == (None, None, None, None)
+        SELECT COUNT(*)
+        FROM room_revisits
+        WHERE stage_seconds = 300 AND attempted_at IS NULL
+        """
+    ).fetchone() == (1,)
 
 
 def test_slow_base_phase_issues_no_room_revisits(signer_store, monkeypatch):
@@ -2583,7 +2863,7 @@ def test_slow_base_phase_issues_no_room_revisits(signer_store, monkeypatch):
             calls.append(path)
             return room_body(message(1, "server"))
 
-    lifecycle = collect.collect_room_revisits(
+    lifecycle = collect_revisits(
         RecordingClient(),
         signer_store,
         "2026-08-30T08:05:00Z",
@@ -2622,7 +2902,7 @@ def test_revisit_read_cap_deferral_count_is_exact(signer_store, monkeypatch):
             calls.append(path)
             return room_body(message(1, "server"))
 
-    lifecycle = collect.collect_room_revisits(
+    lifecycle = collect_revisits(
         SuccessfulClient(),
         signer_store,
         "2026-08-30T08:05:00Z",
@@ -2630,12 +2910,12 @@ def test_revisit_read_cap_deferral_count_is_exact(signer_store, monkeypatch):
         deadline=1.0,
     )
 
-    assert lifecycle["due_this_tick"] == 10
-    assert lifecycle["attempted_this_tick"] == 8
+    assert lifecycle["due_this_tick"] == 40
+    assert lifecycle["attempted_this_tick"] == 38
     assert lifecycle["deferred_due_to_read_budget"] == 2
     assert lifecycle["deferred_due_to_deadline"] == 0
     assert lifecycle["deferred_due_to_budget"] == 2
-    assert len(calls) == 8
+    assert len(calls) == 38
 
 
 def test_read_budget_is_enforced_before_first_revisit_read(
@@ -2660,7 +2940,7 @@ def test_read_budget_is_enforced_before_first_revisit_read(
     monkeypatch.setattr(collect, "read_budget_summary", reject_budget)
 
     with pytest.raises(CollectionError, match="preflight budget rejected"):
-        collect.collect_room_revisits(
+        collect_revisits(
             RecordingClient(),
             signer_store,
             "2026-08-30T08:05:00Z",
@@ -2669,6 +2949,90 @@ def test_read_budget_is_enforced_before_first_revisit_read(
         )
 
     assert calls == []
+
+
+def test_collect_tick_prioritizes_revisits_before_sampled_room_reads(
+    tmp_path,
+    monkeypatch,
+):
+    tick_ts = "2026-08-30T08:05:00Z"
+    clock = [0.0]
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+    monkeypatch.setattr(collect.time, "monotonic", lambda: clock[0])
+
+    signer_state_path = tmp_path / "signers.json"
+    connection = connect_signer_database(
+        collect.signer_database_path(signer_state_path)
+    )
+    try:
+        record_created_rooms(
+            connection,
+            [created_event(10, "2026-08-30T08:00:00Z", "priority-room")],
+            "2026-08-30T08:00:01Z",
+        )
+        state = new_signer_state(100)
+        state["selector_seed"] = REVISIT_SELECTOR_SEED
+        collect.write_signer_metadata(connection, state)
+        connection.commit()
+    finally:
+        connection.close()
+
+    calls = []
+
+    class SlowSampleClient:
+        def get(self, path, deadline=None):
+            calls.append(path)
+            if path == "/rooms?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "total": 1,
+                        "capacity": 100,
+                        "bytes": 0,
+                        "notes": {
+                            "total": 0,
+                            "capacity": 100,
+                            "bytes": 0,
+                        },
+                        "rooms": [{"name": "lobby", "seq": 1, "idle": 0}],
+                    }
+                )
+            if path == "/r/events?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "room": "events",
+                        "messages": [
+                            {
+                                "seq": 20,
+                                "ts": tick_ts,
+                                "from": "server",
+                                "text": "created event-room",
+                            }
+                        ],
+                    }
+                )
+            if path == "/r/priority-room?format=json&limit=200":
+                return room_body(message(1, "server"))
+            if path == "/r/lobby?format=json&limit=200":
+                clock[0] = collect.TICK_REVISIT_DEADLINE_SECONDS + 1
+                return room_body(message(1, "server"))
+            raise AssertionError(f"unexpected read: {path}")
+
+    tick = collect.collect_tick(
+        SlowSampleClient(),
+        signer_state_path,
+        100,
+    )
+
+    assert calls[:4] == [
+        "/rooms?format=json&limit=200",
+        "/r/events?format=json&limit=200",
+        "/r/priority-room?format=json&limit=200",
+        "/r/lobby?format=json&limit=200",
+    ]
+    assert tick["room_lifecycle"]["attempted_this_tick"] == 1
+    assert "sampling" not in tick["room_lifecycle"]
+    assert tick["room_lifecycle_sampling"]["selection"]
+    assert tick["room_lifecycle_sampling"]["coverage_by_stage"]
 
 
 def test_did_shaped_sender_without_nonce_is_not_counted_as_a_signer(signer_store):

@@ -240,6 +240,17 @@ def query_database(tmp_path):
     oversized_name = "oversize-marker-" + "x" * 70_000
     insert_room(connection, oversized_name, created_seq=203)
 
+    insert_room(connection, "unchecked-room", created_seq=210)
+    connection.execute(
+        """
+        INSERT INTO room_revisits (
+            room_created_seq, stage_seconds, due_at, attempted_at
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (210, 86400, "2026-08-31T08:00:00Z", None),
+    )
+
     insert_room(connection, "legacy-failed-room", created_seq=204)
     connection.execute(
         """
@@ -1217,12 +1228,15 @@ def test_room_evidence_includes_every_check_listing_presence_and_state_vocabular
         "absent_at_last_check",
         "check_failed",
         "superseded_before_check",
+        "deferred",
+        "aged_out_unselected",
     }
     assert (
         query_service.state_from_outcome(
             "superseded_before_check",
             0,
             "2026-08-30T09:00:00Z",
+            now=datetime(2026, 8, 30, 9, 1, tzinfo=timezone.utc),
         )
         == "superseded_before_check"
     )
@@ -2018,3 +2032,102 @@ def test_plain_text_escapes_unicode_line_and_format_controls():
         "contract_version: 1.0.0",
         "value: safe\\u2028contract_version: forged\\u2029end\\u202espoof",
     ]
+
+
+def test_search_reports_lifecycle_state_for_an_unattempted_room(running_server):
+    status, _, payload = json_request(
+        running_server,
+        "/api/v1/rooms/search?q=evidence-room&format=json",
+    )
+    assert status == 200
+    result = next(
+        entry for entry in payload["results"] if entry["name"] == "evidence-room"
+    )
+    assert result["latest_lifecycle_state"] in query_service.STATE_VOCABULARY
+
+
+def test_state_from_outcome_separates_deferred_from_aged_out():
+    now = datetime(2026, 8, 30, 9, 1, tzinfo=timezone.utc)
+
+    def state(windows):
+        return query_service.state_from_outcome(
+            None, None, None, pending_windows=windows, now=now
+        )
+
+    # The window is open and the read budget has not reached this room yet.
+    assert state([("2026-08-30T09:00:00Z", 3600)]) == "deferred"
+    # Every window closed with no attempt: never checked, and never will be.
+    assert state([("2026-08-30T08:00:00Z", 300)]) == "aged_out_unselected"
+    # A checkpoint still ahead of its due time is genuinely pending.
+    assert state([("2026-08-31T08:00:00Z", 86400)]) == "not_yet_checked"
+    # One closed stage does not age out a room that still has a later stage due.
+    assert (
+        state([("2026-08-30T08:00:00Z", 300), ("2026-08-31T08:00:00Z", 86400)])
+        == "not_yet_checked"
+    )
+    # An open window outranks a closed one.
+    assert (
+        state([("2026-08-30T08:00:00Z", 300), ("2026-08-30T09:00:00Z", 3600)])
+        == "deferred"
+    )
+
+
+def test_state_from_outcome_never_guesses_without_windows():
+    now = datetime(2026, 8, 30, 9, 1, tzinfo=timezone.utc)
+    # Without windows we know a check is scheduled but not whether it can still
+    # happen, so the older, weaker claim stands rather than a fabricated one.
+    assert (
+        query_service.state_from_outcome(None, None, None, now=now) == "not_yet_checked"
+    )
+    assert (
+        query_service.state_from_outcome(
+            None, None, None, has_scheduled_checks=False, now=now
+        )
+        == "unknown"
+    )
+    assert (
+        query_service.state_from_outcome(
+            None, None, None, pending_windows=[("not-a-timestamp", 300)], now=now
+        )
+        == "unknown"
+    )
+
+
+@pytest.mark.parametrize(
+    ("moment", "expected"),
+    [
+        # The 86400 stage falls due at 2026-08-31T08:00 and has no attempt.
+        (datetime(2026, 8, 30, 9, 1, tzinfo=timezone.utc), "not_yet_checked"),
+        (datetime(2026, 8, 31, 8, 30, tzinfo=timezone.utc), "deferred"),
+        (datetime(2026, 9, 2, 0, 0, tzinfo=timezone.utc), "aged_out_unselected"),
+    ],
+)
+def test_both_endpoints_agree_on_an_unattempted_rooms_state(
+    query_database,
+    snapshot_root,
+    moment,
+    expected,
+):
+    # The evidence page used to hardcode not_yet_checked while search consulted
+    # the windows, so one room could report two different states, and the
+    # evidence payload could contradict its own scheduled_checks.
+    application = query_service.QueryApplication(
+        query_service.ServiceConfig(
+            database_path=query_database,
+            snapshot_root=snapshot_root,
+            clock=lambda: moment,
+        )
+    )
+
+    record = application.room_record(room_id("unchecked-room"))
+    assert record["room"]["latest_lifecycle_state"] == expected
+    assert [check["state"] for check in record["room"]["scheduled_checks"]] == [
+        expected
+    ]
+
+    response = application.room_search_api(
+        {"q": "unchecked-room", "limit": "20", "format": "json"}
+    )
+    results = json.loads(response.body)["results"]
+    entry = next(r for r in results if r["name"] == "unchecked-room")
+    assert entry["latest_lifecycle_state"] == expected

@@ -125,11 +125,12 @@ def tick(
     signer_funnel=None,
     room_sampling=None,
     room_lifecycle=None,
+    room_lifecycle_sampling=None,
     collector_version="2.0.0",
     identity_census_started=None,
     identity_census_run=None,
 ):
-    return {
+    value = {
         "collector_version": collector_version,
         "ts": ts,
         "rooms_total": rooms,
@@ -160,6 +161,9 @@ def tick(
         "signer_funnel": signer_funnel,
         "room_lifecycle": room_lifecycle,
     }
+    if room_lifecycle_sampling is not None:
+        value["room_lifecycle_sampling"] = room_lifecycle_sampling
+    return value
 
 
 def census_run(
@@ -247,6 +251,210 @@ def lifecycle(*, failed=1, successful=8, second=3):
     }
 
 
+def lifecycle_2_12():
+    value = lifecycle(failed=0, successful=38, second=8)
+    value["rooms_in_ledger"] = 100_000
+    value["rooms_revisited"] = 38
+    value["rooms_successfully_revisited"] = 38
+    value["rooms_with_second_message"] = 8
+    value["reads_attempted"] = 38
+    value["reads_failed"] = 0
+    value["due_this_tick"] = 10_072
+    value["attempted_this_tick"] = 38
+    value["superseded_this_tick"] = 2
+    value["deferred_superseded_due_to_batch_limit"] = 0
+    value["deferred_due_to_read_budget"] = 10_034
+    value["deferred_due_to_deadline"] = 0
+    value["deferred_due_to_budget"] = 10_034
+    value["revisits"] = []
+
+    created_seq = 1
+    for stage, count, second_messages in ((3600, 13, 3), (86400, 25, 5)):
+        for index in range(count):
+            value["revisits"].append(
+                {
+                    "id": f"{created_seq:016x}",
+                    "created_seq": created_seq,
+                    "stage_seconds": stage,
+                    "elapsed_since_creation_seconds": stage + 60,
+                    "success": True,
+                    "outcome": "present_at_last_check",
+                    "message_count": 2 if index < second_messages else 1,
+                    "has_second_message": index < second_messages,
+                    "second_sender_class": (
+                        "signed_did" if index < second_messages else None
+                    ),
+                }
+            )
+            created_seq += 1
+    for _ in range(2):
+        value["revisits"].append(
+            {
+                "id": f"{created_seq:016x}",
+                "created_seq": created_seq,
+                "stage_seconds": 86400,
+                "elapsed_since_creation_seconds": None,
+                "success": False,
+                "outcome": "superseded_before_check",
+                "message_count": None,
+                "has_second_message": None,
+                "second_sender_class": None,
+            }
+        )
+        created_seq += 1
+
+    value["read_budget"] = {
+        "base_reads": 82,
+        "revisit_reads": 38,
+        "total_reads": 120,
+        "total_read_budget": 120,
+        "revisit_read_budget": 38,
+        "rate_window_seconds": 60,
+        "tick_revisit_deadline_seconds": 300,
+        "reads_per_minute": 120.0,
+        "published_reads_per_minute": 600,
+        "share": 0.2,
+        "maximum_share": 0.2,
+    }
+    return value
+
+
+def lifecycle_sampling():
+    return {
+        "aged_out_unselected": 77_151,
+        "selection": {
+            "allocation_rotation": 1,
+            "eligibility": {
+                "lower_bound": "due_at <= tick_timestamp",
+                "upper_bound": "tick_timestamp < due_at + stage_seconds",
+            },
+            "initial_allocation_by_stage": {
+                "300": 13,
+                "3600": 12,
+                "86400": 13,
+            },
+            "rank": {
+                "algorithm": "sha256",
+                "canonicalization": (
+                    "UTF-8 JSON; ensure_ascii=False; allow_nan=False; "
+                    "separators=(',', ':'); sort_keys=True"
+                ),
+                "inputs": [
+                    "selector_seed",
+                    "created_seq",
+                    "stage_seconds",
+                ],
+                "ordering": "ascending hexadecimal digest",
+            },
+            "read_budget": 38,
+            "redistributed_reads": 13,
+            "selected_by_stage": {
+                "300": 0,
+                "3600": 13,
+                "86400": 25,
+            },
+            "selector_seed": (
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            ),
+            "selector_version": 1,
+            "short_stage_seconds": 3600,
+            "tick_timestamp": "2026-08-31T12:00:00Z",
+        },
+        "coverage_by_stage": {
+            "300": {
+                "scheduled_due_rooms": 39_478,
+                "ineligible_superseded_before_due": 0,
+                "eligible_rooms": 39_478,
+                "attempted_checks": 0,
+                "completed_checks": 0,
+                "failed_checks": 0,
+                "deferred_checks": 0,
+                "aged_out_unselected": 39_478,
+                "superseded_after_eligibility": 0,
+                "coverage_fraction": {
+                    "numerator": 0,
+                    "denominator": 39_478,
+                },
+                "second_message_fraction": {
+                    "numerator": 0,
+                    "denominator": 0,
+                },
+            },
+            "3600": {
+                "scheduled_due_rooms": 39_478,
+                "ineligible_superseded_before_due": 0,
+                "eligible_rooms": 39_478,
+                "attempted_checks": 13,
+                "completed_checks": 13,
+                "failed_checks": 0,
+                "deferred_checks": 1_792,
+                "aged_out_unselected": 37_673,
+                "superseded_after_eligibility": 0,
+                "coverage_fraction": {
+                    "numerator": 13,
+                    "denominator": 39_478,
+                },
+                "second_message_fraction": {
+                    "numerator": 3,
+                    "denominator": 13,
+                },
+            },
+            "86400": {
+                "scheduled_due_rooms": 8_269,
+                "ineligible_superseded_before_due": 0,
+                "eligible_rooms": 8_269,
+                "attempted_checks": 25,
+                "completed_checks": 25,
+                "failed_checks": 0,
+                "deferred_checks": 8_242,
+                "aged_out_unselected": 0,
+                "superseded_after_eligibility": 2,
+                "coverage_fraction": {
+                    "numerator": 25,
+                    "denominator": 8_269,
+                },
+                "second_message_fraction": {
+                    "numerator": 5,
+                    "denominator": 25,
+                },
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "rotation,initial_allocation,short_stage_seconds,redistributed_reads",
+    (
+        (0, {"300": 12, "3600": 13, "86400": 13}, 300, 12),
+        (1, {"300": 13, "3600": 12, "86400": 13}, 3600, 13),
+        (2, {"300": 13, "3600": 13, "86400": 12}, 86400, 13),
+    ),
+)
+def test_lifecycle_sampling_accepts_each_collector_allocation_rotation(
+    rotation,
+    initial_allocation,
+    short_stage_seconds,
+    redistributed_reads,
+):
+    sampling = lifecycle_sampling()
+    selection = sampling["selection"]
+    selection["allocation_rotation"] = rotation
+    selection["initial_allocation_by_stage"] = initial_allocation
+    selection["short_stage_seconds"] = short_stage_seconds
+    selection["redistributed_reads"] = redistributed_reads
+
+    validated = derive.validate_room_lifecycle_sampling(
+        sampling,
+        derive.parse_ts(selection["tick_timestamp"]),
+    )
+
+    assert validated is not None
+    assert validated["selection"]["allocation_rotation"] == rotation
+    assert validated["selection"]["initial_allocation_by_stage"] == initial_allocation
+    assert validated["selection"]["short_stage_seconds"] == short_stage_seconds
+    assert validated["selection"]["redistributed_reads"] == redistributed_reads
+
+
 def html_template():
     keys = (
         "status",
@@ -286,6 +494,16 @@ def html_template():
         "lifecycle-senders",
         "lifecycle-senders-context",
         "lifecycle-coverage",
+        "lifecycle-sampling-selection",
+        "lifecycle-sampling-selection-context",
+        "lifecycle-sampling-aged-out",
+        "lifecycle-sampling-aged-out-context",
+        "lifecycle-stage-300",
+        "lifecycle-stage-300-context",
+        "lifecycle-stage-3600",
+        "lifecycle-stage-3600-context",
+        "lifecycle-stage-86400",
+        "lifecycle-stage-86400-context",
         "notes-cap-count",
         "notes-headroom",
         "notes-rate",
@@ -383,13 +601,16 @@ def embedded_data(source):
     return json.loads(match.group(1))
 
 
-def test_methodology_version_is_bumped_for_query_gated_room_disclosure():
+def test_methodology_version_is_bumped_for_lifecycle_sampling_evidence():
     result = derive_records([])
-    assert derive.METHODOLOGY_VERSION == "1.13.0"
+    assert derive.METHODOLOGY_VERSION == "1.14.0"
     assert result["methodology_version"] == derive.METHODOLOGY_VERSION
     assert (
-        "since collector 2.2.0 a sender without a nonce is never counted"
-        in result["methodology"]["signer_funnel"]
+        "scheduled_due_rooms is exactly ineligible_superseded_before_due"
+        in result["methodology"]["room_lifecycle"]
+    )
+    assert (
+        "completed checks / eligible rooms" in result["methodology"]["room_lifecycle"]
     )
 
 
@@ -807,7 +1028,7 @@ def test_superseded_batch_deferral_partitions_due_work_and_is_disclosed():
     assert "1 by the 305-record bounded local-finalization batch" in coverage
     assert "not an origin-read or deadline failure" in coverage
     assert (
-        "bounded local finalization"
+        "bounded local-finalization"
         in derive.methodology_definitions()["room_lifecycle"]
     )
 
@@ -2072,6 +2293,10 @@ def test_collector_assembled_current_and_legacy_ticks_validate(tmp_path, monkeyp
     legacy.pop("collector_version")
     legacy.pop("identity_census_started")
     legacy.pop("room_lifecycle")
+    # A pre-2.12.0 tick carried neither key. Dropping only the measurement would
+    # build a sampling-without-lifecycle tick that no collector has ever emitted,
+    # and that the deriver rightly refuses as incoherent evidence.
+    legacy.pop("room_lifecycle_sampling", None)
     legacy_funnel_value = legacy["signer_funnel"]
     legacy_funnel_value.pop("census_started_at")
     legacy_funnel_value["signed_counterparty"] = legacy_funnel_value.pop(
@@ -2944,3 +3169,502 @@ def test_funnel_census_block_reads_the_shared_display_contract_verbatim():
     values = ssr_values(result)
     assert values["funnel-census"] == display["census"]["value_text"]
     assert values["funnel-census-context"] == display["census"]["context"]
+
+
+def test_live_2_12_lifecycle_sampling_validates_and_derives_cleanly():
+    record = tick(
+        "2026-08-31T12:00:00Z",
+        collector_version="2.12.0",
+        room_lifecycle=lifecycle_2_12(),
+        room_lifecycle_sampling=lifecycle_sampling(),
+    )
+
+    raw_stage = record["room_lifecycle_sampling"]["coverage_by_stage"]["3600"]
+    assert "checked_and_quiet" not in raw_stage
+    assert raw_stage["coverage_fraction"] == {
+        "numerator": 13,
+        "denominator": 39_478,
+    }
+
+    validated = validate_tick(record)
+    assert validated["room_lifecycle"]["due_this_tick"] == 10_072
+    assert validated["room_lifecycle"]["attempted_this_tick"] == 38
+    assert validated["room_lifecycle"]["deferred_due_to_read_budget"] == 10_034
+    assert validated["room_lifecycle_sampling"]["aged_out_unselected"] == 77_151
+    validated_stage = validated["room_lifecycle_sampling"]["coverage_by_stage"]["3600"]
+    assert validated_stage["coverage_fraction"] == raw_stage["coverage_fraction"]
+    assert validated_stage["checked_and_quiet"] == 10
+    selection = validated["room_lifecycle_sampling"]["selection"]
+    assert set(selection) == {
+        "allocation_rotation",
+        "eligibility",
+        "initial_allocation_by_stage",
+        "rank",
+        "read_budget",
+        "redistributed_reads",
+        "selected_by_stage",
+        "selector_seed",
+        "selector_version",
+        "short_stage_seconds",
+        "tick_timestamp",
+    }
+    assert selection == lifecycle_sampling()["selection"]
+
+    point = derive_records([validated])["points"][0]
+    assert point["room_lifecycle_sampling"] == validated["room_lifecycle_sampling"]
+    assert (
+        "active-eligible scheduled revisits"
+        in (point["room_lifecycle_display"]["coverage_text"])
+    )
+
+
+def test_two_argument_lifecycle_display_renders_sampling_evidence_and_legacy_absence():
+    current = derive_records(
+        [
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=lifecycle_sampling(),
+            )
+        ]
+    )
+    current_coverage = current["points"][0]["room_lifecycle_display"]["coverage_text"]
+    assert "Sampling evidence: 38 / 38 lifecycle reads selected" in current_coverage
+    assert (
+        "77,151 eligible checks have aged out across the three stages since the "
+        "ledger began" in current_coverage
+    )
+
+    legacy = derive_records(
+        [
+            tick(
+                "2026-08-30T08:05:00Z",
+                collector_version="2.11.0",
+                room_lifecycle=lifecycle(),
+            )
+        ]
+    )
+    legacy_coverage = legacy["points"][0]["room_lifecycle_display"]["coverage_text"]
+    assert "sampling evidence was not recorded" in legacy_coverage
+    assert "no selector, stage allocation or aged-out count is inferred" in (
+        legacy_coverage
+    )
+
+
+def test_lifecycle_sampling_enforces_scheduled_due_identity():
+    sampling = lifecycle_sampling()
+    sampling["coverage_by_stage"]["300"]["scheduled_due_rooms"] += 1
+
+    with pytest.raises(ValueError, match="scheduled-due accounting"):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=sampling,
+            )
+        )
+
+
+def test_lifecycle_sampling_enforces_eligible_room_identity():
+    sampling = lifecycle_sampling()
+    sampling["coverage_by_stage"]["3600"]["deferred_checks"] += 1
+
+    with pytest.raises(ValueError, match="eligible-room accounting"):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=sampling,
+            )
+        )
+
+
+def test_lifecycle_sampling_enforces_attempted_check_identity():
+    sampling = lifecycle_sampling()
+    sampling["coverage_by_stage"]["86400"]["failed_checks"] += 1
+
+    with pytest.raises(ValueError, match="attempted-check accounting"):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=sampling,
+            )
+        )
+
+
+def test_lifecycle_sampling_requires_coverage_fraction():
+    sampling = lifecycle_sampling()
+    sampling["coverage_by_stage"]["300"].pop("coverage_fraction")
+
+    with pytest.raises(
+        ValueError,
+        match="coverage for stage 300 is incomplete",
+    ):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=sampling,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "fraction,match",
+    (
+        ({"numerator": 13}, "coverage_fraction is incomplete"),
+        (
+            {"numerator": 12, "denominator": 39_478},
+            "coverage-fraction accounting",
+        ),
+        (
+            {"numerator": 13, "denominator": 39_477},
+            "coverage-fraction accounting",
+        ),
+    ),
+)
+def test_lifecycle_sampling_validates_coverage_fraction(fraction, match):
+    sampling = lifecycle_sampling()
+    sampling["coverage_by_stage"]["3600"]["coverage_fraction"] = fraction
+
+    with pytest.raises(ValueError, match=match):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=sampling,
+            )
+        )
+
+
+def test_lifecycle_sampling_and_lifecycle_read_budgets_must_agree():
+    value = lifecycle_2_12()
+    sampling = lifecycle_sampling()
+    value["read_budget"]["revisit_read_budget"] += 1
+
+    with pytest.raises(
+        ValueError,
+        match="sampling and lifecycle accounting disagree",
+    ):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=value,
+                room_lifecycle_sampling=sampling,
+            )
+        )
+
+
+def test_cumulative_coverage_may_exceed_this_ticks_lifecycle_counters():
+    # coverage_by_stage counts every revisit row whose window has opened, for all
+    # time; room_lifecycle counts one tick. Once a second tick lands, the running
+    # total outgrows the snapshot. That is the normal case, not a corrupt tick.
+    value = lifecycle_2_12()
+    sampling = lifecycle_sampling()
+    stage = sampling["coverage_by_stage"]["3600"]
+    stage["eligible_rooms"] += 82
+    stage["scheduled_due_rooms"] += 82
+    stage["attempted_checks"] += 82
+    stage["completed_checks"] += 82
+    stage["coverage_fraction"]["numerator"] = stage["completed_checks"]
+    stage["coverage_fraction"]["denominator"] = stage["eligible_rooms"]
+    stage["second_message_fraction"]["denominator"] = stage["completed_checks"]
+
+    derived = validate_tick(
+        tick(
+            "2026-08-31T12:00:00Z",
+            collector_version="2.12.0",
+            room_lifecycle=value,
+            room_lifecycle_sampling=sampling,
+        )
+    )
+
+    cumulative = sum(
+        s["attempted_checks"]
+        for s in derived["room_lifecycle_sampling"]["coverage_by_stage"].values()
+    )
+    assert cumulative > derived["room_lifecycle"]["attempted_this_tick"]
+
+
+def test_current_lifecycle_requires_sampling_evidence():
+    with pytest.raises(ValueError, match="missing room_lifecycle_sampling"):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+            )
+        )
+
+
+def test_lifecycle_sampling_rule_descriptor_uses_the_real_selection_fields():
+    result = derive_records(
+        [
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=lifecycle_sampling(),
+            )
+        ]
+    )
+    display = result["points"][0]["room_lifecycle_sampling_display"]
+    context = display["selection"]["context"]
+
+    assert display["selection"]["value_text"] == "38 / 38 reads selected"
+    assert "deterministic rank {" in context
+    assert '"algorithm": "sha256"' in context
+    assert '"inputs": ["selector_seed", "created_seq", "stage_seconds"]' in context
+    assert '"lower_bound": "due_at <= tick_timestamp"' in context
+    assert '"upper_bound": "tick_timestamp < due_at + stage_seconds"' in context
+    assert "age gates eligibility but does not order the draw" in context
+    assert "selector seed 0123456789abcdef" in context
+    assert "tick timestamp 2026-08-31T12:00:00Z" in context
+    assert "allocation rotation 1" in context
+    assert "initial allocation by stage: 5-minute 13, 1-hour 12, 24-hour 13" in context
+    assert "short stage 3,600s" in context
+    assert "selector version 1" in context
+    assert "13 redistributed reads" in context
+    assert "selection rule not recorded" not in context
+
+
+def test_lifecycle_sampling_rejects_a_missing_selection_descriptor_field():
+    malformed = lifecycle_sampling()
+    malformed["selection"].pop("rank")
+
+    with pytest.raises(ValueError, match=r"selection is incomplete"):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=malformed,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    (
+        ("rank", False, r"selection\.rank"),
+        (
+            "rank",
+            {"algorithm": "sha256"},
+            r"selection\.rank",
+        ),
+        (
+            "rank",
+            {"algorithm": "sha256", "canonicalization": False},
+            r"selection\.rank",
+        ),
+        ("eligibility", "", r"selection\.eligibility"),
+        (
+            "eligibility",
+            {"lower_bound": "due_at <= tick_timestamp"},
+            r"selection\.eligibility",
+        ),
+        (
+            "eligibility",
+            {
+                "lower_bound": "due_at <= tick_timestamp",
+                "upper_bound": False,
+            },
+            r"selection\.eligibility\.upper_bound",
+        ),
+        ("selector_seed", "not-a-seed", r"selection\.selector_seed"),
+        ("allocation_rotation", 3, "allocation rotation"),
+        (
+            "initial_allocation_by_stage",
+            {"300": 13, "3600": 13, "86400": 13},
+            "initial allocation",
+        ),
+        (
+            "initial_allocation_by_stage",
+            {"300": 12, "3600": 13, "86400": 13},
+            "initial allocation",
+        ),
+        ("short_stage_seconds", 300, "short stage"),
+        ("tick_timestamp", "2026-08-31T12:01:00Z", "tick timestamp"),
+    ),
+)
+def test_lifecycle_sampling_validates_selection_descriptor_fields(
+    field,
+    value,
+    match,
+):
+    malformed = lifecycle_sampling()
+    malformed["selection"][field] = value
+
+    with pytest.raises(ValueError, match=match):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=malformed,
+            )
+        )
+
+
+def test_stage_coverage_keeps_each_outcome_state_distinct():
+    result = derive_records(
+        [
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=lifecycle_sampling(),
+            )
+        ]
+    )
+    display = result["points"][0]["room_lifecycle_sampling_display"]
+    one_hour = display["stages"]["3600"]
+    aged_out = display["aged_out"]
+
+    # A check read after its window closed lands here too, so the published text
+    # must not claim these were never attempted.
+    assert "no timely in-window attempt" in aged_out["context"]
+    assert "never selected or attempted" not in aged_out["context"]
+    assert "not a quiet check, failure, or deferral" in aged_out["context"]
+    assert one_hour["value_text"] == "13 / 39,478 completed"
+    assert "1,792 deferred" in one_hour["context"]
+    assert "0 failed" in one_hour["context"]
+    assert "37,673 aged out without a timely attempt" in one_hour["context"]
+    assert "10 checked and quiet" in one_hour["context"]
+    assert "3 / 13 recorded a second message (23.1%)" in one_hour["context"]
+    assert one_hour["value_text"] != "0.0%"
+
+
+def test_zero_second_message_denominator_is_explicitly_not_recorded():
+    result = derive_records(
+        [
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=lifecycle_sampling(),
+            )
+        ]
+    )
+    stage = result["points"][0]["room_lifecycle_sampling_display"]["stages"]["300"]
+    values = ssr_values(result)
+
+    assert stage["value_text"] == "0 / 39,478 completed"
+    assert "second-message fraction not recorded" in stage["context"]
+    assert "denominator is 0" in stage["context"]
+    assert "0%" not in stage["context"]
+    assert "—" not in stage["context"]
+    assert values["lifecycle-stage-300-context"] == stage["context"]
+
+
+def test_legacy_tick_has_explicit_not_recorded_sampling_states():
+    result = derive_records([tick("2026-08-28T08:00:00Z")])
+    point = result["points"][0]
+    display = point["room_lifecycle_sampling_display"]
+    values = ssr_values(result)
+
+    assert point["room_lifecycle_sampling"] is None
+    assert display["selection"]["value_text"] == "Not recorded"
+    assert display["aged_out"]["value_text"] == "Not recorded"
+    assert display["stages"]["300"]["value_text"] == "Not recorded"
+    assert "absence never means zero" in display["stages"]["300"]["context"]
+    assert values["lifecycle-sampling-selection"] == "Not recorded"
+    assert values["lifecycle-stage-86400"] == "Not recorded"
+
+
+def test_lifecycle_sampling_ssr_reads_shared_strings_verbatim(tmp_path):
+    data = derive_records(
+        [
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=lifecycle_sampling(),
+            )
+        ]
+    )
+    path = tmp_path / "index.html"
+    path.write_text(html_template(), encoding="utf-8")
+    inject_html(path, data)
+    source = path.read_text(encoding="utf-8")
+    embedded = embedded_data(source)
+    display = embedded["points"][0]["room_lifecycle_sampling_display"]
+
+    assert (
+        rendered_ssr(source, "lifecycle-sampling-selection")
+        == (display["selection"]["value_text"])
+    )
+    assert (
+        rendered_ssr(source, "lifecycle-sampling-aged-out-context")
+        == (display["aged_out"]["context"])
+    )
+    for stage in ("300", "3600", "86400"):
+        assert (
+            rendered_ssr(source, f"lifecycle-stage-{stage}")
+            == (display["stages"][stage]["value_text"])
+        )
+        assert (
+            rendered_ssr(
+                source,
+                f"lifecycle-stage-{stage}-context",
+            )
+            == display["stages"][stage]["context"]
+        )
+
+    page_source = Path("index.html").read_text(encoding="utf-8")
+    assert "function renderRoomLifecycleSampling(point)" in page_source
+    assert "renderRoomLifecycleSampling(point);" in page_source
+    assert ".innerHTML" not in page_source
+
+
+def test_a_completed_check_that_found_the_room_absent_is_not_quiet():
+    # The collector counts second messages only for checks that found the room
+    # present, so a 404 makes the present-check denominator smaller than
+    # completed_checks. Requiring equality refused every tick after the first
+    # timely 404, and since coverage is cumulative the refusal was permanent.
+    sampling = lifecycle_sampling()
+    stage = sampling["coverage_by_stage"]["3600"]
+    assert stage["completed_checks"] == 13
+    stage["second_message_fraction"]["denominator"] = 12
+
+    derived = validate_tick(
+        tick(
+            "2026-08-31T12:00:00Z",
+            collector_version="2.12.0",
+            room_lifecycle=lifecycle_2_12(),
+            room_lifecycle_sampling=sampling,
+        )
+    )
+
+    validated = derived["room_lifecycle_sampling"]["coverage_by_stage"]["3600"]
+    numerator = validated["second_message_fraction"]["numerator"]
+    # The absent room was checked, but there was no room there to be quiet.
+    assert validated["checked_and_quiet"] == 12 - numerator
+    assert validated["checked_and_quiet"] != 13 - numerator
+
+
+def test_second_message_denominator_cannot_exceed_completed_checks():
+    sampling = lifecycle_sampling()
+    stage = sampling["coverage_by_stage"]["3600"]
+    stage["second_message_fraction"]["denominator"] = stage["completed_checks"] + 1
+
+    with pytest.raises(
+        ValueError,
+        match="second-message accounting is inconsistent",
+    ):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=sampling,
+            )
+        )

@@ -567,6 +567,9 @@ def test_revisit_parser_failure_is_check_failed_and_attempt_is_invalid_response(
         connection,
         "2026-08-30T08:05:01Z",
         sampled_room_reads=1,
+        selector_version=collect.SELECTOR_VERSION,
+        selector_seed="0123456789abcdef0123456789abcdef",
+        allocation_rotation=0,
         deadline=collect.time.monotonic() + 1,
     )
     connection.close()

@@ -927,6 +927,30 @@ def methodology_resource() -> dict[str, Any]:
         ),
         "change_history": [
             {
+                "version": "1.14.0",
+                "published_on": "2026-09-01",
+                "changes": [
+                    "Published how scheduled room checks are sampled: the "
+                    "deterministic selection descriptor and its read budget, "
+                    "per-stage coverage as completed checks over eligible "
+                    "rooms, and the count of eligible checks that aged out "
+                    "without a timely attempt."
+                ],
+                "limitations": [
+                    "Per-stage coverage counts every scheduled check whose "
+                    "window has opened since the ledger began, while the "
+                    "selection and read-budget figures beside it describe only "
+                    "the tick being reported; the two are never summed or "
+                    "compared.",
+                    "The aged-out count includes checks that were read after "
+                    "their eligibility window closed, so it is not a count of "
+                    "checks that were never attempted.",
+                    "The second-message denominator counts only checks that "
+                    "found the room present; a check that found it absent "
+                    "observed no room that could carry a second message.",
+                ],
+            },
+            {
                 "version": "1.13.0",
                 "published_on": "2026-08-31",
                 "changes": [

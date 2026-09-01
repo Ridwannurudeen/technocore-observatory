@@ -7,6 +7,7 @@ from unittest import mock
 
 import pytest
 
+import derive
 import snapshots
 from api_contract import MAX_RESPONSE_BYTES, json_bytes, text_bytes
 from snapshots import build_snapshots, change_resource, load_telemetry
@@ -846,6 +847,7 @@ def test_methodology_discloses_current_room_name_policy_and_history_boundary():
     )
     history = methodology["change_history"]
     assert [entry["version"] for entry in history] == [
+        "1.14.0",
         "1.13.0",
         "1.12.0",
         "1.11.0",
@@ -861,18 +863,29 @@ def test_methodology_discloses_current_room_name_policy_and_history_boundary():
         set(entry) == {"version", "published_on", "changes", "limitations"}
         for entry in history
     )
+    # The newest entry must describe the version the page is stamping, or a
+    # reader cannot see what the live methodology changed.
+    assert history[0]["version"] == derive.METHODOLOGY_VERSION
     assert history[0] == {
-        "version": "1.13.0",
-        "published_on": "2026-08-31",
+        "version": "1.14.0",
+        "published_on": "2026-09-01",
         "changes": [
-            "Separated recreated room names into creation generations and marked "
-            "older scheduled checks as superseded without reading the origin."
+            "Published how scheduled room checks are sampled: the deterministic "
+            "selection descriptor and its read budget, per-stage coverage as "
+            "completed checks over eligible rooms, and the count of eligible "
+            "checks that aged out without a timely attempt."
         ],
         "limitations": [
-            "Creation generations begin only where the bounded events window was "
-            "locally observed; missing earlier generations are not reconstructed.",
-            "Superseded means a newer creation event was observed for the same "
-            "name, not that either generation was deleted or inactive.",
+            "Per-stage coverage counts every scheduled check whose window has "
+            "opened since the ledger began, while the selection and read-budget "
+            "figures beside it describe only the tick being reported; the two are "
+            "never summed or compared.",
+            "The aged-out count includes checks that were read after their "
+            "eligibility window closed, so it is not a count of checks that were "
+            "never attempted.",
+            "The second-message denominator counts only checks that found the "
+            "room present; a check that found it absent observed no room that "
+            "could carry a second message.",
         ],
     }
 
