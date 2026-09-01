@@ -80,8 +80,12 @@ Lifecycle state is one of:
   yet. It may still be checked.
 - `aged_out_unselected`: every scheduled window closed with no attempt. The room was never read at
   those stages and never will be. This is not a pending state, and it is not evidence of absence.
-  The observatory page publishes a same-named cumulative counter that additionally includes checks
-  attempted after their window closed; this API state is assigned only when no attempt was recorded.
+  Since collector 2.13.0 and methodology 1.15.0 the observatory page's same-named cumulative
+  counter describes the same population as this state — scheduled checks that were never attempted
+  — because a check attempted after its window closed is published separately as `attempted_late`.
+  Page ticks recorded before that version keep their historical counter, which also included late
+  attempts. The collector also finalizes each aged-out check as a terminal record in bounded
+  per-tick batches; finalization writes no attempt evidence and changes no API state.
 - `unknown`: legacy evidence cannot distinguish an outcome.
 
 Legacy `success=0` rows migrate to `check_failed`; they are never reinterpreted as absence. The
@@ -130,6 +134,14 @@ no origin request.
 newest-first `change_history`. Each revision has `version`, `published_on`, `changes` and
 `limitations`; `history_boundary` states where repository-backed detail begins, without inventing
 missing version numbers.
+
+Methodology `1.15.0` separates checks attempted after their eligibility window closed into a
+distinct `attempted_late` state and finalizes never-attempted aged-out checks as terminal records
+in bounded per-tick batches, publishing the count finalized each tick and the backlog still
+remaining. Ticks recorded before collector 2.13.0 keep their historical accounting: their
+cumulative aged-out counter also contained late attempts, and they publish `attempted_late` as not
+recorded. Finalization writes no attempt evidence, and a check finalized as aged out stays aged
+out even if supersession evidence for its window is observed later.
 
 Methodology `1.13.0` separates repeated creation events for the same room name into distinct
 creation generations. Once a newer generation is observed, scheduled checks for older generations

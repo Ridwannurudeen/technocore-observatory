@@ -847,6 +847,7 @@ def test_methodology_discloses_current_room_name_policy_and_history_boundary():
     )
     history = methodology["change_history"]
     assert [entry["version"] for entry in history] == [
+        "1.15.0",
         "1.14.0",
         "1.13.0",
         "1.12.0",
@@ -867,25 +868,22 @@ def test_methodology_discloses_current_room_name_policy_and_history_boundary():
     # reader cannot see what the live methodology changed.
     assert history[0]["version"] == derive.METHODOLOGY_VERSION
     assert history[0] == {
-        "version": "1.14.0",
+        "version": "1.15.0",
         "published_on": "2026-09-01",
         "changes": [
-            "Published how scheduled room checks are sampled: the deterministic "
-            "selection descriptor and its read budget, per-stage coverage as "
-            "completed checks over eligible rooms, and the count of eligible "
-            "checks that aged out without a timely attempt."
+            "Separated checks attempted after their eligibility window closed "
+            "into a distinct attempted_late state, and began finalizing "
+            "never-attempted aged-out checks as terminal records in bounded "
+            "per-tick batches, publishing the count finalized each tick and "
+            "the backlog still remaining."
         ],
         "limitations": [
-            "Per-stage coverage counts every scheduled check whose window has "
-            "opened since the ledger began, while the selection and read-budget "
-            "figures beside it describe only the tick being reported; the two are "
-            "never summed or compared.",
-            "The aged-out count includes checks that were read after their "
-            "eligibility window closed, so it is not a count of checks that were "
-            "never attempted.",
-            "The second-message denominator counts only checks that found the "
-            "room present; a check that found it absent observed no room that "
-            "could carry a second message.",
+            "Ticks recorded before collector 2.13.0 include late attempts in "
+            "their aged_out_unselected counts and publish attempted_late as "
+            "not recorded; their historical meaning is not rewritten.",
+            "Finalization is terminal bookkeeping that writes no attempt "
+            "evidence; a check finalized as aged out stays aged out even if "
+            "supersession evidence for its window is observed later.",
         ],
     }
 
