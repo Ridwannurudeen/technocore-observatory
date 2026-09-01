@@ -80,6 +80,8 @@ Lifecycle state is one of:
   yet. It may still be checked.
 - `aged_out_unselected`: every scheduled window closed with no attempt. The room was never read at
   those stages and never will be. This is not a pending state, and it is not evidence of absence.
+  The observatory page publishes a same-named cumulative counter that additionally includes checks
+  attempted after their window closed; this API state is assigned only when no attempt was recorded.
 - `unknown`: legacy evidence cannot distinguish an outcome.
 
 Legacy `success=0` rows migrate to `check_failed`; they are never reinterpreted as absence. The

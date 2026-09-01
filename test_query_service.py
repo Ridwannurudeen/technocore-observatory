@@ -240,6 +240,17 @@ def query_database(tmp_path):
     oversized_name = "oversize-marker-" + "x" * 70_000
     insert_room(connection, oversized_name, created_seq=203)
 
+    insert_room(connection, "unchecked-room", created_seq=210)
+    connection.execute(
+        """
+        INSERT INTO room_revisits (
+            room_created_seq, stage_seconds, due_at, attempted_at
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (210, 86400, "2026-08-31T08:00:00Z", None),
+    )
+
     insert_room(connection, "legacy-failed-room", created_seq=204)
     connection.execute(
         """
@@ -1225,6 +1236,7 @@ def test_room_evidence_includes_every_check_listing_presence_and_state_vocabular
             "superseded_before_check",
             0,
             "2026-08-30T09:00:00Z",
+            now=datetime(2026, 8, 30, 9, 1, tzinfo=timezone.utc),
         )
         == "superseded_before_check"
     )
@@ -2079,3 +2091,43 @@ def test_state_from_outcome_never_guesses_without_windows():
         )
         == "unknown"
     )
+
+
+@pytest.mark.parametrize(
+    ("moment", "expected"),
+    [
+        # The 86400 stage falls due at 2026-08-31T08:00 and has no attempt.
+        (datetime(2026, 8, 30, 9, 1, tzinfo=timezone.utc), "not_yet_checked"),
+        (datetime(2026, 8, 31, 8, 30, tzinfo=timezone.utc), "deferred"),
+        (datetime(2026, 9, 2, 0, 0, tzinfo=timezone.utc), "aged_out_unselected"),
+    ],
+)
+def test_both_endpoints_agree_on_an_unattempted_rooms_state(
+    query_database,
+    snapshot_root,
+    moment,
+    expected,
+):
+    # The evidence page used to hardcode not_yet_checked while search consulted
+    # the windows, so one room could report two different states, and the
+    # evidence payload could contradict its own scheduled_checks.
+    application = query_service.QueryApplication(
+        query_service.ServiceConfig(
+            database_path=query_database,
+            snapshot_root=snapshot_root,
+            clock=lambda: moment,
+        )
+    )
+
+    record = application.room_record(room_id("unchecked-room"))
+    assert record["room"]["latest_lifecycle_state"] == expected
+    assert [check["state"] for check in record["room"]["scheduled_checks"]] == [
+        expected
+    ]
+
+    response = application.room_search_api(
+        {"q": "unchecked-room", "limit": "20", "format": "json"}
+    )
+    results = json.loads(response.body)["results"]
+    entry = next(r for r in results if r["name"] == "unchecked-room")
+    assert entry["latest_lifecycle_state"] == expected

@@ -478,7 +478,7 @@ def state_from_outcome(
     *,
     has_scheduled_checks: bool = True,
     pending_windows: list[tuple[str, int]] | None = None,
-    now: datetime | None = None,
+    now: datetime,
 ) -> str:
     if attempted_at is None:
         if not has_scheduled_checks:
@@ -487,7 +487,7 @@ def state_from_outcome(
         # eligibility has closed, so the caller keeps the older, weaker claim.
         if not pending_windows:
             return "not_yet_checked"
-        instant = now if now is not None else utc_datetime()
+        instant = now
         open_window = False
         future_window = False
         for due_at, stage_seconds in pending_windows:
@@ -1007,7 +1007,17 @@ class QueryApplication:
                     key=lambda check: (check["attempted_at"], check["stage_seconds"]),
                 )["state"]
             elif check_records:
-                latest_state = "not_yet_checked"
+                latest_state = state_from_outcome(
+                    None,
+                    None,
+                    None,
+                    pending_windows=[
+                        (check["due_at"], check["stage_seconds"])
+                        for check in check_records
+                        if check["attempted_at"] is None
+                    ],
+                    now=self.config.clock(),
+                )
             else:
                 latest_state = "unknown"
             last_listed_at = room["last_listed_at"]
