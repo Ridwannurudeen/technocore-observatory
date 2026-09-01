@@ -34,7 +34,7 @@ HOURLY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DAILY_RETENTION_SECONDS = 365 * 24 * 60 * 60
 HOURLY_ROLLUP_SECONDS = 60 * 60
 DAILY_ROLLUP_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.13.0"
+METHODOLOGY_VERSION = "1.14.0"
 CENSUS_SHARD_COUNT = 256
 CENSUS_RUN_FIELDS = {
     "walk_started_at",
@@ -63,6 +63,7 @@ ROOM_SAMPLING_STRUCTURAL_CEILING = 200
 ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
 ROOM_REVISIT_STRUCTURAL_CEILING = 305
 ROOM_GENERATION_COLLECTOR_VERSION = (2, 11, 0)
+ROOM_LIFECYCLE_SAMPLING_COLLECTOR_VERSION = (2, 12, 0)
 ROOM_REVISIT_OUTCOMES = {
     "present_at_last_check",
     "absent_at_last_check",
@@ -451,10 +452,389 @@ def validate_event(value: Any) -> dict[str, Any]:
     }
 
 
+def validate_room_lifecycle_sampling(
+    value: Any,
+    tick_datetime: datetime,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "aged_out_unselected",
+        "selection",
+        "coverage_by_stage",
+    }:
+        raise ValueError(
+            "room_lifecycle_sampling is not a complete sampling-evidence object"
+        )
+
+    selection = value["selection"]
+    expected_selection_fields = {
+        "allocation_rotation",
+        "eligibility",
+        "initial_allocation_by_stage",
+        "rank",
+        "read_budget",
+        "redistributed_reads",
+        "selected_by_stage",
+        "selector_seed",
+        "selector_version",
+        "short_stage_seconds",
+        "tick_timestamp",
+    }
+    if not isinstance(selection, dict) or set(selection) != expected_selection_fields:
+        raise ValueError("room_lifecycle_sampling.selection is incomplete")
+
+    def descriptor_value(raw: Any, field: str, depth: int = 0) -> Any:
+        if isinstance(raw, str):
+            if not raw.strip() or len(raw) > 512:
+                raise ValueError(f"{field} is not valid text")
+            return raw
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, int):
+            return integer(raw, field)
+        if depth >= 3:
+            raise ValueError(f"{field} exceeds the descriptor depth limit")
+        if isinstance(raw, list) and 1 <= len(raw) <= 32:
+            return [
+                descriptor_value(item, f"{field}.{index}", depth + 1)
+                for index, item in enumerate(raw)
+            ]
+        if isinstance(raw, dict) and 1 <= len(raw) <= 32:
+            result: dict[str, Any] = {}
+            for key, item in raw.items():
+                if not isinstance(key, str) or not key.strip() or len(key) > 64:
+                    raise ValueError(f"{field} contains an invalid field name")
+                result[key] = descriptor_value(
+                    item,
+                    f"{field}.{key}",
+                    depth + 1,
+                )
+            return result
+        raise ValueError(f"{field} is not valid descriptor data")
+
+    rank_value = selection["rank"]
+    if not isinstance(rank_value, dict) or not {
+        "algorithm",
+        "canonicalization",
+    }.issubset(rank_value):
+        raise ValueError(
+            "room_lifecycle_sampling.selection.rank is not a complete descriptor"
+        )
+    rank = descriptor_value(
+        rank_value,
+        "room_lifecycle_sampling.selection.rank",
+    )
+    if (
+        not isinstance(rank["algorithm"], str)
+        or rank["algorithm"] != "sha256"
+        or not isinstance(rank["canonicalization"], str)
+        or not rank["canonicalization"].startswith("UTF-8 JSON")
+    ):
+        raise ValueError(
+            "room_lifecycle_sampling.selection.rank is not a supported descriptor"
+        )
+
+    eligibility_value = selection["eligibility"]
+    if not isinstance(eligibility_value, dict) or set(eligibility_value) != {
+        "lower_bound",
+        "upper_bound",
+    }:
+        raise ValueError(
+            "room_lifecycle_sampling.selection.eligibility is not a complete descriptor"
+        )
+    eligibility: dict[str, str] = {}
+    for field in ("lower_bound", "upper_bound"):
+        descriptor = eligibility_value[field]
+        if (
+            not isinstance(descriptor, str)
+            or not descriptor.strip()
+            or len(descriptor) > 256
+        ):
+            raise ValueError(
+                "room_lifecycle_sampling.selection."
+                f"eligibility.{field} is not valid text"
+            )
+        eligibility[field] = descriptor
+    if eligibility != {
+        "lower_bound": "due_at <= tick_timestamp",
+        "upper_bound": "tick_timestamp < due_at + stage_seconds",
+    }:
+        raise ValueError(
+            "room_lifecycle_sampling.selection.eligibility does not describe "
+            "the recorded eligibility window"
+        )
+
+    selector_seed = selection["selector_seed"]
+    if (
+        not isinstance(selector_seed, str)
+        or len(selector_seed) not in {16, 32, 64}
+        or re.fullmatch(r"[0-9a-f]+", selector_seed) is None
+    ):
+        raise ValueError(
+            "room_lifecycle_sampling.selection.selector_seed is not "
+            "lowercase hexadecimal"
+        )
+
+    tick_timestamp = selection["tick_timestamp"]
+    try:
+        selection_tick_datetime = parse_ts(tick_timestamp)
+    except ValueError as error:
+        raise ValueError(
+            "room_lifecycle_sampling.selection.tick_timestamp is not valid"
+        ) from error
+    if selection_tick_datetime != tick_datetime:
+        raise ValueError(
+            "room_lifecycle_sampling selection tick timestamp does not match "
+            "the tick timestamp"
+        )
+
+    stage_keys = tuple(str(stage) for stage in ROOM_REVISIT_STAGES_SECONDS)
+    selected_by_stage = selection["selected_by_stage"]
+    if not isinstance(selected_by_stage, dict) or set(selected_by_stage) != set(
+        stage_keys
+    ):
+        raise ValueError("room_lifecycle_sampling.selection stages are incomplete")
+    validated_selected = {
+        stage: integer(
+            selected_by_stage[stage],
+            f"room_lifecycle_sampling.selection.selected_by_stage.{stage}",
+        )
+        for stage in stage_keys
+    }
+
+    initial_allocation = selection["initial_allocation_by_stage"]
+    if not isinstance(initial_allocation, dict) or set(initial_allocation) != set(
+        stage_keys
+    ):
+        raise ValueError(
+            "room_lifecycle_sampling selection initial stages are incomplete"
+        )
+    validated_initial = {
+        stage: integer(
+            initial_allocation[stage],
+            (f"room_lifecycle_sampling.selection.initial_allocation_by_stage.{stage}"),
+        )
+        for stage in stage_keys
+    }
+
+    read_budget = integer(
+        selection["read_budget"],
+        "room_lifecycle_sampling.selection.read_budget",
+    )
+    allocation_rotation = integer(
+        selection["allocation_rotation"],
+        "room_lifecycle_sampling.selection.allocation_rotation",
+    )
+    if allocation_rotation >= len(stage_keys):
+        raise ValueError(
+            "room_lifecycle_sampling selection allocation rotation is invalid"
+        )
+
+    short_stage_seconds = integer(
+        selection["short_stage_seconds"],
+        "room_lifecycle_sampling.selection.short_stage_seconds",
+        1,
+    )
+    expected_short_stage_seconds = ROOM_REVISIT_STAGES_SECONDS[allocation_rotation]
+    if short_stage_seconds != expected_short_stage_seconds:
+        raise ValueError(
+            "room_lifecycle_sampling selection short stage is inconsistent"
+        )
+
+    # Validate the allocation contract without copying the collector's cyclic
+    # surplus-placement formula: the split is balanced, exhausts the budget,
+    # and the rotating stage receives the short allocation.
+    base_allocation = read_budget // len(stage_keys)
+    allowed_allocations = {base_allocation, base_allocation + 1}
+    if (
+        sum(validated_initial.values()) != read_budget
+        or any(
+            allocation not in allowed_allocations
+            for allocation in validated_initial.values()
+        )
+        or validated_initial[str(short_stage_seconds)] != base_allocation
+    ):
+        raise ValueError(
+            "room_lifecycle_sampling selection initial allocation is inconsistent"
+        )
+
+    redistributed_reads = integer(
+        selection["redistributed_reads"],
+        "room_lifecycle_sampling.selection.redistributed_reads",
+    )
+    selected_total = sum(validated_selected.values())
+    redistributed_total = sum(
+        max(0, validated_selected[stage] - validated_initial[stage])
+        for stage in stage_keys
+    )
+    if selected_total > read_budget or redistributed_reads != redistributed_total:
+        raise ValueError("room_lifecycle_sampling selection accounting is inconsistent")
+
+    coverage_by_stage = value["coverage_by_stage"]
+    if not isinstance(coverage_by_stage, dict) or set(coverage_by_stage) != set(
+        stage_keys
+    ):
+        raise ValueError("room_lifecycle_sampling coverage stages are incomplete")
+
+    expected_stage_fields = {
+        "scheduled_due_rooms",
+        "ineligible_superseded_before_due",
+        "eligible_rooms",
+        "attempted_checks",
+        "completed_checks",
+        "failed_checks",
+        "deferred_checks",
+        "aged_out_unselected",
+        "superseded_after_eligibility",
+        "coverage_fraction",
+        "second_message_fraction",
+    }
+    validated_coverage: dict[str, dict[str, Any]] = {}
+    total_aged_out = 0
+    for stage in stage_keys:
+        coverage = coverage_by_stage[stage]
+        if not isinstance(coverage, dict) or set(coverage) != expected_stage_fields:
+            raise ValueError(
+                f"room_lifecycle_sampling coverage for stage {stage} is incomplete"
+            )
+
+        validated = {
+            field: integer(
+                coverage[field],
+                f"room_lifecycle_sampling.coverage_by_stage.{stage}.{field}",
+            )
+            for field in expected_stage_fields
+            if field not in {"coverage_fraction", "second_message_fraction"}
+        }
+        if (
+            validated["scheduled_due_rooms"]
+            != validated["ineligible_superseded_before_due"]
+            + validated["eligible_rooms"]
+        ):
+            raise ValueError(
+                "room_lifecycle_sampling scheduled-due accounting is inconsistent"
+            )
+        if (
+            validated["eligible_rooms"]
+            != validated["attempted_checks"]
+            + validated["deferred_checks"]
+            + validated["aged_out_unselected"]
+            + validated["superseded_after_eligibility"]
+        ):
+            raise ValueError(
+                "room_lifecycle_sampling eligible-room accounting is inconsistent"
+            )
+        if (
+            validated["attempted_checks"]
+            != validated["completed_checks"] + validated["failed_checks"]
+        ):
+            raise ValueError(
+                "room_lifecycle_sampling attempted-check accounting is inconsistent"
+            )
+
+        coverage_fraction = coverage["coverage_fraction"]
+        if not isinstance(coverage_fraction, dict) or set(coverage_fraction) != {
+            "numerator",
+            "denominator",
+        }:
+            raise ValueError("room_lifecycle_sampling coverage_fraction is incomplete")
+        coverage_numerator = integer(
+            coverage_fraction["numerator"],
+            (
+                "room_lifecycle_sampling.coverage_by_stage."
+                f"{stage}.coverage_fraction.numerator"
+            ),
+        )
+        coverage_denominator = integer(
+            coverage_fraction["denominator"],
+            (
+                "room_lifecycle_sampling.coverage_by_stage."
+                f"{stage}.coverage_fraction.denominator"
+            ),
+        )
+        if (
+            coverage_numerator != validated["completed_checks"]
+            or coverage_denominator != validated["eligible_rooms"]
+            or coverage_numerator > coverage_denominator
+        ):
+            raise ValueError(
+                "room_lifecycle_sampling coverage-fraction accounting is inconsistent"
+            )
+        validated["coverage_fraction"] = {
+            "numerator": coverage_numerator,
+            "denominator": coverage_denominator,
+        }
+
+        fraction = coverage["second_message_fraction"]
+        if not isinstance(fraction, dict) or set(fraction) != {
+            "numerator",
+            "denominator",
+        }:
+            raise ValueError(
+                "room_lifecycle_sampling second_message_fraction is incomplete"
+            )
+        numerator = integer(
+            fraction["numerator"],
+            (
+                "room_lifecycle_sampling.coverage_by_stage."
+                f"{stage}.second_message_fraction.numerator"
+            ),
+        )
+        denominator = integer(
+            fraction["denominator"],
+            (
+                "room_lifecycle_sampling.coverage_by_stage."
+                f"{stage}.second_message_fraction.denominator"
+            ),
+        )
+        if denominator != validated["completed_checks"] or numerator > denominator:
+            raise ValueError(
+                "room_lifecycle_sampling second-message accounting is inconsistent"
+            )
+        validated["checked_and_quiet"] = validated["completed_checks"] - numerator
+        validated["second_message_fraction"] = {
+            "numerator": numerator,
+            "denominator": denominator,
+        }
+        validated_coverage[stage] = validated
+        total_aged_out += validated["aged_out_unselected"]
+
+    aged_out_unselected = integer(
+        value["aged_out_unselected"],
+        "room_lifecycle_sampling.aged_out_unselected",
+    )
+    if aged_out_unselected != total_aged_out:
+        raise ValueError("room_lifecycle_sampling aged-out accounting is inconsistent")
+
+    return {
+        "aged_out_unselected": aged_out_unselected,
+        "selection": {
+            "allocation_rotation": allocation_rotation,
+            "eligibility": eligibility,
+            "initial_allocation_by_stage": validated_initial,
+            "rank": rank,
+            "read_budget": read_budget,
+            "redistributed_reads": redistributed_reads,
+            "selected_by_stage": validated_selected,
+            "selector_seed": selector_seed,
+            "selector_version": integer(
+                selection["selector_version"],
+                "room_lifecycle_sampling.selection.selector_version",
+                1,
+            ),
+            "short_stage_seconds": short_stage_seconds,
+            "tick_timestamp": tick_timestamp,
+        },
+        "coverage_by_stage": validated_coverage,
+    }
+
+
 def validate_room_lifecycle(
     value: Any,
     *,
     require_generation_contract: bool = False,
+    sampling_contract: bool = False,
 ) -> dict[str, Any] | None:
     if value is None:
         return None
@@ -564,22 +944,31 @@ def validate_room_lifecycle(
         result["superseded_this_tick"] or 0
     )
     deferred_superseded = result["deferred_superseded_due_to_batch_limit"] or 0
-    if (
-        finalized_this_tick > result["due_this_tick"]
-        or result["deferred_due_to_budget"]
-        != result["due_this_tick"] - finalized_this_tick
-    ):
-        raise ValueError("room_lifecycle due-read accounting is inconsistent")
-    if (
-        has_wall_clock_contract
-        and result["deferred_due_to_read_budget"]
-        + result["deferred_due_to_deadline"]
-        + deferred_superseded
-        != result["deferred_due_to_budget"]
-    ):
-        raise ValueError(
-            "room_lifecycle deferral reasons do not partition deferred work"
+    if sampling_contract:
+        due_accounting_is_inconsistent = (
+            result["attempted_this_tick"] > result["due_this_tick"]
+            or result["deferred_due_to_budget"]
+            != result["due_this_tick"] - result["attempted_this_tick"]
         )
+    else:
+        due_accounting_is_inconsistent = (
+            finalized_this_tick > result["due_this_tick"]
+            or result["deferred_due_to_budget"]
+            != result["due_this_tick"] - finalized_this_tick
+        )
+    if due_accounting_is_inconsistent:
+        raise ValueError("room_lifecycle due-read accounting is inconsistent")
+
+    if has_wall_clock_contract:
+        expected_deferred = (
+            result["deferred_due_to_read_budget"] + result["deferred_due_to_deadline"]
+        )
+        if not sampling_contract:
+            expected_deferred += deferred_superseded
+        if expected_deferred != result["deferred_due_to_budget"]:
+            raise ValueError(
+                "room_lifecycle deferral reasons do not partition deferred work"
+            )
     if result["rooms_in_ledger"] == 0 and ledger_started_at is not None:
         raise ValueError("empty room ledger has a start timestamp")
     if result["rooms_in_ledger"] > 0 and ledger_started_at is None:
@@ -832,9 +1221,15 @@ def validate_room_lifecycle(
         raise ValueError("room_lifecycle read-budget accounting is inconsistent")
     if has_wall_clock_contract != (rate_window_seconds is not None):
         raise ValueError("room_lifecycle wall-clock fields are incomplete")
-    if has_wall_clock_contract and (
-        tick_revisit_deadline_seconds >= STALL_THRESHOLD_SECONDS
-        or result["deferred_due_to_read_budget"]
+    if (
+        has_wall_clock_contract
+        and tick_revisit_deadline_seconds >= STALL_THRESHOLD_SECONDS
+    ):
+        raise ValueError("room_lifecycle wall-clock budget is inconsistent")
+    if (
+        has_wall_clock_contract
+        and not sampling_contract
+        and result["deferred_due_to_read_budget"]
         != max(
             0,
             result["due_this_tick"]
@@ -1066,6 +1461,46 @@ def validate_tick(value: Any) -> dict[str, Any]:
         if raw_collector_version is None
         else version_string(raw_collector_version, "collector_version")
     )
+    require_lifecycle_sampling = collector_version_at_least(
+        collector_version,
+        ROOM_LIFECYCLE_SAMPLING_COLLECTOR_VERSION,
+    )
+    lifecycle_sampling = validate_room_lifecycle_sampling(
+        value.get("room_lifecycle_sampling"),
+        parsed_ts,
+    )
+    if require_lifecycle_sampling and lifecycle_sampling is None:
+        raise ValueError("current tick is missing room_lifecycle_sampling evidence")
+
+    lifecycle = validate_room_lifecycle(
+        value.get("room_lifecycle"),
+        require_generation_contract=(
+            collector_version_at_least(
+                collector_version,
+                ROOM_GENERATION_COLLECTOR_VERSION,
+            )
+            or lifecycle_sampling is not None
+        ),
+        sampling_contract=lifecycle_sampling is not None,
+    )
+    if lifecycle_sampling is not None:
+        if lifecycle is None:
+            raise ValueError(
+                "room_lifecycle_sampling has no room_lifecycle measurement"
+            )
+        # coverage_by_stage is cumulative: the collector counts every revisit row whose
+        # window has opened (`WHERE due_at <= selection_time`, with no lower bound),
+        # while room_lifecycle counts only this tick. A running total and a snapshot
+        # have no equality to enforce between them. The read budget is the one figure
+        # both sides take from this tick, so it is the only one worth cross-checking.
+        if (
+            lifecycle["read_budget"]["revisit_read_budget"]
+            != lifecycle_sampling["selection"]["read_budget"]
+        ):
+            raise ValueError(
+                "room_lifecycle sampling and lifecycle accounting disagree"
+            )
+
     result = {
         "collector_version": collector_version,
         "ledger_chain": (
@@ -1089,13 +1524,8 @@ def validate_tick(value: Any) -> dict[str, Any]:
         "newest_rooms": validated_rooms,
         "room_sampling": validate_room_sampling(value.get("room_sampling")),
         "signer_funnel": validate_funnel(value.get("signer_funnel")),
-        "room_lifecycle": validate_room_lifecycle(
-            value.get("room_lifecycle"),
-            require_generation_contract=collector_version_at_least(
-                collector_version,
-                ROOM_GENERATION_COLLECTOR_VERSION,
-            ),
-        ),
+        "room_lifecycle": lifecycle,
+        "room_lifecycle_sampling": lifecycle_sampling,
         "engagement": validate_engagement(value.get("engagement")),
     }
     if validated_events and validated_events[-1]["seq"] != result["events_last_seq"]:
@@ -1542,7 +1972,10 @@ def derived_room_sampling(
     }
 
 
-def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
+def room_lifecycle_display(
+    lifecycle: dict[str, Any] | None,
+    sampling: dict[str, Any] | None,
+) -> dict[str, Any]:
     if lifecycle is None:
         missing = {
             "value_text": "—",
@@ -1559,8 +1992,8 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
             "budget": dict(missing),
             "senders": dict(missing),
             "coverage_text": (
-                "Room lifecycle was not recorded for this tick. No value is "
-                "inferred from later ledger state."
+                "Room lifecycle and room-lifecycle sampling evidence were not "
+                "recorded for this tick. No value is inferred from later ledger state."
             ),
         }
 
@@ -1625,11 +2058,47 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
         else "No room with a second message has been observed yet"
     )
 
-    if lifecycle["deferred_due_to_deadline"] is None:
+    if sampling is None:
+        sampling_evidence_text = (
+            " Room-lifecycle sampling evidence was not recorded for this legacy "
+            "tick; no selector, stage allocation or aged-out count is inferred."
+        )
+    else:
+        selected_total = sum(sampling["selection"]["selected_by_stage"].values())
+        sampling_evidence_text = (
+            f" Sampling evidence: {format_int(selected_total)} / "
+            f"{format_int(sampling['selection']['read_budget'])} lifecycle reads "
+            f"selected; {format_int(sampling['aged_out_unselected'])} eligible "
+            "checks aged out unselected across the three stages."
+        )
+
+    if sampling is not None:
+        deferral_text = (
+            f"{format_int(lifecycle['deferred_due_to_budget'])} active-eligible "
+            f"checks deferred: "
+            f"{format_int(lifecycle['deferred_due_to_read_budget'])} by the "
+            f"recorded read budget and "
+            f"{format_int(lifecycle['deferred_due_to_deadline'])} because the "
+            "wall-clock deadline was reached"
+        )
+        deferred_superseded = lifecycle["deferred_superseded_due_to_batch_limit"]
+        superseded_batch_text = (
+            ""
+            if deferred_superseded is None or deferred_superseded == 0
+            else (
+                f" {format_int(deferred_superseded)} superseded "
+                f"{'cohort remains' if deferred_superseded == 1 else 'cohorts remain'} "
+                f"pending behind the "
+                f"{format_int(ROOM_REVISIT_STRUCTURAL_CEILING)}-record bounded "
+                "local-finalization batch."
+            )
+        )
+    elif lifecycle["deferred_due_to_deadline"] is None:
         deferral_text = (
             f"{format_int(lifecycle['deferred_due_to_budget'])} deferred by the "
             "recorded aggregate budget; the reason split was not recorded"
         )
+        superseded_batch_text = ""
     elif lifecycle["deferred_superseded_due_to_batch_limit"] is None:
         deferral_text = (
             f"{format_int(lifecycle['deferred_due_to_budget'])} deferred: "
@@ -1638,6 +2107,7 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
             f"{format_int(lifecycle['deferred_due_to_deadline'])} because the "
             "wall-clock deadline was reached"
         )
+        superseded_batch_text = ""
     else:
         deferral_text = (
             f"{format_int(lifecycle['deferred_due_to_budget'])} deferred: "
@@ -1649,6 +2119,7 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
             f"by the {format_int(ROOM_REVISIT_STRUCTURAL_CEILING)}-record bounded "
             "local-finalization batch"
         )
+        superseded_batch_text = ""
 
     superseded = lifecycle["superseded_this_tick"]
     superseded_text = (
@@ -1690,6 +2161,38 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
         )
     else:
         delay_text = "no revisit was attempted this tick"
+
+    if sampling is None:
+        coverage_text = (
+            f"{format_int(lifecycle['created_rooms_observed_this_tick'])} new ledger "
+            f"entries this tick · {format_int(lifecycle['due_this_tick'])} scheduled "
+            f"revisits due · {format_int(lifecycle['attempted_this_tick'])} origin "
+            f"reads attempted · {superseded_text}"
+            f"{deferral_text}. Read-cap and deadline deferrals were not attempted and "
+            "are neither failed reads nor evidence that a room had no second message. "
+            "A superseded batch deferral is bounded local bookkeeping and not an "
+            "origin-read or deadline failure. Nominal due "
+            "targets are 5 minutes, 1 hour and 24 hours after creation; they are "
+            f"scheduling targets, not measured delays · {delay_text}. Coverage begins "
+            "when this ledger begins and says nothing about older rooms."
+        )
+    else:
+        coverage_text = (
+            f"{format_int(lifecycle['created_rooms_observed_this_tick'])} new ledger "
+            f"entries this tick · {format_int(lifecycle['due_this_tick'])} "
+            "active-eligible scheduled revisits · "
+            f"{format_int(lifecycle['attempted_this_tick'])} origin reads attempted · "
+            f"{superseded_text}{deferral_text}.{superseded_batch_text} "
+            "Read-budget and deadline deferrals were not attempted and are neither "
+            "failed reads nor evidence that a room had no second message. Superseded "
+            "cohorts and bounded local-finalization backlog are not active-eligible "
+            "origin reads. Nominal due targets are 5 minutes, 1 hour and 24 hours "
+            "after creation; they are scheduling targets, not measured delays · "
+            f"{delay_text}. Coverage begins when this ledger begins and says nothing "
+            "about older rooms."
+        )
+
+    coverage_text += sampling_evidence_text
 
     return {
         "ledger": {
@@ -1735,19 +2238,110 @@ def room_lifecycle_display(lifecycle: dict[str, Any] | None) -> dict[str, Any]:
             "value_text": format_int(sender_denominator),
             "context": sender_context,
         },
-        "coverage_text": (
-            f"{format_int(lifecycle['created_rooms_observed_this_tick'])} new ledger "
-            f"entries this tick · {format_int(lifecycle['due_this_tick'])} scheduled "
-            f"revisits due · {format_int(lifecycle['attempted_this_tick'])} origin "
-            f"reads attempted · {superseded_text}"
-            f"{deferral_text}. Read-cap and deadline deferrals were not attempted and "
-            "are neither failed reads nor evidence that a room had no second message. "
-            "A superseded batch deferral is bounded local bookkeeping and not an "
-            "origin-read or deadline failure. Nominal due "
-            "targets are 5 minutes, 1 hour and 24 hours after creation; they are "
-            f"scheduling targets, not measured delays · {delay_text}. Coverage begins "
-            "when this ledger begins and says nothing about older rooms."
-        ),
+        "coverage_text": coverage_text,
+    }
+
+
+def room_lifecycle_sampling_display(
+    sampling: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if sampling is None:
+        missing = {
+            "value_text": "Not recorded",
+            "context": (
+                "not recorded · this tick predates room-lifecycle sampling evidence; "
+                "absence never means zero"
+            ),
+        }
+        return {
+            "selection": dict(missing),
+            "aged_out": dict(missing),
+            "stages": {
+                str(stage): dict(missing) for stage in ROOM_REVISIT_STAGES_SECONDS
+            },
+        }
+
+    selection = sampling["selection"]
+    selected_by_stage = selection["selected_by_stage"]
+    selected_total = sum(selected_by_stage.values())
+    initial_by_stage = selection["initial_allocation_by_stage"]
+    rank_text = json.dumps(selection["rank"], ensure_ascii=False, sort_keys=True)
+    eligibility_text = json.dumps(
+        selection["eligibility"],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    rule_text = (
+        f"deterministic rank {rank_text} · eligibility {eligibility_text} · "
+        "age gates eligibility but does not order the draw · "
+        f"selector seed {selection['selector_seed']} · tick timestamp "
+        f"{selection['tick_timestamp']} · allocation rotation "
+        f"{format_int(selection['allocation_rotation'])} · initial allocation "
+        f"by stage: 5-minute {format_int(initial_by_stage['300'])}, "
+        f"1-hour {format_int(initial_by_stage['3600'])}, "
+        f"24-hour {format_int(initial_by_stage['86400'])} · short stage "
+        f"{format_int(selection['short_stage_seconds'])}s"
+    )
+    stage_labels = {
+        "300": "5-minute",
+        "3600": "1-hour",
+        "86400": "24-hour",
+    }
+    stages: dict[str, dict[str, str]] = {}
+    for stage, coverage in sampling["coverage_by_stage"].items():
+        coverage_fraction = coverage["coverage_fraction"]
+        fraction = coverage["second_message_fraction"]
+        if fraction["denominator"] == 0:
+            fraction_text = (
+                "second-message fraction not recorded because the "
+                "completed-check denominator is 0"
+            )
+        else:
+            fraction_text = (
+                f"{format_int(fraction['numerator'])} / "
+                f"{format_int(fraction['denominator'])} recorded a second message "
+                f"({format_percent(fraction['numerator'] / fraction['denominator'])})"
+            )
+        stages[stage] = {
+            "value_text": (
+                f"{format_int(coverage_fraction['numerator'])} / "
+                f"{format_int(coverage_fraction['denominator'])} completed"
+            ),
+            "context": (
+                f"{stage_labels[stage]} stage · "
+                f"{format_int(coverage['deferred_checks'])} deferred · "
+                f"{format_int(coverage['failed_checks'])} failed · "
+                f"{format_int(coverage['aged_out_unselected'])} aged out unselected "
+                "without an attempt · "
+                f"{format_int(coverage['checked_and_quiet'])} checked and quiet · "
+                f"{fraction_text}"
+            ),
+        }
+
+    return {
+        "selection": {
+            "value_text": (
+                f"{format_int(selected_total)} / "
+                f"{format_int(selection['read_budget'])} reads selected"
+            ),
+            "context": (
+                f"{rule_text} · selector version "
+                f"{format_int(selection['selector_version'])} · selected by stage: "
+                f"5-minute {format_int(selected_by_stage['300'])}, "
+                f"1-hour {format_int(selected_by_stage['3600'])}, "
+                f"24-hour {format_int(selected_by_stage['86400'])} · "
+                f"{format_int(selection['redistributed_reads'])} redistributed reads"
+            ),
+        },
+        "aged_out": {
+            "value_text": format_int(sampling["aged_out_unselected"]),
+            "context": (
+                "eligible scheduled checks that were never selected or attempted "
+                "before their stage window expired · not a quiet check, failure, "
+                "or deferral"
+            ),
+        },
+        "stages": stages,
     }
 
 
@@ -2377,21 +2971,38 @@ def methodology_definitions() -> dict[str, str]:
             "claims about actual revisit age. New-format attempted revisits publish "
             "actual elapsed seconds from creation to the read attempt; legacy ticks "
             "without that field report it as not recorded and no delay is inferred. "
-            "New ticks permit at most 8 revisit reads. With 82 base logical reads, the "
-            "maximum is 90 reads in the enforced minimum 60-second scheduling window: "
-            "90.0 reads/minute, or 15.0% of the published 600-read/minute/IP budget. "
-            "This rate accounting no longer uses tick duration as its denominator. "
-            "Revisit reads may be issued only during the first 300 seconds from tick "
-            "start, leaving 300 seconds below the published 600-second stall threshold. "
-            "A base phase that reaches that deadline receives no revisit work, so due "
-            "work yields rather than extending the tick. Due work excluded by the "
-            "eight-read cap and due work skipped because the wall-clock deadline was "
-            "reached are published separately. Superseded cohorts held for a later "
-            "tick by the 305-record bounded local finalization batch are published as "
-            "a third deferral reason; this is local bookkeeping, not origin-read work "
-            "or a deadline failure. The three reasons sum to the aggregate deferred "
-            "count. Deferred work is not attempted, is not a failed read, and is never "
-            "evidence of absent room activity."
+            "Ticks carrying room_lifecycle_sampling publish the lifecycle scheduler's "
+            "selection and per-stage coverage evidence. For each nominal stage, "
+            "scheduled_due_rooms is exactly ineligible_superseded_before_due plus "
+            "eligible_rooms; eligible_rooms is exactly attempted_checks plus "
+            "deferred_checks plus aged_out_unselected plus "
+            "superseded_after_eligibility; and attempted_checks is exactly "
+            "completed_checks plus failed_checks. The top-level aged_out_unselected "
+            "is the sum across stages. Per-stage coverage is printed as completed "
+            "checks / eligible rooms, never as a bare percentage. Deferred checks, "
+            "failed checks, aged-out unselected checks and completed checks that were "
+            "checked and quiet remain separate published states. A second-message "
+            "fraction is printed only with its numerator and completed-check "
+            "denominator; a zero denominator is reported as not recorded, never as "
+            "0%. Selection evidence publishes the rank and eligibility descriptors, "
+            "selector seed, tick timestamp, allocation rotation, initial per-stage "
+            "allocation and short-stage duration that define the deterministic "
+            "selection. The deriver validates the tick timestamp, seed shape, rotating "
+            "initial allocation and redistribution accounting, then prints the "
+            "collector's descriptors without fabricating a rule field. For these "
+            "ticks, room_lifecycle.due_this_tick counts only active eligibility: "
+            "attempted "
+            "checks plus read-budget and deadline deferrals. "
+            "deferred_due_to_budget is exactly deferred_due_to_read_budget plus "
+            "deferred_due_to_deadline. Superseded cohorts and aged-out unselected "
+            "checks are outside that active-eligibility count. Earlier ticks retain "
+            "their historical accounting contract and publish lifecycle-sampling "
+            "fields as not recorded. Revisit reads remain bounded by the recorded "
+            "per-tick read budget and may be issued only before the recorded deadline; "
+            "the rate is normalized to the recorded scheduling window rather than "
+            "tick duration. Superseded cohorts held behind the 305-record bounded "
+            "local-finalization batch remain separate local bookkeeping, not a read "
+            "deferral, failed read or claim of absent room activity."
         ),
         "service_engagement": (
             "The service publishes an engagement object on /rooms — nick_diversity, "
@@ -2882,7 +3493,14 @@ def derive_records(
                 latest_census,
             ),
             "room_lifecycle": tick["room_lifecycle"],
-            "room_lifecycle_display": room_lifecycle_display(tick["room_lifecycle"]),
+            "room_lifecycle_display": room_lifecycle_display(
+                tick["room_lifecycle"],
+                tick["room_lifecycle_sampling"],
+            ),
+            "room_lifecycle_sampling": tick["room_lifecycle_sampling"],
+            "room_lifecycle_sampling_display": room_lifecycle_sampling_display(
+                tick["room_lifecycle_sampling"]
+            ),
             "engagement": tick["engagement"],
             "engagement_display": engagement_display(tick["engagement"]),
             "composition": {
@@ -3179,6 +3797,34 @@ def room_lifecycle_ssr(display: Any) -> dict[str, str]:
     return values
 
 
+def room_lifecycle_sampling_ssr(display: Any) -> dict[str, str]:
+    fallback = room_lifecycle_sampling_display(None)
+    source = display if isinstance(display, dict) else fallback
+    selection = source.get("selection")
+    if not isinstance(selection, dict):
+        selection = fallback["selection"]
+    aged_out = source.get("aged_out")
+    if not isinstance(aged_out, dict):
+        aged_out = fallback["aged_out"]
+    stages = source.get("stages")
+    if not isinstance(stages, dict):
+        stages = fallback["stages"]
+
+    values = {
+        "lifecycle-sampling-selection": str(selection["value_text"]),
+        "lifecycle-sampling-selection-context": str(selection["context"]),
+        "lifecycle-sampling-aged-out": str(aged_out["value_text"]),
+        "lifecycle-sampling-aged-out-context": str(aged_out["context"]),
+    }
+    for stage in ("300", "3600", "86400"):
+        entry = stages.get(stage)
+        if not isinstance(entry, dict):
+            entry = fallback["stages"][stage]
+        values[f"lifecycle-stage-{stage}"] = str(entry["value_text"])
+        values[f"lifecycle-stage-{stage}-context"] = str(entry["context"])
+    return values
+
+
 def engagement_ssr(display: Any) -> dict[str, str]:
     """Server-rendered engagement tiles, read verbatim from the shared display
     contract. The fallback strings match the page JavaScript's fallbacks
@@ -3291,6 +3937,7 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
             "engagement-nick": "—",
             "engagement-nick-context": "No engagement observation yet",
             **room_lifecycle_ssr(None),
+            **room_lifecycle_sampling_ssr(None),
             "notes-cap-count": missing_capacity["count_text"],
             "notes-headroom": missing_capacity["headroom_text"],
             "notes-rate": missing_capacity["rate_text"],
@@ -3387,6 +4034,7 @@ def ssr_values(data: dict[str, Any]) -> dict[str, str]:
         "stillborn-samples": stillborn["context"],
         **engagement_ssr(point.get("engagement_display")),
         **room_lifecycle_ssr(point.get("room_lifecycle_display")),
+        **room_lifecycle_sampling_ssr(point.get("room_lifecycle_sampling_display")),
         "notes-cap-count": notes["count_text"],
         "notes-headroom": notes["headroom_text"],
         "notes-rate": notes["rate_text"],

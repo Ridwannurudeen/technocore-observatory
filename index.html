@@ -1348,9 +1348,43 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--missing) }
   </div>
 
   <div class="block">
-    <p class="block-label">First-message-only · a separate live signal</p>
+    <p class="block-label">Lifecycle sampling evidence</p>
     <div class="stat-row">
       <span class="rank">07</span>
+      <span class="stat-name">Deterministic selection</span>
+      <span class="stat-figure" id="lifecycle-sampling-selection" data-ssr="lifecycle-sampling-selection">Not recorded</span>
+      <span class="stat-context" id="lifecycle-sampling-selection-context" data-ssr="lifecycle-sampling-selection-context">not recorded · this tick predates room-lifecycle sampling evidence; absence never means zero</span>
+    </div>
+    <div class="stat-row">
+      <span class="rank">08</span>
+      <span class="stat-name">Aged out unselected</span>
+      <span class="stat-figure" id="lifecycle-sampling-aged-out" data-ssr="lifecycle-sampling-aged-out">Not recorded</span>
+      <span class="stat-context" id="lifecycle-sampling-aged-out-context" data-ssr="lifecycle-sampling-aged-out-context">not recorded · this tick predates room-lifecycle sampling evidence; absence never means zero</span>
+    </div>
+    <div class="stat-row">
+      <span class="rank">09</span>
+      <span class="stat-name">5-minute completed / eligible</span>
+      <span class="stat-figure" id="lifecycle-stage-300" data-ssr="lifecycle-stage-300">Not recorded</span>
+      <span class="stat-context" id="lifecycle-stage-300-context" data-ssr="lifecycle-stage-300-context">not recorded · this tick predates room-lifecycle sampling evidence; absence never means zero</span>
+    </div>
+    <div class="stat-row">
+      <span class="rank">10</span>
+      <span class="stat-name">1-hour completed / eligible</span>
+      <span class="stat-figure" id="lifecycle-stage-3600" data-ssr="lifecycle-stage-3600">Not recorded</span>
+      <span class="stat-context" id="lifecycle-stage-3600-context" data-ssr="lifecycle-stage-3600-context">not recorded · this tick predates room-lifecycle sampling evidence; absence never means zero</span>
+    </div>
+    <div class="stat-row">
+      <span class="rank">11</span>
+      <span class="stat-name">24-hour completed / eligible</span>
+      <span class="stat-figure" id="lifecycle-stage-86400" data-ssr="lifecycle-stage-86400">Not recorded</span>
+      <span class="stat-context" id="lifecycle-stage-86400-context" data-ssr="lifecycle-stage-86400-context">not recorded · this tick predates room-lifecycle sampling evidence; absence never means zero</span>
+    </div>
+  </div>
+
+  <div class="block">
+    <p class="block-label">First-message-only · a separate live signal</p>
+    <div class="stat-row">
+      <span class="rank">12</span>
       <span class="stat-name">First-message-only share</span>
       <span class="stat-figure lead" id="stillborn" data-ssr="stillborn">100.0%</span>
       <span class="stat-context" id="stillborn-samples" data-ssr="stillborn-samples">2 / 2 matched new rooms</span>
@@ -1947,6 +1981,44 @@ function renderRoomLifecycle(point) {
       ? display.coverage_text
       : "Room lifecycle has not been recorded.";
 }
+function renderRoomLifecycleSampling(point) {
+  const display = point.room_lifecycle_sampling_display;
+  if (!display) return;
+  const entries = {
+    selection: [
+      "lifecycle-sampling-selection",
+      "lifecycle-sampling-selection-context",
+    ],
+    aged_out: [
+      "lifecycle-sampling-aged-out",
+      "lifecycle-sampling-aged-out-context",
+    ],
+  };
+  Object.entries(entries).forEach(([key, ids]) => {
+    const entry = display[key];
+    if (
+      !entry ||
+      typeof entry.value_text !== "string" ||
+      typeof entry.context !== "string"
+    )
+      return;
+    byId(ids[0]).textContent = entry.value_text;
+    byId(ids[1]).textContent = entry.context;
+  });
+  const stages = display.stages;
+  if (!stages || typeof stages !== "object") return;
+  ["300", "3600", "86400"].forEach((stage) => {
+    const entry = stages[stage];
+    if (
+      !entry ||
+      typeof entry.value_text !== "string" ||
+      typeof entry.context !== "string"
+    )
+      return;
+    byId(`lifecycle-stage-${stage}`).textContent = entry.value_text;
+    byId(`lifecycle-stage-${stage}-context`).textContent = entry.context;
+  });
+}
 function renderCapacityMetric(tile, prefix) {
   // Counts, headroom, the trailing-window caption and any cap change are one
   // deriver-owned contract, so the bar and its printed totals cannot disagree.
@@ -2399,6 +2471,7 @@ function update(index, live = true) {
     "engagement-nick-context",
   );
   renderRoomLifecycle(point);
+  renderRoomLifecycleSampling(point);
 
   const capacity = point.capacity_display;
   renderCapacityMetric(capacity && capacity.notes, "notes");
