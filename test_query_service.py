@@ -117,6 +117,7 @@ def query_database(tmp_path):
             has_second_message INTEGER,
             second_sender_class TEXT,
             outcome TEXT,
+            aged_out_at TEXT,
             PRIMARY KEY (room_created_seq, stage_seconds),
             FOREIGN KEY (room_created_seq) REFERENCES room_ledger(created_seq)
         );
@@ -249,6 +250,23 @@ def query_database(tmp_path):
         VALUES (?, ?, ?, ?)
         """,
         (210, 86400, "2026-08-31T08:00:00Z", None),
+    )
+
+    # Terminally finalized aged-out room: never attempted, every window
+    # closed, aged_out_at stamped by the collector's bounded finalizer.
+    insert_room(connection, "finalized-room", created_seq=211)
+    connection.executemany(
+        """
+        INSERT INTO room_revisits (
+            room_created_seq, stage_seconds, due_at, attempted_at, aged_out_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            (211, 300, "2026-08-30T08:05:00Z", None, "2026-09-01T00:00:00Z"),
+            (211, 3600, "2026-08-30T09:00:00Z", None, "2026-09-01T00:00:00Z"),
+            (211, 86400, "2026-08-31T08:00:00Z", None, "2026-09-01T00:00:00Z"),
+        ),
     )
 
     insert_room(connection, "legacy-failed-room", created_seq=204)
@@ -2131,3 +2149,35 @@ def test_both_endpoints_agree_on_an_unattempted_rooms_state(
     results = json.loads(response.body)["results"]
     entry = next(r for r in results if r["name"] == "unchecked-room")
     assert entry["latest_lifecycle_state"] == expected
+
+
+def test_finalized_aged_out_room_still_reports_aged_out_everywhere(
+    query_database,
+    snapshot_root,
+):
+    # Terminal finalization stamps aged_out_at while attempted_at stays NULL.
+    # The finalized rows must keep contributing their closed windows: the
+    # room may never drift to not_yet_checked or unknown, and it must not
+    # drop out of has_scheduled_checks.
+    application = query_service.QueryApplication(
+        query_service.ServiceConfig(
+            database_path=query_database,
+            snapshot_root=snapshot_root,
+            clock=lambda: datetime(2026, 9, 2, 0, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    record = application.room_record(room_id("finalized-room"))
+    assert record["room"]["latest_lifecycle_state"] == "aged_out_unselected"
+    assert [check["state"] for check in record["room"]["scheduled_checks"]] == [
+        "aged_out_unselected",
+        "aged_out_unselected",
+        "aged_out_unselected",
+    ]
+
+    response = application.room_search_api(
+        {"q": "finalized-room", "limit": "20", "format": "json"}
+    )
+    results = json.loads(response.body)["results"]
+    entry = next(r for r in results if r["name"] == "finalized-room")
+    assert entry["latest_lifecycle_state"] == "aged_out_unselected"

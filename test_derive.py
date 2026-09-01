@@ -603,7 +603,7 @@ def embedded_data(source):
 
 def test_methodology_version_is_bumped_for_lifecycle_sampling_evidence():
     result = derive_records([])
-    assert derive.METHODOLOGY_VERSION == "1.14.0"
+    assert derive.METHODOLOGY_VERSION == "1.15.0"
     assert result["methodology_version"] == derive.METHODOLOGY_VERSION
     assert (
         "scheduled_due_rooms is exactly ineligible_superseded_before_due"
@@ -3250,6 +3250,237 @@ def test_two_argument_lifecycle_display_renders_sampling_evidence_and_legacy_abs
     assert "no selector, stage allocation or aged-out count is inferred" in (
         legacy_coverage
     )
+
+
+def collector_finalization_tick(tmp_path, monkeypatch):
+    """A real 2.13.0 tick produced by the collector, never hand-shaped.
+
+    One room is read late (selected inside its 5-minute window, the read
+    recorded after the window closed); its remaining stages age out and are
+    finalized terminally by the next tick.
+    """
+    connection = collect.connect_signer_database(tmp_path / "signers.sqlite3")
+    try:
+        collect.record_created_rooms(
+            connection,
+            [
+                {
+                    "seq": 1,
+                    "ts": "2026-08-30T08:00:00Z",
+                    "name": "late-room",
+                    "classes": [],
+                    "primary_class": "human_or_other",
+                    "base_name": "late-room",
+                }
+            ],
+            "2026-08-30T08:00:01Z",
+        )
+
+        class LateClient:
+            def get(self, path, deadline=None):
+                return json.dumps(
+                    {
+                        "messages": [
+                            {
+                                "seq": seq,
+                                "ts": "2026-08-30T08:00:00Z",
+                                "from": "server",
+                                "text": "x",
+                            }
+                            for seq in (1, 2)
+                        ]
+                    }
+                )
+
+        monkeypatch.setattr(collect, "utc_now", lambda: "2026-08-30T08:11:00Z")
+        collect.collect_room_revisits(
+            LateClient(),
+            connection,
+            "2026-08-30T08:06:00Z",
+            sampled_room_reads=82,
+            selector_version=collect.SELECTOR_VERSION,
+            selector_seed="0123456789abcdef0123456789abcdef",
+            allocation_rotation=0,
+            deadline=float("inf"),
+        )
+
+        class MustNotReadClient:
+            def get(self, path, deadline=None):
+                raise AssertionError(f"unexpected origin read: {path}")
+
+        tick_ts = "2026-09-01T09:00:00Z"
+        monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+        lifecycle = collect.collect_room_revisits(
+            MustNotReadClient(),
+            connection,
+            tick_ts,
+            sampled_room_reads=82,
+            selector_version=collect.SELECTOR_VERSION,
+            selector_seed="0123456789abcdef0123456789abcdef",
+            allocation_rotation=0,
+            deadline=float("inf"),
+        )
+    finally:
+        connection.close()
+
+    sampling = lifecycle.pop("sampling")
+    lifecycle["created_rooms_observed_this_tick"] = 0
+    lifecycle["read_budget"] = collect.read_budget_summary(
+        82,
+        lifecycle["attempted_this_tick"],
+    )
+    return tick(
+        tick_ts,
+        collector_version=collect.COLLECTOR_VERSION,
+        room_lifecycle=lifecycle,
+        room_lifecycle_sampling=sampling,
+    )
+
+
+def test_live_2_13_finalization_evidence_validates_and_derives_cleanly(
+    tmp_path,
+    monkeypatch,
+):
+    record = collector_finalization_tick(tmp_path, monkeypatch)
+    sampling = record["room_lifecycle_sampling"]
+    assert sampling["aged_out_finalization"] == {
+        "finalized_this_tick": 2,
+        "backlog_remaining": 0,
+        "batch_limit": collect.ROOM_REVISIT_AGED_OUT_FINALIZATION_LIMIT,
+    }
+
+    validated = validate_tick(record)
+    validated_sampling = validated["room_lifecycle_sampling"]
+    assert (
+        validated_sampling["aged_out_finalization"] == sampling["aged_out_finalization"]
+    )
+    late_stage = validated_sampling["coverage_by_stage"]["300"]
+    assert late_stage["attempted_late"] == 1
+    assert late_stage["aged_out_unselected"] == 0
+    assert late_stage["attempted_checks"] == 0
+    assert validated_sampling["coverage_by_stage"]["3600"]["aged_out_unselected"] == 1
+    assert validated_sampling["coverage_by_stage"]["86400"]["aged_out_unselected"] == 1
+    assert validated_sampling["aged_out_unselected"] == 2
+
+    point = derive_records([validated])["points"][0]
+    display = point["room_lifecycle_sampling_display"]
+    assert "1 attempted late" in display["stages"]["300"]["context"]
+    assert "aged out with no attempt" in display["stages"]["300"]["context"]
+    assert "counted as attempted late, not here" in display["aged_out"]["context"]
+    coverage_text = point["room_lifecycle_display"]["coverage_text"]
+    assert (
+        "This tick finalized 2 aged-out checks as terminal ledger records"
+        in coverage_text
+    )
+    assert "0 aged-out checks remained unfinalized" in coverage_text
+
+
+def test_current_collector_requires_finalization_evidence():
+    with pytest.raises(ValueError, match="aged-out finalization evidence"):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.13.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=lifecycle_sampling(),
+            )
+        )
+
+
+def test_finalization_and_late_attempt_evidence_must_travel_together():
+    with_finalization_only = lifecycle_sampling()
+    with_finalization_only["aged_out_finalization"] = {
+        "finalized_this_tick": 0,
+        "backlog_remaining": 0,
+        "batch_limit": 2000,
+    }
+    with pytest.raises(ValueError, match="attempted-late evidence"):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=with_finalization_only,
+            )
+        )
+
+    with_late_only = lifecycle_sampling()
+    for stage in with_late_only["coverage_by_stage"].values():
+        stage["attempted_late"] = 0
+    with pytest.raises(ValueError, match="attempted-late evidence"):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=with_late_only,
+            )
+        )
+
+    one_stage_only = lifecycle_sampling()
+    one_stage_only["aged_out_finalization"] = {
+        "finalized_this_tick": 0,
+        "backlog_remaining": 0,
+        "batch_limit": 2000,
+    }
+    one_stage_only["coverage_by_stage"]["300"]["attempted_late"] = 0
+    with pytest.raises(ValueError, match="attempted-late evidence"):
+        validate_tick(
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=one_stage_only,
+            )
+        )
+
+
+def test_lifecycle_sampling_enforces_late_attempt_identity(tmp_path, monkeypatch):
+    record = collector_finalization_tick(tmp_path, monkeypatch)
+    record["room_lifecycle_sampling"]["coverage_by_stage"]["300"]["attempted_late"] += 1
+    with pytest.raises(ValueError, match="eligible-room accounting"):
+        validate_tick(record)
+
+
+def test_finalization_bounds_are_enforced(tmp_path, monkeypatch):
+    over_limit = collector_finalization_tick(tmp_path, monkeypatch)
+    finalization = over_limit["room_lifecycle_sampling"]["aged_out_finalization"]
+    finalization["finalized_this_tick"] = finalization["batch_limit"] + 1
+    with pytest.raises(ValueError, match="finalization exceeds its batch limit"):
+        validate_tick(over_limit)
+
+
+def test_finalization_backlog_may_never_be_negative(tmp_path, monkeypatch):
+    record = collector_finalization_tick(tmp_path, monkeypatch)
+    record["room_lifecycle_sampling"]["aged_out_finalization"]["backlog_remaining"] = -1
+    with pytest.raises(ValueError, match="backlog_remaining"):
+        validate_tick(record)
+
+
+def test_legacy_sampling_renders_attempted_late_as_not_recorded():
+    result = derive_records(
+        [
+            tick(
+                "2026-08-31T12:00:00Z",
+                collector_version="2.12.0",
+                room_lifecycle=lifecycle_2_12(),
+                room_lifecycle_sampling=lifecycle_sampling(),
+            )
+        ]
+    )
+    point = result["points"][0]
+    validated_sampling = point["room_lifecycle_sampling"]
+    assert validated_sampling["aged_out_finalization"] is None
+    assert all(
+        stage["attempted_late"] is None
+        for stage in validated_sampling["coverage_by_stage"].values()
+    )
+    display = point["room_lifecycle_sampling_display"]
+    assert "attempted late not recorded" in display["stages"]["3600"]["context"]
+    assert "no timely in-window attempt" in display["aged_out"]["context"]
+    coverage_text = point["room_lifecycle_display"]["coverage_text"]
+    assert "This tick finalized" not in coverage_text
+    assert "remained unfinalized" not in coverage_text
 
 
 def test_lifecycle_sampling_enforces_scheduled_due_identity():

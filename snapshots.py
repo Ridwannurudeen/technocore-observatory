@@ -927,6 +927,34 @@ def methodology_resource() -> dict[str, Any]:
         ),
         "change_history": [
             {
+                "version": "1.15.0",
+                "published_on": "2026-09-01",
+                "changes": [
+                    "Separated checks attempted after their eligibility window "
+                    "closed into a distinct attempted_late state, and began "
+                    "finalizing never-attempted aged-out checks as terminal "
+                    "records in bounded per-tick batches, publishing the count "
+                    "finalized each tick and the backlog still remaining."
+                ],
+                "limitations": [
+                    "Ticks recorded before collector 2.13.0 include late "
+                    "attempts in their aged_out_unselected counts and publish "
+                    "attempted_late as not recorded; their historical meaning "
+                    "is not rewritten.",
+                    "Finalization is terminal bookkeeping that writes no "
+                    "attempt evidence; a check finalized as aged out stays "
+                    "aged out even if supersession evidence for its window is "
+                    "observed later.",
+                    "A recorded origin read now outranks supersession "
+                    "evidence, so from collector 2.13.0 a late-read check "
+                    "whose name was recreated before the check fell due is "
+                    "counted as an eligible late attempt rather than as "
+                    "ineligible and superseded before due. This shifts the "
+                    "split between those two counts at the version boundary; "
+                    "earlier ticks keep their original split.",
+                ],
+            },
+            {
                 "version": "1.14.0",
                 "published_on": "2026-09-01",
                 "changes": [

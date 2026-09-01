@@ -34,7 +34,7 @@ HOURLY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DAILY_RETENTION_SECONDS = 365 * 24 * 60 * 60
 HOURLY_ROLLUP_SECONDS = 60 * 60
 DAILY_ROLLUP_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.14.0"
+METHODOLOGY_VERSION = "1.15.0"
 CENSUS_SHARD_COUNT = 256
 CENSUS_RUN_FIELDS = {
     "walk_started_at",
@@ -64,6 +64,7 @@ ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
 ROOM_REVISIT_STRUCTURAL_CEILING = 305
 ROOM_GENERATION_COLLECTOR_VERSION = (2, 11, 0)
 ROOM_LIFECYCLE_SAMPLING_COLLECTOR_VERSION = (2, 12, 0)
+ROOM_AGED_OUT_FINALIZATION_COLLECTOR_VERSION = (2, 13, 0)
 ROOM_REVISIT_OUTCOMES = {
     "present_at_last_check",
     "absent_at_last_check",
@@ -455,16 +456,30 @@ def validate_event(value: Any) -> dict[str, Any]:
 def validate_room_lifecycle_sampling(
     value: Any,
     tick_datetime: datetime,
+    *,
+    require_finalization: bool = False,
 ) -> dict[str, Any] | None:
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {
+    base_fields = {
         "aged_out_unselected",
         "selection",
         "coverage_by_stage",
-    }:
+    }
+    if not isinstance(value, dict) or set(value) not in (
+        base_fields,
+        base_fields | {"aged_out_finalization"},
+    ):
         raise ValueError(
             "room_lifecycle_sampling is not a complete sampling-evidence object"
+        )
+    # From collector 2.13.0 the attempted-late split and the bounded aged-out
+    # finalization record ship together; older ticks carry neither and keep
+    # their historical accounting, published as not recorded.
+    has_finalization = "aged_out_finalization" in value
+    if require_finalization and not has_finalization:
+        raise ValueError(
+            "room_lifecycle_sampling is missing its aged-out finalization evidence"
         )
 
     selection = value["selection"]
@@ -552,8 +567,7 @@ def validate_room_lifecycle_sampling(
             or len(descriptor) > 256
         ):
             raise ValueError(
-                "room_lifecycle_sampling.selection."
-                f"eligibility.{field} is not valid text"
+                f"room_lifecycle_sampling.selection.eligibility.{field} is not valid text"
             )
         eligibility[field] = descriptor
     if eligibility != {
@@ -572,8 +586,7 @@ def validate_room_lifecycle_sampling(
         or re.fullmatch(r"[0-9a-f]+", selector_seed) is None
     ):
         raise ValueError(
-            "room_lifecycle_sampling.selection.selector_seed is not "
-            "lowercase hexadecimal"
+            "room_lifecycle_sampling.selection.selector_seed is not lowercase hexadecimal"
         )
 
     tick_timestamp = selection["tick_timestamp"]
@@ -585,8 +598,7 @@ def validate_room_lifecycle_sampling(
         ) from error
     if selection_tick_datetime != tick_datetime:
         raise ValueError(
-            "room_lifecycle_sampling selection tick timestamp does not match "
-            "the tick timestamp"
+            "room_lifecycle_sampling selection tick timestamp does not match the tick timestamp"
         )
 
     stage_keys = tuple(str(stage) for stage in ROOM_REVISIT_STAGES_SECONDS)
@@ -694,7 +706,17 @@ def validate_room_lifecycle_sampling(
     total_aged_out = 0
     for stage in stage_keys:
         coverage = coverage_by_stage[stage]
-        if not isinstance(coverage, dict) or set(coverage) != expected_stage_fields:
+        stage_fields = expected_stage_fields
+        if has_finalization:
+            stage_fields = expected_stage_fields | {"attempted_late"}
+        if not isinstance(coverage, dict) or set(coverage) != stage_fields:
+            if (
+                isinstance(coverage, dict)
+                and set(coverage) - {"attempted_late"} == expected_stage_fields
+            ):
+                raise ValueError(
+                    "room_lifecycle_sampling attempted-late evidence is incomplete"
+                )
             raise ValueError(
                 f"room_lifecycle_sampling coverage for stage {stage} is incomplete"
             )
@@ -704,9 +726,14 @@ def validate_room_lifecycle_sampling(
                 coverage[field],
                 f"room_lifecycle_sampling.coverage_by_stage.{stage}.{field}",
             )
-            for field in expected_stage_fields
+            for field in stage_fields
             if field not in {"coverage_fraction", "second_message_fraction"}
         }
+        if not has_finalization:
+            # Ticks recorded before collector 2.13.0 did not separate late
+            # attempts from aged-out checks; the split is not recorded, and
+            # absence never becomes zero.
+            validated["attempted_late"] = None
         if (
             validated["scheduled_due_rooms"]
             != validated["ineligible_superseded_before_due"]
@@ -715,9 +742,9 @@ def validate_room_lifecycle_sampling(
             raise ValueError(
                 "room_lifecycle_sampling scheduled-due accounting is inconsistent"
             )
-        if (
-            validated["eligible_rooms"]
-            != validated["attempted_checks"]
+        if validated["eligible_rooms"] != (
+            validated["attempted_checks"]
+            + (validated["attempted_late"] or 0)
             + validated["deferred_checks"]
             + validated["aged_out_unselected"]
             + validated["superseded_after_eligibility"]
@@ -742,15 +769,13 @@ def validate_room_lifecycle_sampling(
         coverage_numerator = integer(
             coverage_fraction["numerator"],
             (
-                "room_lifecycle_sampling.coverage_by_stage."
-                f"{stage}.coverage_fraction.numerator"
+                f"room_lifecycle_sampling.coverage_by_stage.{stage}.coverage_fraction.numerator"
             ),
         )
         coverage_denominator = integer(
             coverage_fraction["denominator"],
             (
-                "room_lifecycle_sampling.coverage_by_stage."
-                f"{stage}.coverage_fraction.denominator"
+                f"room_lifecycle_sampling.coverage_by_stage.{stage}.coverage_fraction.denominator"
             ),
         )
         if (
@@ -810,8 +835,40 @@ def validate_room_lifecycle_sampling(
     if aged_out_unselected != total_aged_out:
         raise ValueError("room_lifecycle_sampling aged-out accounting is inconsistent")
 
+    finalization: dict[str, int] | None = None
+    if has_finalization:
+        raw_finalization = value["aged_out_finalization"]
+        if not isinstance(raw_finalization, dict) or set(raw_finalization) != {
+            "finalized_this_tick",
+            "backlog_remaining",
+            "batch_limit",
+        }:
+            raise ValueError(
+                "room_lifecycle_sampling.aged_out_finalization is not a "
+                "complete finalization object"
+            )
+        finalization = {
+            field: integer(
+                raw_finalization[field],
+                f"room_lifecycle_sampling.aged_out_finalization.{field}",
+            )
+            for field in ("finalized_this_tick", "backlog_remaining", "batch_limit")
+        }
+        if finalization["batch_limit"] < 1:
+            raise ValueError(
+                "room_lifecycle_sampling.aged_out_finalization.batch_limit is invalid"
+            )
+        if finalization["finalized_this_tick"] > finalization["batch_limit"]:
+            raise ValueError(
+                "room_lifecycle_sampling finalization exceeds its batch limit"
+            )
+        # finalized_this_tick and backlog_remaining describe only the tick
+        # being reported; the coverage figures beside them run since the
+        # ledger began. No equality between the two scopes is enforced.
+
     return {
         "aged_out_unselected": aged_out_unselected,
+        "aged_out_finalization": finalization,
         "selection": {
             "allocation_rotation": allocation_rotation,
             "eligibility": eligibility,
@@ -1471,6 +1528,10 @@ def validate_tick(value: Any) -> dict[str, Any]:
     lifecycle_sampling = validate_room_lifecycle_sampling(
         value.get("room_lifecycle_sampling"),
         parsed_ts,
+        require_finalization=collector_version_at_least(
+            collector_version,
+            ROOM_AGED_OUT_FINALIZATION_COLLECTOR_VERSION,
+        ),
     )
     if require_lifecycle_sampling and lifecycle_sampling is None:
         raise ValueError("current tick is missing room_lifecycle_sampling evidence")
@@ -2075,6 +2136,16 @@ def room_lifecycle_display(
             "eligible checks have aged out across the three stages since the ledger "
             "began."
         )
+        finalization = sampling["aged_out_finalization"]
+        if finalization is not None:
+            sampling_evidence_text += (
+                " This tick finalized "
+                f"{format_int(finalization['finalized_this_tick'])} aged-out "
+                "checks as terminal ledger records under its "
+                f"{format_int(finalization['batch_limit'])}-check per-tick bound; "
+                f"{format_int(finalization['backlog_remaining'])} aged-out checks "
+                "remained unfinalized when the tick was written."
+            )
 
     if sampling is not None:
         deferral_text = (
@@ -2296,16 +2367,25 @@ def room_lifecycle_sampling_display(
         coverage_fraction = coverage["coverage_fraction"]
         fraction = coverage["second_message_fraction"]
         if fraction["denominator"] == 0:
-            fraction_text = (
-                "second-message fraction not recorded because the "
-                "present-check denominator is 0"
-            )
+            fraction_text = "second-message fraction not recorded because the present-check denominator is 0"
         else:
             fraction_text = (
                 f"{format_int(fraction['numerator'])} / "
                 f"{format_int(fraction['denominator'])} recorded a second message "
                 f"({format_percent(fraction['numerator'] / fraction['denominator'])})"
             )
+        if coverage["attempted_late"] is None:
+            # This tick predates the attempted-late split: its aged-out
+            # count also contains checks read after their window closed,
+            # and that historical meaning is preserved, not rewritten.
+            late_text = "attempted late not recorded · "
+            aged_out_text = (
+                f"{format_int(coverage['aged_out_unselected'])} aged out "
+                "without a timely attempt · "
+            )
+        else:
+            late_text = f"{format_int(coverage['attempted_late'])} attempted late · "
+            aged_out_text = f"{format_int(coverage['aged_out_unselected'])} aged out with no attempt · "
         stages[stage] = {
             "value_text": (
                 f"{format_int(coverage_fraction['numerator'])} / "
@@ -2315,8 +2395,8 @@ def room_lifecycle_sampling_display(
                 f"{stage_labels[stage]} stage, since the ledger began · "
                 f"{format_int(coverage['deferred_checks'])} deferred · "
                 f"{format_int(coverage['failed_checks'])} failed · "
-                f"{format_int(coverage['aged_out_unselected'])} aged out without a "
-                "timely attempt · "
+                f"{late_text}"
+                f"{aged_out_text}"
                 f"{format_int(coverage['checked_and_quiet'])} checked and quiet · "
                 f"{fraction_text}"
             ),
@@ -2340,10 +2420,20 @@ def room_lifecycle_sampling_display(
         "aged_out": {
             "value_text": format_int(sampling["aged_out_unselected"]),
             "context": (
-                "eligible scheduled checks, since the ledger began, with no timely "
-                "in-window attempt; a check read after its window closed is counted "
-                "here and excluded from coverage · not a quiet check, failure, "
-                "or deferral"
+                (
+                    "eligible scheduled checks, since the ledger began, never "
+                    "attempted before their window closed and terminal once it "
+                    "did; a check read after its window closed is counted as "
+                    "attempted late, not here · not a quiet check, failure, "
+                    "or deferral"
+                )
+                if sampling["aged_out_finalization"] is not None
+                else (
+                    "eligible scheduled checks, since the ledger began, with no "
+                    "timely in-window attempt; a check read after its window "
+                    "closed is counted here and excluded from coverage · not a "
+                    "quiet check, failure, or deferral"
+                )
             ),
         },
         "stages": stages,
@@ -2980,17 +3070,32 @@ def methodology_definitions() -> dict[str, str]:
             "selection and per-stage coverage evidence. For each nominal stage, "
             "scheduled_due_rooms is exactly ineligible_superseded_before_due plus "
             "eligible_rooms; eligible_rooms is exactly attempted_checks plus "
-            "deferred_checks plus aged_out_unselected plus "
+            "attempted_late plus deferred_checks plus aged_out_unselected plus "
             "superseded_after_eligibility; and attempted_checks is exactly "
-            "completed_checks plus failed_checks. The top-level aged_out_unselected "
+            "completed_checks plus failed_checks. From collector 2.13.0 a check "
+            "whose origin read happened only after its eligibility window closed "
+            "is counted as attempted_late — a real read, outside the timely "
+            "coverage and second-message denominators — and aged_out_unselected "
+            "counts only checks that were never attempted at all; ticks recorded "
+            "before 2.13.0 keep their historical meaning, in which "
+            "aged_out_unselected also contained late attempts, and publish "
+            "attempted_late as not recorded. From the same version the collector "
+            "finalizes each aged-out check as a terminal record, in a bounded "
+            "per-tick batch, publishing the count finalized this tick and the "
+            "backlog still unfinalized; finalization writes no attempt evidence "
+            "and never reclassifies a check, and a check finalized as aged out "
+            "stays aged out even if supersession evidence arrives later. "
+            "The top-level aged_out_unselected "
             "is the sum across stages. Per-stage coverage is printed as completed "
             "checks / eligible rooms, never as a bare percentage. Every coverage_by_stage "
             "figure, and the aged-out total drawn from it, counts every scheduled "
             "check whose window has opened since the ledger began; the selection, "
-            "read-budget and due-count figures beside them describe only the tick "
+            "read-budget, due-count and finalization figures beside them describe "
+            "only the tick "
             "being reported. A running total and a single tick are never summed or "
             "compared. Deferred checks, "
-            "failed checks, aged-out checks and present checks that were "
+            "failed checks, late-attempted checks, aged-out checks and present "
+            "checks that were "
             "checked and quiet remain separate published states. A second-message "
             "fraction is printed only with its numerator and present-check "
             "denominator; a zero denominator is reported as not recorded, never as "

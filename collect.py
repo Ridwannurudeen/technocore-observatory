@@ -80,12 +80,13 @@ TOTAL_READ_BUDGET = int(
 )
 ROOM_REVISIT_READ_BUDGET = TOTAL_READ_BUDGET - BASE_READ_BUDGET
 ROOM_REVISIT_PUBLICATION_BATCH_LIMIT = 305
+ROOM_REVISIT_AGED_OUT_FINALIZATION_LIMIT = 2000
 TICK_REVISIT_DEADLINE_SECONDS = 300
 ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
 CENSUS_MAX_PASSES = 5
 CENSUS_DEADLINE_SECONDS = 30 * 60
 CENSUS_STATE_VERSION = 2
-COLLECTOR_VERSION = "2.12.0"
+COLLECTOR_VERSION = "2.13.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
 SIGNER_STATE_VERSION = 6
@@ -2039,8 +2040,7 @@ def _verify_ledger_prefix(
             else ""
         )
         raise CollectionError(
-            "tick ledger base hash chain is broken"
-            f"{location}: {verification['message']}"
+            f"tick ledger base hash chain is broken{location}: {verification['message']}"
         )
     if prefix_path.reader is None or prefix_path.reader.remaining != 0:
         raise CollectionError("tick ledger changed during base-prefix verification")
@@ -2090,8 +2090,7 @@ def _complete_pending_append(
             ) from error
         if ledger_size != len(payload):
             raise CollectionError(
-                "tick ledger checkpoint conflicts with an incomplete fresh pending "
-                "append"
+                "tick ledger checkpoint conflicts with an incomplete fresh pending append"
             )
         checkpoint_tip = _checkpointed_ledger_tip(path, checkpoint_path)
         if (
@@ -3552,6 +3551,18 @@ def _validate_room_lifecycle_store(connection: sqlite3.Connection) -> None:
                     )
                 )
             )
+            OR (
+                room_revisits.aged_out_at IS NOT NULL
+                AND (
+                    room_revisits.attempted_at IS NOT NULL
+                    OR typeof(room_revisits.aged_out_at) <> 'text'
+                    OR julianday(room_revisits.aged_out_at) IS NULL
+                    OR (
+                        julianday(room_revisits.aged_out_at)
+                        - julianday(room_revisits.due_at)
+                    ) * 86400.0 - room_revisits.stage_seconds < -0.001
+                )
+            )
         LIMIT 1
         """,
         ROOM_REVISIT_STAGES_SECONDS,
@@ -3827,6 +3838,18 @@ def _room_revisit_validation_expression(reference: str) -> str:
                 )
             )
         )
+        OR (
+            {reference}.aged_out_at IS NOT NULL
+            AND (
+                {reference}.attempted_at IS NOT NULL
+                OR typeof({reference}.aged_out_at) <> 'text'
+                OR julianday({reference}.aged_out_at) IS NULL
+                OR (
+                    julianday({reference}.aged_out_at)
+                    - julianday({reference}.due_at)
+                ) * 86400.0 - {reference}.stage_seconds < -0.001
+            )
+        )
     """
 
 
@@ -4030,13 +4053,27 @@ def _initialize_room_lifecycle_rollup(connection: sqlite3.Connection) -> None:
         ).fetchone()
         is not None
     )
-    existing_triggers = {
-        row[0]
+    existing_trigger_sql = {
+        row[0]: row[1]
         for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
         )
         if row[0] in LIFECYCLE_ROLLUP_TRIGGER_NAMES
     }
+    # Validation triggers created before terminal aged-out finalization
+    # cannot guard the aged_out_at contract; rebuild the whole trigger set
+    # and revalidate the store once.
+    validation_is_stale = any(
+        not isinstance(existing_trigger_sql.get(name), str)
+        or "aged_out_at" not in existing_trigger_sql[name]
+        for name in ("room_revisits_validate_insert", "room_revisits_validate_update")
+        if name in existing_trigger_sql
+    )
+    if validation_is_stale:
+        for trigger in LIFECYCLE_ROLLUP_TRIGGER_NAMES:
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        existing_trigger_sql = {}
+    existing_triggers = set(existing_trigger_sql)
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS room_lifecycle_totals (
@@ -4262,12 +4299,10 @@ def initialize_signer_database(connection: sqlite3.Connection) -> None:
                     'not_observed'
                 )
             ),
+            aged_out_at TEXT,
             PRIMARY KEY (room_created_seq, stage_seconds),
             FOREIGN KEY (room_created_seq) REFERENCES room_ledger(created_seq)
         );
-
-        CREATE INDEX IF NOT EXISTS room_revisits_due
-        ON room_revisits (attempted_at, due_at);
         """
     )
     _validate_tick_outbox_schema(connection)
@@ -4344,13 +4379,32 @@ def initialize_signer_database(connection: sqlite3.Connection) -> None:
     if legacy_room_generation_schema:
         _migrate_room_generation_schema(connection)
         room_search_existed = False
+    migrated_revisit_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info('room_revisits')")
+    }
+    if "aged_out_at" not in migrated_revisit_columns:
+        connection.execute("ALTER TABLE room_revisits ADD COLUMN aged_out_at TEXT")
+    # The pending partial index replaces the retired (attempted_at, due_at)
+    # index: finalized aged-out rows would otherwise stay inside the old
+    # index's attempted_at IS NULL range forever and every selection would
+    # keep scanning them.
+    connection.execute("DROP INDEX IF EXISTS room_revisits_due")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS room_revisits_pending "
+        "ON room_revisits (due_at) "
+        "WHERE attempted_at IS NULL AND aged_out_at IS NULL"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS room_revisits_aged_out "
+        "ON room_revisits (stage_seconds, due_at, aged_out_at) "
+        "WHERE aged_out_at IS NOT NULL"
+    )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS room_ledger_room_id "
         "ON room_ledger (room_id, room_sha256, created_seq DESC)"
     )
     connection.execute(
-        "CREATE INDEX IF NOT EXISTS room_ledger_name "
-        "ON room_ledger (name, created_seq DESC)"
+        "CREATE INDEX IF NOT EXISTS room_ledger_name ON room_ledger (name, created_seq DESC)"
     )
     _initialize_room_lifecycle_rollup(connection)
     connection.executescript(
@@ -4978,6 +5032,7 @@ def select_due_room_revisits(
             ON room_ledger.created_seq = room_revisits.room_created_seq
         WHERE
             room_revisits.attempted_at IS NULL
+            AND room_revisits.aged_out_at IS NULL
             AND (
                 typeof(room_revisits.room_created_seq) <> 'integer'
                 OR room_ledger.created_seq IS NULL
@@ -5031,6 +5086,7 @@ def select_due_room_revisits(
             ON room_ledger.created_seq = room_revisits.room_created_seq
         WHERE
             room_revisits.attempted_at IS NULL
+            AND room_revisits.aged_out_at IS NULL
             AND room_revisits.due_at <= ?
         """,
         (normalized_now, normalized_now),
@@ -5041,6 +5097,7 @@ def select_due_room_revisits(
     }
     superseded: list[tuple[datetime, int, int, dict[str, Any]]] = []
     aged_out_unselected = 0
+    aged_out_finalizable: list[tuple[int, int]] = []
 
     for (
         created_seq,
@@ -5094,6 +5151,8 @@ def select_due_room_revisits(
             continue
         if now_timestamp >= eligible_until:
             aged_out_unselected += 1
+            if len(aged_out_finalizable) < ROOM_REVISIT_AGED_OUT_FINALIZATION_LIMIT:
+                aged_out_finalizable.append((created_seq, stage_seconds))
             continue
 
         rank = room_revisit_rank(
@@ -5175,8 +5234,7 @@ def select_due_room_revisits(
                 "tick_timestamp",
             ],
             "order": (
-                "digest ascending, then stage_seconds ascending, "
-                "then created_seq ascending"
+                "digest ascending, then stage_seconds ascending, then created_seq ascending"
             ),
         },
         "allocation_rotation": allocation_rotation,
@@ -5194,6 +5252,7 @@ def select_due_room_revisits(
         "due_this_tick": sum(len(candidates) for candidates in active.values()),
         "superseded_due_this_tick": len(superseded),
         "aged_out_unselected": aged_out_unselected,
+        "aged_out_finalizable": aged_out_finalizable,
         "selected": selected,
         "superseded": selected_superseded,
         "selection": selection,
@@ -5231,7 +5290,9 @@ def room_lifecycle_coverage_by_stage(
         FROM room_revisits
         JOIN room_ledger
             ON room_ledger.created_seq = room_revisits.room_created_seq
-        WHERE room_revisits.due_at <= ?
+        WHERE
+            room_revisits.due_at <= ?
+            AND room_revisits.aged_out_at IS NULL
         """,
         (normalized_selection_time, normalized_selection_time),
     ).fetchall()
@@ -5244,12 +5305,37 @@ def room_lifecycle_coverage_by_stage(
             "attempted_checks": 0,
             "completed_checks": 0,
             "failed_checks": 0,
+            "attempted_late": 0,
             "deferred_checks": 0,
             "aged_out_unselected": 0,
             "superseded_after_eligibility": 0,
         }
         for stage_seconds in ROOM_REVISIT_STAGES_SECONDS
     }
+
+    # Rows finalized as terminally aged out were validated at write time:
+    # never attempted, window closed, no supersession observed inside the
+    # window. They keep their cumulative place in coverage without another
+    # per-row scan.
+    finalized_rows = connection.execute(
+        """
+        SELECT stage_seconds, COUNT(*)
+        FROM room_revisits
+        WHERE aged_out_at IS NOT NULL AND due_at <= ?
+        GROUP BY stage_seconds
+        """,
+        (normalized_selection_time,),
+    ).fetchall()
+    for stage_seconds, finalized_count in finalized_rows:
+        if (
+            isinstance(stage_seconds, bool)
+            or stage_seconds not in ROOM_REVISIT_STAGES_SECONDS
+        ):
+            raise CollectionError("room lifecycle coverage found an invalid row")
+        counters = coverage[str(stage_seconds)]
+        counters["scheduled_due_rooms"] += finalized_count
+        counters["eligible_rooms"] += finalized_count
+        counters["aged_out_unselected"] += finalized_count
     successful_present_checks = dict.fromkeys(ROOM_REVISIT_STAGES_SECONDS, 0)
     second_message_checks = dict.fromkeys(ROOM_REVISIT_STAGES_SECONDS, 0)
 
@@ -5291,24 +5377,33 @@ def room_lifecycle_coverage_by_stage(
         )
         timely_attempt = actual_attempt and attempt_timestamp < eligible_until
 
-        if timely_attempt:
-            counters["eligible_rooms"] += 1
-            counters["attempted_checks"] += 1
-            if outcome in (
+        if actual_attempt:
+            if outcome not in (
                 "present_at_last_check",
                 "absent_at_last_check",
+                "check_failed",
             ):
-                counters["completed_checks"] += 1
-            elif outcome == "check_failed":
-                counters["failed_checks"] += 1
-            else:
                 raise CollectionError(
                     "room lifecycle coverage found an invalid attempt outcome"
                 )
-            if success == 1:
-                successful_present_checks[stage_seconds] += 1
-                if has_second_message == 1:
-                    second_message_checks[stage_seconds] += 1
+            counters["eligible_rooms"] += 1
+            if timely_attempt:
+                counters["attempted_checks"] += 1
+                if outcome == "check_failed":
+                    counters["failed_checks"] += 1
+                else:
+                    counters["completed_checks"] += 1
+                if success == 1:
+                    successful_present_checks[stage_seconds] += 1
+                    if has_second_message == 1:
+                        second_message_checks[stage_seconds] += 1
+            else:
+                # An origin read happened, only after the eligibility window
+                # closed. That is neither a timely check nor a check that
+                # never happened, so it counts in its own state and stays
+                # out of the timely coverage and second-message
+                # denominators.
+                counters["attempted_late"] += 1
             continue
 
         if newer_created is not None and newer_created <= due_timestamp:
@@ -5330,6 +5425,7 @@ def room_lifecycle_coverage_by_stage(
             != counters["ineligible_superseded_before_due"] + counters["eligible_rooms"]
             or counters["eligible_rooms"]
             != counters["attempted_checks"]
+            + counters["attempted_late"]
             + counters["deferred_checks"]
             + counters["aged_out_unselected"]
             + counters["superseded_after_eligibility"]
@@ -5612,6 +5708,34 @@ def collect_room_revisits(
             }
         )
 
+    # Terminal finalization of aged-out checks: every window closed with no
+    # attempt and no supersession observed inside the window, so nothing can
+    # ever change these rows again. The batch is bounded per tick so a large
+    # backlog can never stall the tick; the remainder is published, not
+    # hidden. No attempt evidence is fabricated: only aged_out_at is set.
+    finalizable = selected["aged_out_finalizable"]
+    if finalizable:
+        finalized_at = utc_now()
+        cursor = connection.executemany(
+            """
+            UPDATE room_revisits
+            SET aged_out_at = ?
+            WHERE
+                room_created_seq = ?
+                AND stage_seconds = ?
+                AND attempted_at IS NULL
+                AND aged_out_at IS NULL
+            """,
+            [
+                (finalized_at, created_seq, stage_seconds)
+                for created_seq, stage_seconds in finalizable
+            ],
+        )
+        if cursor.rowcount != len(finalizable):
+            raise CollectionError(
+                "aged-out finalization did not update its selected rows"
+            )
+
     summary = room_lifecycle_summary(
         connection,
         created_this_tick=0,
@@ -5625,6 +5749,11 @@ def collect_room_revisits(
         "aged_out_unselected": sum(
             stage["aged_out_unselected"] for stage in coverage_by_stage.values()
         ),
+        "aged_out_finalization": {
+            "finalized_this_tick": len(finalizable),
+            "backlog_remaining": selected["aged_out_unselected"] - len(finalizable),
+            "batch_limit": ROOM_REVISIT_AGED_OUT_FINALIZATION_LIMIT,
+        },
         "selection": selected["selection"],
         "coverage_by_stage": coverage_by_stage,
     }

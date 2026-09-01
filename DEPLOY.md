@@ -423,6 +423,41 @@ files: fence the new rebuild timer, restore the old vhost and flat files from th
 snapshot, run `nginx -t`, and reload nginx. Do not delete the new releases or forward state while
 diagnosing. The old vhost and flat files are the only verified pre-versioned static rollback.
 
+### Deploy order at 2.13.0
+
+Collector and deriver ship from the same archived tree, so they move together. If a 2.13.0 tick is
+ever written while an older deriver is still running, that deriver rejects it: the sampling object
+gained required fields. Nothing is lost — the deriver re-reads the retained corpus on each run, so
+the rejected tick is picked up as soon as the matching deriver is live. Deploy both, then rebuild.
+
+### Reverting the collector below 2.13.0
+
+A static rollback changes no collector state and needs nothing extra. Reverting the **collector**
+below 2.13.0 does: the signer state version is unchanged, so an older binary will open a 2.13.0
+store, and the 2.13.0 validation triggers survive because they are created `IF NOT EXISTS` under
+unchanged names. A pre-2.13.0 collector does not know about `aged_out_at`, so it can reselect a
+finalized check and try to write an attempt to it, which the surviving trigger aborts — failing
+that tick, and every tick after it, until someone intervenes.
+
+Before starting a pre-2.13.0 collector, drop the eight room-revisit triggers:
+
+```sql
+DROP TRIGGER IF EXISTS room_revisits_validate_insert;
+DROP TRIGGER IF EXISTS room_revisits_validate_update;
+DROP TRIGGER IF EXISTS room_revisits_rollup_before_insert;
+DROP TRIGGER IF EXISTS room_revisits_rollup_after_insert;
+DROP TRIGGER IF EXISTS room_revisits_rollup_before_update;
+DROP TRIGGER IF EXISTS room_revisits_rollup_after_update;
+DROP TRIGGER IF EXISTS room_revisits_rollup_before_delete;
+DROP TRIGGER IF EXISTS room_revisits_rollup_after_delete;
+```
+
+The older collector recreates its own set on start, finds the trigger set incomplete, and
+revalidates the store. Finalized rows pass its checks: their attempt fields are still null and the
+extra `aged_out_at` column is invisible to its queries. The column and its partial indexes are left
+in place; they cost nothing to a collector that never reads them, and they are still there if you
+roll forward again.
+
 For a static/publication rollback, take the same exclusive publication-root lock used by
 `rebuild.sh`, then point `current` at a previously verified versioned release with the same atomic
 link pattern and run `nginx -t`. This changes no collector, telemetry, or signer state. The

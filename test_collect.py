@@ -413,8 +413,7 @@ def test_identity_shards_reject_unrecognized_response_shapes(body):
             id="duplicate-items-object",
         ),
         pytest.param(
-            '{"items":["/kv/did-ff/00000000000000",'
-            '"/kv/did-ff/00000000000000\\t"],"total":2}',
+            '{"items":["/kv/did-ff/00000000000000","/kv/did-ff/00000000000000\\t"],"total":2}',
             id="duplicate-items-path-with-whitespace",
         ),
         pytest.param(
@@ -1116,8 +1115,7 @@ def test_census_state_json_parser_failures_are_collection_errors(
             id="invalid-started-at",
         ),
         pytest.param(
-            '{"version":1,"started_at":"2026-08-30T00:00:00Z",'
-            '"counts":{},"unexpected":true}',
+            '{"version":1,"started_at":"2026-08-30T00:00:00Z","counts":{},"unexpected":true}',
             id="unexpected-field",
         ),
     ),
@@ -1173,8 +1171,7 @@ def test_legacy_signer_metadata_parser_failures_are_collection_errors(
     path = tmp_path / "signers.sqlite3"
     connection = sqlite3.connect(path)
     connection.execute(
-        "CREATE TABLE signer_metadata "
-        "(singleton INTEGER PRIMARY KEY, state_json TEXT NOT NULL)"
+        "CREATE TABLE signer_metadata (singleton INTEGER PRIMARY KEY, state_json TEXT NOT NULL)"
     )
     connection.execute(
         "INSERT INTO signer_metadata (singleton, state_json) VALUES (1, ?)",
@@ -1811,8 +1808,7 @@ def test_created_room_preserves_fractional_revisit_schedule_precision(signer_sto
         "SELECT created_at FROM room_ledger WHERE name = 'fractional-room'"
     ).fetchone() == ("2026-08-30T08:00:00.123456Z",)
     assert signer_store.execute(
-        "SELECT due_at FROM room_revisits "
-        "WHERE room_created_seq = 10 AND stage_seconds = 300"
+        "SELECT due_at FROM room_revisits WHERE room_created_seq = 10 AND stage_seconds = 300"
     ).fetchone() == ("2026-08-30T08:05:00.123456Z",)
     before_due = select_revisits(
         signer_store,
@@ -1926,8 +1922,7 @@ def test_created_room_rejects_an_incomplete_persisted_revisit_schedule(signer_st
     )
     record_created_rooms(signer_store, [event], "2026-08-30T08:00:01Z")
     signer_store.execute(
-        "DELETE FROM room_revisits "
-        "WHERE room_created_seq = 10 AND stage_seconds = 86400"
+        "DELETE FROM room_revisits WHERE room_created_seq = 10 AND stage_seconds = 86400"
     )
 
     with pytest.raises(CollectionError, match="conflicting room-creation event"):
@@ -2198,8 +2193,7 @@ def test_lifecycle_rollup_verifier_detects_tampered_totals(signer_store):
 def test_lifecycle_rollup_schema_rejects_inconsistent_sender_totals(signer_store):
     with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
         signer_store.execute(
-            "UPDATE room_lifecycle_totals "
-            "SET second_sender_signed_did = 1 WHERE singleton = 1"
+            "UPDATE room_lifecycle_totals SET second_sender_signed_did = 1 WHERE singleton = 1"
         )
 
 
@@ -2393,6 +2387,7 @@ def test_stage_coverage_distinguishes_sampling_outcomes(
         "attempted_checks": 3,
         "completed_checks": 2,
         "failed_checks": 1,
+        "attempted_late": 0,
         "deferred_checks": 1,
         "aged_out_unselected": 1,
         "superseded_after_eligibility": 1,
@@ -2405,6 +2400,329 @@ def test_stage_coverage_distinguishes_sampling_outcomes(
             "denominator": 1,
         },
     }
+
+
+def test_stage_coverage_counts_late_attempts_separately_from_aged_out(
+    signer_store,
+    monkeypatch,
+):
+    record_created_rooms(
+        signer_store,
+        [created_event(10, "2026-08-30T08:00:00Z", "late-room")],
+        "2026-08-30T08:00:01Z",
+    )
+    # Selected inside the 5-minute eligibility window, but the read itself
+    # lands after the window closes at 08:10:00.
+    monkeypatch.setattr(collect, "utc_now", lambda: "2026-08-30T08:11:00Z")
+
+    class SlowClient:
+        def get(self, path, deadline=None):
+            return room_body(message(1, "server"), message(2, "server"))
+
+    lifecycle = collect_revisits(
+        SlowClient(),
+        signer_store,
+        "2026-08-30T08:06:00Z",
+        sampled_room_reads=1,
+        deadline=time.monotonic() + 1,
+    )
+    assert lifecycle["revisits"][0]["outcome"] == "present_at_last_check"
+
+    coverage = collect.room_lifecycle_coverage_by_stage(
+        signer_store,
+        "2026-08-30T08:20:00Z",
+    )["300"]
+
+    assert coverage["attempted_late"] == 1
+    assert coverage["aged_out_unselected"] == 0
+    assert coverage["attempted_checks"] == 0
+    assert coverage["completed_checks"] == 0
+    assert coverage["deferred_checks"] == 0
+    assert coverage["eligible_rooms"] == 1
+    # A late present check never enters the timely coverage or
+    # second-message denominators.
+    assert coverage["coverage_fraction"] == {"numerator": 0, "denominator": 1}
+    assert coverage["second_message_fraction"] == {
+        "numerator": 0,
+        "denominator": 0,
+    }
+
+
+def test_aged_out_checks_are_finalized_terminally_and_published(
+    signer_store,
+    monkeypatch,
+):
+    record_created_rooms(
+        signer_store,
+        [
+            created_event(10, "2026-08-30T07:00:00Z", "aged-room-a"),
+            created_event(11, "2026-08-30T07:01:00Z", "aged-room-b"),
+        ],
+        "2026-08-30T07:01:01Z",
+    )
+    tick_ts = "2026-09-01T08:00:00Z"
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+
+    class MustNotReadClient:
+        def get(self, path, deadline=None):
+            raise AssertionError(f"aged-out stage was read: {path}")
+
+    lifecycle = collect_revisits(
+        MustNotReadClient(),
+        signer_store,
+        tick_ts,
+        sampled_room_reads=1,
+        deadline=time.monotonic() + 1,
+    )
+    sampling = lifecycle["sampling"]
+
+    assert sampling["aged_out_unselected"] == 6
+    assert sampling["aged_out_finalization"] == {
+        "finalized_this_tick": 6,
+        "backlog_remaining": 0,
+        "batch_limit": collect.ROOM_REVISIT_AGED_OUT_FINALIZATION_LIMIT,
+    }
+    # Finalization is terminal bookkeeping, never fabricated attempt
+    # evidence: every finalized row keeps its null attempt fields.
+    assert signer_store.execute(
+        """
+        SELECT COUNT(*)
+        FROM room_revisits
+        WHERE
+            aged_out_at IS NOT NULL
+            AND attempted_at IS NULL
+            AND success IS NULL
+            AND outcome IS NULL
+        """
+    ).fetchone() == (6,)
+
+    later = select_revisits(signer_store, "2026-09-01T08:05:00Z")
+    assert later["due_this_tick"] == 0
+    assert later["aged_out_unselected"] == 0
+    assert later["aged_out_finalizable"] == []
+
+    coverage = collect.room_lifecycle_coverage_by_stage(
+        signer_store,
+        "2026-09-01T08:10:00Z",
+    )
+    assert {
+        stage: counters["aged_out_unselected"] for stage, counters in coverage.items()
+    } == {
+        "300": 2,
+        "3600": 2,
+        "86400": 2,
+    }
+    collect.verify_lifecycle_rollup(signer_store)
+
+
+def test_aged_out_finalization_is_bounded_and_publishes_its_backlog(
+    signer_store,
+    monkeypatch,
+):
+    record_created_rooms(
+        signer_store,
+        [
+            created_event(index, "2026-08-30T07:00:00Z", f"aged-room-{index}")
+            for index in range(3)
+        ],
+        "2026-08-30T07:00:01Z",
+    )
+    monkeypatch.setattr(collect, "ROOM_REVISIT_AGED_OUT_FINALIZATION_LIMIT", 4)
+
+    class MustNotReadClient:
+        def get(self, path, deadline=None):
+            raise AssertionError(f"aged-out stage was read: {path}")
+
+    def run_tick(tick_ts):
+        monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+        return collect_revisits(
+            MustNotReadClient(),
+            signer_store,
+            tick_ts,
+            sampled_room_reads=1,
+            deadline=time.monotonic() + 1,
+        )
+
+    first = run_tick("2026-09-01T08:00:00Z")
+    assert first["sampling"]["aged_out_unselected"] == 9
+    assert first["sampling"]["aged_out_finalization"] == {
+        "finalized_this_tick": 4,
+        "backlog_remaining": 5,
+        "batch_limit": 4,
+    }
+    assert signer_store.execute(
+        "SELECT COUNT(*) FROM room_revisits WHERE aged_out_at IS NOT NULL"
+    ).fetchone() == (4,)
+
+    second = run_tick("2026-09-01T08:05:00Z")
+    assert second["sampling"]["aged_out_unselected"] == 9
+    assert second["sampling"]["aged_out_finalization"] == {
+        "finalized_this_tick": 4,
+        "backlog_remaining": 1,
+        "batch_limit": 4,
+    }
+
+    third = run_tick("2026-09-01T08:10:00Z")
+    assert third["sampling"]["aged_out_finalization"] == {
+        "finalized_this_tick": 1,
+        "backlog_remaining": 0,
+        "batch_limit": 4,
+    }
+    assert signer_store.execute(
+        "SELECT COUNT(*) FROM room_revisits WHERE aged_out_at IS NOT NULL"
+    ).fetchone() == (9,)
+
+
+def test_revisit_selection_uses_the_pending_partial_index(signer_store):
+    record_created_rooms(
+        signer_store,
+        [created_event(10, "2026-08-30T08:00:00Z", "indexed-room")],
+        "2026-08-30T08:00:01Z",
+    )
+    statements = []
+    signer_store.set_trace_callback(statements.append)
+    select_revisits(signer_store, "2026-08-30T08:05:00Z")
+    signer_store.set_trace_callback(None)
+
+    fetch = next(
+        statement
+        for statement in statements
+        if "MIN(newer.created_at)" in statement and "attempted_at IS NULL" in statement
+    )
+    plan = " ".join(
+        str(row[3])
+        for row in signer_store.execute("EXPLAIN QUERY PLAN " + fetch).fetchall()
+    )
+    assert "room_revisits_pending" in plan
+    assert "SCAN room_revisits" not in plan
+
+
+def test_finalization_state_is_validated_at_write_time(signer_store):
+    record_created_rooms(
+        signer_store,
+        [created_event(10, "2026-08-30T08:00:00Z", "guarded-room")],
+        "2026-08-30T08:00:01Z",
+    )
+    # Finalizing before the eligibility window closes is refused.
+    with pytest.raises(sqlite3.IntegrityError, match="invalid room revisit state"):
+        signer_store.execute(
+            "UPDATE room_revisits SET aged_out_at = '2026-08-30T08:07:00Z' "
+            "WHERE room_created_seq = 10 AND stage_seconds = 300"
+        )
+    # An attempted row can never be finalized as aged out.
+    signer_store.execute(
+        """
+        UPDATE room_revisits
+        SET attempted_at = due_at, success = 0, outcome = 'check_failed'
+        WHERE room_created_seq = 10 AND stage_seconds = 300
+        """
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="invalid room revisit state"):
+        signer_store.execute(
+            "UPDATE room_revisits SET aged_out_at = '2026-08-30T09:00:00Z' "
+            "WHERE room_created_seq = 10 AND stage_seconds = 300"
+        )
+    # A closed, never-attempted window accepts terminal finalization.
+    signer_store.execute(
+        "UPDATE room_revisits SET aged_out_at = '2026-08-30T10:00:00Z' "
+        "WHERE room_created_seq = 10 AND stage_seconds = 3600"
+    )
+    collect.verify_lifecycle_rollup(signer_store)
+
+
+def test_signer_database_migrates_pre_finalization_revisit_schema(tmp_path):
+    path = tmp_path / "signers.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE room_ledger (
+            created_seq INTEGER PRIMARY KEY CHECK (created_seq >= 0),
+            name TEXT NOT NULL,
+            room_id TEXT NOT NULL CHECK (
+                length(room_id) = 16
+                AND room_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            room_sha256 TEXT NOT NULL CHECK (
+                length(room_sha256) = 64
+                AND room_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            created_at TEXT NOT NULL,
+            first_observed_at TEXT NOT NULL,
+            last_listed_at TEXT
+        );
+
+        CREATE TABLE room_revisits (
+            room_created_seq INTEGER NOT NULL,
+            stage_seconds INTEGER NOT NULL,
+            due_at TEXT NOT NULL,
+            attempted_at TEXT,
+            success INTEGER CHECK (success IN (0, 1)),
+            outcome TEXT CHECK (
+                outcome IN (
+                    'present_at_last_check',
+                    'absent_at_last_check',
+                    'check_failed',
+                    'superseded_before_check'
+                )
+            ),
+            message_count INTEGER CHECK (message_count >= 0),
+            has_second_message INTEGER CHECK (has_second_message IN (0, 1)),
+            second_sender_class TEXT CHECK (
+                second_sender_class IN (
+                    'signed_did',
+                    'unsigned_did',
+                    'server',
+                    'other',
+                    'not_observed'
+                )
+            ),
+            PRIMARY KEY (room_created_seq, stage_seconds),
+            FOREIGN KEY (room_created_seq) REFERENCES room_ledger(created_seq)
+        );
+
+        CREATE INDEX room_revisits_due
+        ON room_revisits (attempted_at, due_at);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = connect_signer_database(path)
+    try:
+        columns = {
+            row[1] for row in migrated.execute("PRAGMA table_info('room_revisits')")
+        }
+        assert "aged_out_at" in columns
+        indexes = {
+            row[1] for row in migrated.execute("PRAGMA index_list('room_revisits')")
+        }
+        assert "room_revisits_pending" in indexes
+        assert "room_revisits_aged_out" in indexes
+        assert "room_revisits_due" not in indexes
+    finally:
+        migrated.close()
+
+
+def test_stale_lifecycle_triggers_are_rebuilt_with_finalization_rules(tmp_path):
+    path = tmp_path / "signers.sqlite3"
+    connection = connect_signer_database(path)
+    connection.execute("DROP TRIGGER room_revisits_validate_update")
+    connection.execute(
+        "CREATE TRIGGER room_revisits_validate_update "
+        "BEFORE UPDATE ON room_revisits BEGIN SELECT 1; END"
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = connect_signer_database(path)
+    try:
+        sql = reopened.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'room_revisits_validate_update'"
+        ).fetchone()[0]
+        assert "aged_out_at" in sql
+    finally:
+        reopened.close()
 
 
 def test_read_budget_ceiling_is_enforced_in_selection_and_arithmetic(signer_store):
@@ -3836,8 +4154,7 @@ def test_signer_update_rejects_a_partial_observation_timestamp_pair(
     suffix = DID.removeprefix("did:key:z6Mk")
     insert_record(signer_store, suffix, 3, 2, ["room-a"], 0)
     signer_store.execute(
-        "UPDATE signer_dids SET first_observed_ts = ?, last_observed_ts = ? "
-        "WHERE did = ?",
+        "UPDATE signer_dids SET first_observed_ts = ?, last_observed_ts = ? WHERE did = ?",
         (first_observed_ts, last_observed_ts, suffix),
     )
     messages = parse_room_messages(
