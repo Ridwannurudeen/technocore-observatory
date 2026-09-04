@@ -2,6 +2,7 @@ import ast
 import hashlib
 import http.client
 import json
+import re
 import socket
 import sqlite3
 import threading
@@ -819,6 +820,18 @@ def test_hostile_names_are_valid_json_and_cannot_forge_plain_text_fields(
     assert b"\\r\\n" in body
     assert b"\r\ncontract_version: forged" not in body
 
+    for hostile in ("ab\u2028contract_version: forged", "ab\u202espoof"):
+        encoded = urllib.parse.quote(hostile, safe="")
+        for suffix in ("&format=json", ""):
+            status, _, body = request(
+                running_server,
+                "GET",
+                f"/api/v1/rooms/search?q={encoded}{suffix}",
+            )
+            assert status == 400
+            assert b"invalid_query" in body
+            assert hostile.encode("utf-8") not in body
+
 
 def test_common_metadata_and_security_headers_are_present(running_server):
     status, headers, payload = json_request(
@@ -844,15 +857,38 @@ def test_common_metadata_and_security_headers_are_present(running_server):
     assert headers["Cache-Control"] == "no-store"
 
 
+@pytest.mark.parametrize(
+    ("moment", "generated_at", "freshness"),
+    (
+        (
+            datetime(2026, 8, 30, 9, 15, 0, 500_000, tzinfo=timezone.utc),
+            "2026-08-30T09:15:00Z",
+            "fresh",
+        ),
+        (
+            datetime(2026, 8, 30, 9, 15, 1, 500_000, tzinfo=timezone.utc),
+            "2026-08-30T09:15:01Z",
+            "stale",
+        ),
+        (
+            datetime(2026, 8, 30, 9, 16, tzinfo=timezone.utc),
+            "2026-08-30T09:16:00Z",
+            "stale",
+        ),
+    ),
+)
 def test_database_metadata_expires_against_the_injected_clock(
     query_database,
     snapshot_root,
+    moment,
+    generated_at,
+    freshness,
 ):
     application = query_service.QueryApplication(
         query_service.ServiceConfig(
             database_path=query_database,
             snapshot_root=snapshot_root,
-            clock=lambda: datetime(2026, 8, 30, 9, 16, tzinfo=timezone.utc),
+            clock=lambda: moment,
         )
     )
 
@@ -861,11 +897,11 @@ def test_database_metadata_expires_against_the_injected_clock(
     )
     payload = json.loads(response.body)
 
-    assert payload["generated_at"] == "2026-08-30T09:16:00Z"
+    assert payload["generated_at"] == generated_at
     assert payload["source_observed_at"] == "2026-08-30T09:00:00Z"
     assert payload["index_observed_at"] == "2026-08-30T09:00:00Z"
     assert payload["valid_until"] == "2026-08-30T09:15:00Z"
-    assert payload["freshness"] == "stale"
+    assert payload["freshness"] == freshness
 
 
 def test_database_metadata_without_an_observation_uses_injected_clock(
@@ -1162,6 +1198,10 @@ def test_head_and_disallowed_methods_have_exact_method_semantics(
     assert body
 
 
+def test_idle_connections_are_bounded_by_a_socket_timeout():
+    assert query_service.ObservatoryRequestHandler.timeout == 10
+
+
 def test_query_concurrency_limit_rejects_excess_work_and_releases_slot(
     query_database,
     snapshot_root,
@@ -1321,7 +1361,7 @@ def test_progressive_room_html_escapes_names_and_uses_generic_previews(running_s
         '<details class="site-index">',
         "<summary>INDEX</summary>",
         '<nav aria-label="Site index">',
-        '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>',
+        '<button class="theme-control" id="theme-toggle" type="button" data-theme-value="system" hidden>THEME AUTO</button>',
         '<main id="main-content" class="page-shell" tabindex="-1">',
         '<footer class="site-footer">',
     )
@@ -1365,6 +1405,37 @@ def test_progressive_room_html_escapes_names_and_uses_generic_previews(running_s
     assert "Untrusted room name" in source
     assert '<meta property="og:title" content="Technocore room evidence">' in source
     assert "evidence-room" not in source.split("<head>", 1)[1].split("</head>", 1)[0]
+
+
+def test_query_shell_classes_are_grid_children_with_stylesheet_rules(
+    running_server,
+):
+    styles = Path("site/assets/styles.css").read_text(encoding="utf-8")
+    emitted = set()
+    for target in (
+        "/rooms/",
+        "/rooms/?q=forged",
+        f"/rooms/{room_id('evidence-room')}/",
+        "/keys/" + urllib.parse.quote(DID, safe="") + "/",
+    ):
+        status, _, body = request(running_server, "GET", target)
+        assert status == 200
+        source = body.decode("utf-8")
+        assert "site-header-inner" not in source
+        head = source.split("</head>", 1)[0]
+        assert head.index('localStorage.getItem("observatory-theme")') < head.index(
+            '<link rel="stylesheet"'
+        )
+        for attribute in re.findall(r'class="([^"]*)"', source):
+            emitted.update(attribute.split())
+
+    assert "site-header" in emitted
+    unstyled = sorted(
+        name
+        for name in emitted
+        if re.search(rf"\.{re.escape(name)}(?![-\w])", styles) is None
+    )
+    assert unstyled == []
 
 
 def test_trace_returns_only_direct_bounded_facts_and_hashes_rooms(running_server):
@@ -1463,7 +1534,7 @@ def test_trace_is_exact_only_and_html_page_uses_generic_metadata(running_server)
     assert '<details class="site-index">' in source
     assert '<nav aria-label="Site index">' in source
     assert (
-        '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>'
+        '<button class="theme-control" id="theme-toggle" type="button" data-theme-value="system" hidden>THEME AUTO</button>'
         in source
     )
     assert '<nav class="priority-nav" aria-label="Primary">' in source
@@ -1473,11 +1544,20 @@ def test_trace_is_exact_only_and_html_page_uses_generic_metadata(running_server)
 
 
 def test_static_snapshots_pass_through_and_lists_filter_in_process(
-    running_server, snapshot_root
+    running_server, snapshot_root, query_database
 ):
+    def without_generation(text):
+        return [
+            line
+            for line in text.decode("utf-8").splitlines()
+            if not line.startswith("generated_at: ")
+        ]
+
+    published = (snapshot_root / "api" / "v1" / "status.txt").read_bytes()
     status, headers, body = request(running_server, "GET", "/api/v1/status")
     assert status == 200
-    assert body == (snapshot_root / "api" / "v1" / "status.txt").read_bytes()
+    assert without_generation(body) == without_generation(published)
+    assert b"generated_at: 2026-08-30T09:01:00Z" in body
     assert headers["Cache-Control"].startswith("public")
 
     status, _, payload = json_request(running_server, "/api/v1/status?format=json")
@@ -1505,16 +1585,57 @@ def test_static_snapshots_pass_through_and_lists_filter_in_process(
     assert b"changes.1:" in body
     assert b'"id":"old"' in body
 
-
-def test_filtered_snapshot_uses_request_time_without_moving_validity(
-    query_database,
-    snapshot_root,
-):
     application = query_service.QueryApplication(
         query_service.ServiceConfig(
             database_path=query_database,
             snapshot_root=snapshot_root,
             clock=lambda: datetime(2026, 8, 30, 9, 16, tzinfo=timezone.utc),
+        )
+    )
+
+    payload = json.loads(application.snapshot("status", {"format": "json"}).body)
+    assert payload["generated_at"] == "2026-08-30T09:16:00Z"
+    assert payload["valid_until"] == "2026-08-30T09:15:00Z"
+    assert payload["freshness"] == "stale"
+
+    methodology = json.loads(
+        application.snapshot("methodology", {"format": "json"}).body
+    )
+    assert methodology["freshness"] == "not_applicable"
+
+
+@pytest.mark.parametrize(
+    ("moment", "generated_at", "freshness"),
+    (
+        (
+            datetime(2026, 8, 30, 9, 15, 0, 500_000, tzinfo=timezone.utc),
+            "2026-08-30T09:15:00Z",
+            "fresh",
+        ),
+        (
+            datetime(2026, 8, 30, 9, 15, 1, 500_000, tzinfo=timezone.utc),
+            "2026-08-30T09:15:01Z",
+            "stale",
+        ),
+        (
+            datetime(2026, 8, 30, 9, 16, tzinfo=timezone.utc),
+            "2026-08-30T09:16:00Z",
+            "stale",
+        ),
+    ),
+)
+def test_filtered_snapshot_uses_request_time_without_moving_validity(
+    query_database,
+    snapshot_root,
+    moment,
+    generated_at,
+    freshness,
+):
+    application = query_service.QueryApplication(
+        query_service.ServiceConfig(
+            database_path=query_database,
+            snapshot_root=snapshot_root,
+            clock=lambda: moment,
         )
     )
 
@@ -1528,11 +1649,12 @@ def test_filtered_snapshot_uses_request_time_without_moving_validity(
     )
     payload = json.loads(response.body)
 
-    assert payload["generated_at"] == "2026-08-30T09:16:00Z"
+    assert response.status == 200
+    assert payload["generated_at"] == generated_at
     assert payload["published_at"] == "2026-08-30T09:01:00Z"
     assert payload["source_observed_at"] == "2026-08-30T09:00:00Z"
     assert payload["valid_until"] == "2026-08-30T09:15:00Z"
-    assert payload["freshness"] == "stale"
+    assert payload["freshness"] == freshness
 
 
 def test_filtered_snapshot_rejects_clock_rollback_before_stored_publication(

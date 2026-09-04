@@ -20,6 +20,14 @@
 <link rel="canonical" href="%%CANONICAL_URL%%">
 <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48 64x64">
 <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" sizes="any">
+<script>
+// Read before first paint so a stored dark preference never flashes light.
+try {
+  const stored = localStorage.getItem("observatory-theme");
+  if (stored === "light" || stored === "dark")
+    document.documentElement.dataset.theme = stored;
+} catch {}
+</script>
 <style>
 :root {
   color-scheme: light dark;
@@ -29,7 +37,7 @@
   --text: #171B18;
   --text-muted: #535B55;
   --line: #747D76;
-  --line-subtle: #D2CEC3;
+  --line-subtle: #8C8880;
   --data-ink: #27302A;
   --accent: #176B3A;
   --accent-ink: #FAF8F1;
@@ -73,7 +81,7 @@
   --text: #171B18;
   --text-muted: #535B55;
   --line: #747D76;
-  --line-subtle: #D2CEC3;
+  --line-subtle: #8C8880;
   --data-ink: #27302A;
   --accent: #176B3A;
   --accent-ink: #FAF8F1;
@@ -92,7 +100,7 @@
   --text: #E7ECE8;
   --text-muted: #A8B0A9;
   --line: #606C63;
-  --line-subtle: #343C36;
+  --line-subtle: #5F6960;
   --data-ink: #C7D0C9;
   --accent: #63D286;
   --accent-ink: #07100A;
@@ -112,7 +120,7 @@
     --text: #E7ECE8;
     --text-muted: #A8B0A9;
     --line: #606C63;
-    --line-subtle: #343C36;
+    --line-subtle: #5F6960;
     --data-ink: #C7D0C9;
     --accent: #63D286;
     --accent-ink: #07100A;
@@ -808,9 +816,9 @@ input[type="range"]::-webkit-slider-runnable-track {
 }
 
 input[type="range"]::-webkit-slider-thumb {
-  width: 14px;
-  height: 22px;
-  margin-top: -10px;
+  width: 24px;
+  height: 44px;
+  margin-top: -21px;
   appearance: none;
   -webkit-appearance: none;
   border: 0;
@@ -823,8 +831,8 @@ input[type="range"]::-moz-range-track {
 }
 
 input[type="range"]::-moz-range-thumb {
-  width: 14px;
-  height: 22px;
+  width: 24px;
+  height: 44px;
   border: 0;
   border-radius: 0;
   background: var(--accent);
@@ -1093,7 +1101,7 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--missing) }
       <a href="/about/">ABOUT</a>
     </nav>
   </details>
-  <button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>
+  <button class="theme-control" id="theme-toggle" type="button" data-theme-value="system" hidden>THEME AUTO</button>
 </header>
 
 <p class="stall-field" id="stall-alert" role="alert" data-ssr="stall-alert">COLLECTION STALLED — no observation for 1d 7h</p>
@@ -1212,7 +1220,7 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--missing) }
         <line id="collection-line" class="collection-line" x1="76" x2="76" y1="24" y2="312"></line>
         <text id="collection-label" class="axis-label" x="82" y="20">collection boundary</text>
         <line id="cursor" class="cursor" y1="24" y2="312"></line>
-        <circle id="point" class="point" r="4"></circle>
+        <circle id="point" class="point" r="4" cx="-10" cy="-10"></circle>
       </svg>
       <p class="empty" id="empty" data-ssr="empty-state"></p>
     </div>
@@ -1238,7 +1246,7 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--missing) }
       <table class="ruled-table" id="chart-data-table">
         <caption>Bounded raw observations for the selected chart series</caption>
         <thead><tr><th scope="col">Observed at</th><th scope="col">Series</th><th scope="col" class="numeric">Value</th><th scope="col">Interval evidence</th></tr></thead>
-        <tbody id="chart-data-body"><tr><td>Rows render from the embedded observation ledger</td><td>—</td><td class="numeric">—</td><td>—</td></tr></tbody>
+        <tbody id="chart-data-body"><tr><td>Rows are carried in this page's embedded observation ledger. With scripting disabled they are not rendered here.</td><td>—</td><td class="numeric">—</td><td>—</td></tr></tbody>
       </table>
     </div>
   </details>
@@ -1457,7 +1465,7 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--missing) }
         <table class="ruled-table" id="composition-data-table">
           <caption>Class totals across the raw retention window</caption>
           <thead><tr><th scope="col">Room-name class</th><th scope="col" class="numeric">Captured events</th><th scope="col" class="numeric">Share</th><th scope="col">Event windows</th></tr></thead>
-          <tbody id="composition-data-body"><tr><td>Table updates from the embedded observation ledger</td><td class="numeric">—</td><td class="numeric">—</td><td>—</td></tr></tbody>
+          <tbody id="composition-data-body"><tr><td>Class totals are carried in this page's embedded observation ledger. With scripting disabled they are not rendered here.</td><td class="numeric">—</td><td class="numeric">—</td><td>—</td></tr></tbody>
         </table>
       </div>
     </details>
@@ -1605,6 +1613,11 @@ const SAMPLING_FALLBACK = {
   newest: "Not recorded",
   total: "Not recorded",
 };
+const LIFECYCLE_SAMPLING_FALLBACK = {
+  value_text: "Not recorded",
+  context:
+    "not recorded · this tick predates room-lifecycle sampling evidence; absence never means zero",
+};
 const CAPACITY_FALLBACK = {
   count_text: "—",
   headroom_text: "No capacity observation recorded",
@@ -1626,7 +1639,6 @@ function readTheme() {
     const stored = localStorage.getItem("observatory-theme");
     return THEMES.includes(stored) ? stored : "system";
   } catch {
-    root.dataset.themeStorage = "unavailable";
     return "system";
   }
 }
@@ -1636,7 +1648,6 @@ function applyTheme(value) {
   if (themeToggle) {
     const label = value === "system" ? "auto" : value;
     themeToggle.textContent = `THEME ${label.toUpperCase()}`;
-    themeToggle.setAttribute("aria-label", `Theme: ${label}`);
     themeToggle.dataset.themeValue = value;
   }
 }
@@ -1644,13 +1655,12 @@ let theme = readTheme();
 function initialiseTheme() {
   applyTheme(theme);
   if (!themeToggle) return;
+  themeToggle.hidden = false;
   themeToggle.addEventListener("click", () => {
     theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
     try {
       localStorage.setItem("observatory-theme", theme);
-    } catch {
-      root.dataset.themeStorage = "unavailable";
-    }
+    } catch {}
     applyTheme(theme);
   });
 }
@@ -1981,9 +1991,15 @@ function renderRoomLifecycle(point) {
       ? display.coverage_text
       : "Room lifecycle has not been recorded.";
 }
+function samplingMeasurement(entry) {
+  return entry &&
+    typeof entry.value_text === "string" &&
+    typeof entry.context === "string"
+    ? entry
+    : LIFECYCLE_SAMPLING_FALLBACK;
+}
 function renderRoomLifecycleSampling(point) {
   const display = point.room_lifecycle_sampling_display;
-  if (!display) return;
   const entries = {
     selection: [
       "lifecycle-sampling-selection",
@@ -1995,28 +2011,16 @@ function renderRoomLifecycleSampling(point) {
     ],
   };
   Object.entries(entries).forEach(([key, ids]) => {
-    const entry = display[key];
-    if (
-      !entry ||
-      typeof entry.value_text !== "string" ||
-      typeof entry.context !== "string"
-    )
-      return;
-    byId(ids[0]).textContent = entry.value_text;
-    byId(ids[1]).textContent = entry.context;
+    const measurement = samplingMeasurement(display && display[key]);
+    byId(ids[0]).textContent = measurement.value_text;
+    byId(ids[1]).textContent = measurement.context;
   });
-  const stages = display.stages;
-  if (!stages || typeof stages !== "object") return;
+  const stages = display && display.stages;
+  const recorded = stages && typeof stages === "object" ? stages : {};
   ["300", "3600", "86400"].forEach((stage) => {
-    const entry = stages[stage];
-    if (
-      !entry ||
-      typeof entry.value_text !== "string" ||
-      typeof entry.context !== "string"
-    )
-      return;
-    byId(`lifecycle-stage-${stage}`).textContent = entry.value_text;
-    byId(`lifecycle-stage-${stage}-context`).textContent = entry.context;
+    const measurement = samplingMeasurement(recorded[stage]);
+    byId(`lifecycle-stage-${stage}`).textContent = measurement.value_text;
+    byId(`lifecycle-stage-${stage}-context`).textContent = measurement.context;
   });
 }
 function renderCapacityMetric(tile, prefix) {

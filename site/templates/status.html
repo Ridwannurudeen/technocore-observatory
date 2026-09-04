@@ -31,8 +31,8 @@
     </section>
 
     <dl class="evidence-rail" aria-label="Status evidence metadata">
-      <div><dt>Observed</dt><dd>%%SOURCE_OBSERVED_AT%% · %%FRESHNESS%%</dd></div>
-      <div><dt>Window</dt><dd>Valid until %%VALID_UNTIL%%</dd></div>
+      <div><dt>Observed</dt><dd>%%SOURCE_OBSERVED_AT%% · <span class="freshness-state" data-freshness-for="status-valid-until">%%FRESHNESS%%</span></dd></div>
+      <div><dt>Window</dt><dd>Valid until <time id="status-valid-until" datetime="%%VALID_UNTIL%%">%%VALID_UNTIL%%</time></dd></div>
       <div><dt>Coverage</dt><dd>Component and endpoint registers</dd></div>
       <div><dt>Method</dt><dd>Versioned status snapshot</dd></div>
       <div><dt>PUBLISHED</dt><dd>%%PUBLISHED_AT%%</dd></div>
