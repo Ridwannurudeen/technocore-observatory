@@ -42,8 +42,12 @@ the rollback evidence.
 - `deploy/systemd/` contains the collector, query, pulse, and rebuild units and the pulse/rebuild
   timers.
 - `rebuild.sh` takes a non-blocking exclusive lock on the resolved publication root, recovers
-  interrupted unpublished builds, creates a new versioned release, runs every guard, atomically
-  replaces only the `current` symlink, and then applies bounded release retention.
+  interrupted unpublished builds, copies the tick ledger once while holding the collector's
+  `ticks.jsonl.lock` so the build and the guards read one untorn snapshot, creates a new versioned
+  release, runs every guard, atomically replaces only the `current` symlink, and then applies
+  bounded release retention. The copy lives in the unit's private `/tmp` and is removed on every
+  exit path. If the lock file is missing, is not a regular file, cannot be opened, or cannot be
+  locked, the rebuild fails closed before copying the ledger or invoking the builder.
 
 All nginx security and CORS headers are declared once at server scope with `always`. Locations do
 not add their own headers, so nginx cannot silently drop the inherited set on error responses. The
@@ -51,9 +55,11 @@ CSP permits same-origin CSS/JavaScript and the legacy inline observatory code, b
 `'self'`. Dynamic room/DID paths receive `X-Robots-Tag`; access logs use `$uri`, never raw query
 arguments or referrers. nginx-generated API 400, 405, 429, and 503 responses use bounded text/JSON
 artifacts selected by `format=json`, with text as the safe default. A 429 also carries
-`Retry-After: 60`; all four error statuses are `no-store`, while successful static status,
-incidents, changes, and methodology representations remain publicly cacheable. Every loopback
-proxy suppresses GET/HEAD request bodies and clears the forwarded `Content-Length`.
+`Retry-After: 60`; that 60 s is a deliberate over-backoff, not the replenishment interval, because
+the zone replenishes one request every 2 s with a burst of 10. All four error statuses are
+`no-store`, while successful static status, incidents, changes, and methodology representations
+remain publicly cacheable. Every loopback proxy suppresses GET/HEAD request bodies and clears the
+forwarded `Content-Length`.
 
 The signer and telemetry databases use SQLite DELETE journal mode. Consequently, the read-only
 query and rebuild services have no WAL/SHM sidecar dependency. An interrupted write can still
@@ -67,7 +73,7 @@ From the repository root, using a real local tick ledger and telemetry database:
 ```bash
 python -m pytest -q
 python -m py_compile ./*.py
-ruff check . --per-file-ignores "derive.py:F841"
+ruff check .
 
 python build_site.py \
   /absolute/path/ticks.jsonl \
@@ -88,10 +94,8 @@ python guards.py \
 
 Non-zero means stop. A `SKIP` for Playwright or a browser is not a render validation; both render
 guards must already have passed on a browser-capable machine before the release is eligible.
-The Ruff invocation carries one explicit waiver for the pre-existing unused local in
-`derive.py:2808`; the roadmap release does not touch that dead-code finding.
 
-The current public contract is methodology 1.15.0. The query unit must pass that exact
+The current public contract is methodology 1.16.0. The query unit must pass that exact
 version so every dynamic response reports the same methodology as the generated snapshots.
 
 ## 2. Stage files without activating them
@@ -344,7 +348,7 @@ nginx -t
 Then establish data before consumers:
 
 1. Run `systemctl start technocore-observatory-pulse.service` once so telemetry schema/data exist.
-2. Start `technocore-observatory.service`, wait for one accepted tick, and verify collector 2.11.1,
+2. Start `technocore-observatory.service`, wait for one accepted tick, and verify collector 2.15.0,
    signer-state/SQLite schema 6, and telemetry schema 1 in local state. This upgrades an existing
    v3-v5 SQLite store before any schema-v6-only reader starts.
 3. Run `systemctl start technocore-observatory-rebuild.service`. It must create a new
@@ -395,7 +399,9 @@ must stay bounded `no-store` 400 responses and must never fall back to the stati
 
 Inspect headers on both 200 and error responses: CSP, HSTS, nosniff, referrer policy, permissions
 policy, frame denial, credential-free CORS, and the route-specific robot policy. Confirm a rate-limit
-response is 429 with `Retry-After`, and confirm the access log contains no raw `q`, `since`,
+response is 429 with `Retry-After`; on `/rooms/?q=...`, `/rooms/{16-hex}/` and `/keys/{did}/` its
+body is the styled `errors/query-rate-limited.html`, elsewhere the text/JSON artifact. Confirm the
+access log contains no raw `q`, `since`,
 `limit`, or `format` values. Confirm every intercepted 400, 405, 429, and 503 is `no-store`, while a
 successful static status, incidents, changes, or methodology response retains the documented
 public cache policy.
@@ -468,10 +474,26 @@ eleven lifecycle triggers, rebuilds `room_lifecycle_totals` with the per-stage c
 revalidates the store — exactly once; that first tick is slower by one full-store validation pass.
 Deploy the tree, restart the collector, then rebuild.
 
-The first 2.14.0 tick will publish an unusually high `deferred_due_to_deadline`, possibly all of its
-revisit reads. The tick clock starts before the one-time migration runs, so the revalidation and
-totals recompute are charged against that tick's own deadline. The number is honest and the next
-tick returns to normal; do not read it as a collection failure.
+That one-time migration is not charged to a tick's revisit deadline. Every invocation drains the
+tick outbox before it collects, and that drain opens the signer database, so the trigger rebuild,
+the `room_lifecycle_totals` rebuild, and the revalidation all finish before `collect_tick` starts
+its clock. Expect no `deferred_due_to_deadline` spike on the first 2.14.0 tick; if one appears,
+it is an ordinary slow tick, not the migration.
+
+### Deploy order at 1.16.0
+
+No collector version moves: 1.16.0 is a deriver-only change to what the payload publishes.
+Recorded gaps now count collector cadence intervals rather than gap records, a rollup bucket is
+marked gapped only by a cadence gap, boundary buckets expect only the ticks their own retention
+level can hold, a legacy funnel tick reports its persistence stage as not recorded, and a
+cumulative series below its chart baseline publishes null instead of zero. Two published fields
+change meaning rather than merely appearing: `signer_funnel.coverage.sampled_rooms` now counts the
+sampled room reads that succeeded, with the manifest selection count moved to the new
+`coverage.selected_rooms`, and the rollup bucket `sum` key is gone. Anything reading either field
+must be updated in the same deploy; earlier payloads keep the old meaning. The query unit's
+`--methodology-version` pin must be moved to 1.16.0 in the same deploy, or the API advertises a
+methodology the snapshots beside it no longer use. Deploy the tree, restart the query unit, then
+rebuild.
 
 ### Reverting the collector from 2.14.0 to 2.13.0
 
@@ -509,7 +531,9 @@ For a static/publication rollback, take the same exclusive publication-root lock
 `rebuild.sh`, then point `current` at a previously verified versioned release with the same atomic
 link pattern and run `nginx -t`. This changes no collector, telemetry, or signer state. The
 immediate predecessor is always retained for this purpose; older releases are subject to the
-documented count/byte bounds. Keep the rejected release for diagnosis.
+documented count/byte bounds. Keep the rejected release for diagnosis. A release built before
+`errors/query-rate-limited.html` existed serves nginx's built-in 429 body on the two human page
+routes, with the same status and headers, until a newer release is published.
 
 ```bash
 (

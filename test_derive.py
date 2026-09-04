@@ -603,7 +603,7 @@ def embedded_data(source):
 
 def test_methodology_version_is_bumped_for_lifecycle_sampling_evidence():
     result = derive_records([])
-    assert derive.METHODOLOGY_VERSION == "1.15.0"
+    assert derive.METHODOLOGY_VERSION == "1.16.0"
     assert result["methodology_version"] == derive.METHODOLOGY_VERSION
     assert (
         "scheduled_due_rooms is exactly ineligible_superseded_before_due"
@@ -694,6 +694,27 @@ def test_published_room_listing_endpoints_match_collector_request():
         assert bare_room_endpoint.search(text) is None, name
 
 
+def test_rate_definitions_describe_the_suppression_the_code_applies():
+    methodology = derive.methodology_definitions()
+    # The census-derived identities_per_second is not one of the four, and it is
+    # not suppressed by a decrease in them.
+    suppression = (
+        "A decrease in any of the four counted totals suppresses all four "
+        "interval rates for that interval, and the last computed rate is "
+        "carried forward with the time it was measured."
+    )
+
+    assert suppression in methodology["room_growth"]
+    assert suppression in methodology["lobby_velocity"]
+    # The trailing capacity window breaks on the polling threshold and a cap
+    # change only, so it must not promise gap-free samples.
+    assert (
+        "consecutive samples within the polling threshold under one unchanged "
+        "cap; a counter decrease does not end the window"
+    ) in methodology["capacity"]
+    assert "gap-free samples under one unchanged cap" not in methodology["capacity"]
+
+
 def test_room_lifecycle_denominators_and_shared_display_are_honest():
     result = derive_records(
         [
@@ -719,6 +740,41 @@ def test_room_lifecycle_denominators_and_shared_display_are_honest():
     assert values["lifecycle-failures-context"] == display["failures"]["context"]
     assert values["lifecycle-budget-context"] == display["budget"]["context"]
     assert values["lifecycle-coverage"] == display["coverage_text"]
+
+    # An empty ledger records no start timestamp, and a missing timestamp is
+    # never interpolated into the published string.
+    empty = lifecycle()
+    empty["ledger_started_at"] = None
+    empty["rooms_in_ledger"] = 0
+    empty["rooms_revisited"] = 0
+    empty["rooms_successfully_revisited"] = 0
+    empty["rooms_with_second_message"] = 0
+    empty["reads_attempted"] = 0
+    empty["reads_failed"] = 0
+    empty["second_sender_classes"] = dict.fromkeys(empty["second_sender_classes"], 0)
+    empty["created_rooms_observed_this_tick"] = 0
+    empty["due_this_tick"] = 0
+    empty["attempted_this_tick"] = 0
+    empty["deferred_due_to_deadline"] = 0
+    empty["deferred_due_to_budget"] = 0
+    empty["revisits"] = []
+    empty["read_budget"] = {
+        **empty["read_budget"],
+        "revisit_reads": 0,
+        "total_reads": 82,
+        "reads_per_minute": 82.0,
+        "share": 82 / 600,
+    }
+    fresh = derive_records([tick("2026-08-30T08:05:00Z", room_lifecycle=empty)])[
+        "points"
+    ][0]
+
+    assert fresh["room_lifecycle"]["ledger_started_at"] is None
+    assert fresh["room_lifecycle_display"]["ledger"]["context"].startswith(
+        "exact created-room names retained privately in SQLite since the ledger "
+        "began; no start timestamp is recorded · "
+    )
+    assert "since None" not in fresh["room_lifecycle_display"]["ledger"]["context"]
 
 
 def test_lifecycle_deferral_reasons_and_actual_elapsed_time_round_trip():
@@ -1312,20 +1368,44 @@ def test_recorded_read_budget_validates_and_reaches_funnel_coverage():
     value = manifest(
         "aaaaaaaaaaaaaaaa",
         "bbbbbbbbbbbbbbbb",
+        success=[True, False],
         frame_size=200,
         read_budget=80,
     )
     record = tick(
         "2026-08-28T08:00:00Z",
         room_sampling=value,
-        signer_funnel=funnel(),
+        signer_funnel=funnel(sampled=1),
     )
     validated = validate_tick(record)
     assert validated["room_sampling"]["read_budget"] == 80
 
     point = derive_records([validated])["points"][0]
+    coverage = point["signer_funnel"]["coverage"]
     assert point["room_sampling"]["read_budget"] == 80
-    assert point["signer_funnel"]["coverage"]["read_budget"] == 80
+    assert coverage["read_budget"] == 80
+    # Rooms selected for a read and reads that succeeded are different
+    # measurements; neither stands in for the other.
+    assert coverage["selected_rooms"] == 2
+    assert coverage["sampled_rooms"] == 1
+    assert "2 selected this tick" in point["signer_funnel"]["display"]["coverage_text"]
+    assert point["sampling_display"]["sampled"] == "2 selected this tick"
+    assert (
+        "1 / 2 selected reads failed this tick"
+        in (point["sampling_display"]["failures"])
+    )
+
+    # A manifest without a funnel carries the same selection count under its own
+    # sampled_rooms, and the sampling register reads the same number either way.
+    bare = derive_records(
+        [validate_tick(tick("2026-08-28T08:00:00Z", room_sampling=value))]
+    )["points"][0]
+    assert bare["signer_funnel"] is None
+    assert bare["sampling_display"]["sampled"] == "2 selected this tick"
+    assert (
+        "1 / 2 selected reads failed this tick"
+        in (bare["sampling_display"]["failures"])
+    )
 
 
 def test_sampling_manifest_rejects_more_entries_than_recorded_budget():
@@ -1614,7 +1694,8 @@ def test_legacy_message_derived_dates_do_not_inflate_persistence_stage():
             counterparties=20,
         ),
     )
-    derived = derive_records([record])["points"][0]["signer_funnel"]
+    result = derive_records([record])
+    derived = result["points"][0]["signer_funnel"]
     assert derived["two_collection_utc_dates"] == 0
     assert derived["two_rooms"] == 0
     assert derived["signed_reciprocal_alternation"] is None
@@ -1622,6 +1703,31 @@ def test_legacy_message_derived_dates_do_not_inflate_persistence_stage():
     assert derived["persistence_collection_utc_dates_count"] == 0
     assert derived["legacy_persistence_reset"] is True
     assert "two_utc_dates" not in derived
+
+    # The reset discards the legacy dates; it does not observe zero collection
+    # dates, so the stage reads like its sibling reciprocity stage.
+    two_dates = next(
+        stage for stage in derived["display"]["stages"] if stage["key"] == "two_dates"
+    )
+    assert two_dates["context"] == (
+        "not recorded · this tick predates collection-UTC-date persistence "
+        "measurement; legacy message-derived dates are not reinterpreted"
+    )
+    assert "0 distinct collection UTC dates" not in two_dates["context"]
+    assert ssr_values(result)["funnel-two-dates-context"] == two_dates["context"]
+    # The stage reads like its sibling reciprocity stage on both sides: a
+    # "not recorded" caption must not sit beside an affirmative zero.
+    sustained = next(
+        stage for stage in derived["display"]["stages"] if stage["key"] == "sustained"
+    )
+    assert two_dates["value"] is None
+    assert two_dates["value_text"] == sustained["value_text"] == "—"
+    assert two_dates["width_percent"] == 0.0
+    assert ssr_values(result)["funnel-two-dates"] == "—"
+    assert (
+        "legacy persistence and all downstream stages are reset to zero in the "
+        "validated record and published as not recorded"
+    ) in derive.methodology_definitions()["signer_funnel"]
 
 
 def test_funnel_stages_are_monotonic_after_collapse():
@@ -2057,6 +2163,19 @@ def test_v6_state_accepts_count_above_retired_cap_without_cap_usage_claim():
     assert "retired JSON-store cap 200,000" in tracked_text
     assert tracked_text.endswith("(no longer gates insertion)")
     assert "% of the state cap used" not in tracked_text
+    assert (
+        "Signer-state versions 3 and later store observed DIDs in SQLite without "
+        "an insertion cap"
+    ) in derive.methodology_definitions()["signer_funnel"]
+
+    # The retired cap must not re-arm at the next signer-state bump and reject
+    # every tick the collector writes.
+    later = deepcopy(current)
+    later["signer_state_version"] = 7
+    later_record = tick("2026-08-30T10:00:00Z", signer_funnel=later)
+
+    assert validate_tick(later_record)["signer_funnel"]["tracked_dids"] == 201_365
+    assert ssr_values(derive_records([later_record]))["tracked-dids"] == tracked_text
 
 
 def test_v2_state_above_its_cap_is_refused():
@@ -2452,20 +2571,34 @@ def test_gap_suppresses_interval_rates_and_is_explicit():
     records = [
         tick("2026-08-28T08:00:00Z", event_seq=30000),
         tick(
-            "2026-08-28T08:20:00Z",
+            "2026-08-28T09:00:00Z",
             rooms=110,
             notes=1100,
             lobby=5200,
-            event_seq=30020,
+            event_seq=30500,
             events=[
                 {
-                    "seq": 30020,
-                    "ts": "2026-08-28T08:20:00Z",
+                    "seq": 30500,
+                    "ts": "2026-08-28T09:00:00Z",
                     "name": "later",
                     "primary_class": "human_or_other",
                     "base_name": "later",
                 }
             ],
+        ),
+        tick(
+            "2026-08-28T09:05:00Z",
+            rooms=111,
+            notes=1101,
+            lobby=5201,
+            event_seq=30501,
+        ),
+        tick(
+            "2026-08-28T09:10:00Z",
+            rooms=105,
+            notes=1102,
+            lobby=5202,
+            event_seq=30502,
         ),
     ]
     result = derive_records(records, gap_seconds=300)
@@ -2473,12 +2606,66 @@ def test_gap_suppresses_interval_rates_and_is_explicit():
     assert point["rates"]["public_rooms_per_second"]["value"] is None
     assert point["rates"]["public_rooms_per_second"]["samples"] == 0
     assert any(gap["reason"] == "polling_gap" for gap in result["gaps"])
-    assert point["composition"]["expected"] == 20
+    assert point["composition"]["expected"] == 500
     assert point["composition"]["samples"] == 1
     assert point["composition"]["complete"] is False
     assert any(gap["reason"] == "events_window_incomplete" for gap in result["gaps"])
+    assert any(gap["reason"] == "counter_decreased" for gap in result["gaps"])
     assert point["capacity"]["notes"]["trailing_rate"] is None
     assert point["capacity"]["notes"]["trailing_window"]["samples"] == 0
+    # Recorded gaps count collector cadence intervals. One interval carried both
+    # a polling gap and an incomplete event window, and a later interval was
+    # observed on time but saw a counter fall; that is one recorded gap.
+    assert len(result["gaps"]) == 3
+    assert result["gap_count"] == 1
+    # cadence_gap marks the record, and the page breaks on the ends it marks.
+    # The incomplete event window shares its interval with a flagged polling
+    # gap, so the break is already there; the on-cadence decrease is not one.
+    assert [gap["cadence_gap"] for gap in result["gaps"]] == [True, False, False]
+    assert {gap["to"] for gap in result["gaps"] if gap["cadence_gap"]} == {
+        "2026-08-28T09:00:00Z"
+    }
+
+    # An interval can run past the polling threshold and see a counter fall. The
+    # collector still missed observations there, so it stays a recorded gap and
+    # still breaks the chart.
+    both = [
+        tick("2026-08-01T08:00:00Z", event_seq=30_000),
+        tick(
+            "2026-08-01T09:00:00Z",
+            rooms=90,
+            notes=1_001,
+            lobby=5_001,
+            event_seq=30_001,
+        ),
+    ]
+    late_decrease = derive_records(both, gap_seconds=300)
+
+    assert [gap["reason"] for gap in late_decrease["gaps"]] == ["counter_decreased"]
+    assert late_decrease["gaps"][0]["cadence_gap"] is True
+    assert late_decrease["gap_count"] == 1
+
+    rolled = derive_records(
+        [
+            *both,
+            tick(
+                "2026-08-03T09:05:00Z",
+                rooms=95,
+                notes=1_002,
+                lobby=5_002,
+                event_seq=30_002,
+            ),
+        ],
+        gap_seconds=300,
+    )
+    late_bucket = next(
+        level
+        for level in rolled["history"]["rollup_levels"]
+        if level["resolution_label"] == "1-hour rollup"
+    )["buckets"][0]
+
+    assert late_bucket["start"] == "2026-08-01T08:00:00Z"
+    assert late_bucket["has_gap"] is True
 
 
 def test_short_series_stays_short():
@@ -2607,6 +2794,134 @@ def test_rollup_preserves_empty_buckets_first_last_and_gap_boundaries():
     assert non_null[-1]["has_gap"] is True
     assert non_null[-1]["complete"] is False
     assert non_null[-1]["missing_count"] > 0
+    # Summing cumulative counters across a bucket produced a number with no
+    # window and no denominator, so it is not published.
+    assert "sum" not in non_null[0]
+
+    # A counter decrease and an incomplete event window are recorded against
+    # their own intervals; neither is a missed observation, so neither breaks
+    # a bucket whose every tick arrived on cadence.
+    cadence_start = datetime(2026, 8, 1, 8, tzinfo=timezone.utc)
+    cadence_records = [
+        tick(
+            (cadence_start + timedelta(minutes=5 * index))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            rooms=100 + index,
+            notes=1_000 + index,
+            lobby=5_000 + index,
+            event_seq=30_000 + index,
+        )
+        for index in range(13)
+    ]
+    cadence_records[6]["rooms_total"] = 90
+    for index, last_seq in ((11, 30_100), (12, 30_101)):
+        cadence_records[index]["events_last_seq"] = last_seq
+        cadence_records[index]["events_window"] = [
+            {
+                "seq": last_seq,
+                "ts": cadence_records[index]["ts"],
+                "name": "later",
+                "primary_class": "human_or_other",
+                "base_name": "later",
+            }
+        ]
+    on_cadence = derive_records(cadence_records, gap_seconds=600)
+
+    assert {gap["reason"] for gap in on_cadence["gaps"]} == {
+        "counter_decreased",
+        "events_window_incomplete",
+    }
+    assert on_cadence["gap_count"] == 0
+
+    rolled = derive_records(
+        [
+            *cadence_records,
+            tick(
+                "2026-08-03T09:05:00Z",
+                rooms=200,
+                notes=2_000,
+                lobby=6_000,
+                event_seq=30_200,
+            ),
+        ],
+        gap_seconds=600,
+    )
+    rolled_hourly = next(
+        level
+        for level in rolled["history"]["rollup_levels"]
+        if level["resolution_label"] == "1-hour rollup"
+    )
+    observed_hour = rolled_hourly["buckets"][0]
+
+    assert observed_hour["start"] == "2026-08-01T08:00:00Z"
+    assert observed_hour["observation_count"] == 12
+    assert observed_hour["missing_count"] == 0
+    assert observed_hour["has_gap"] is False
+    assert observed_hour["complete"] is True
+    assert (
+        "chart lines do not cross a bucket containing a recorded collector cadence gap"
+    ) in derive.methodology_definitions()["history"]
+
+    # A boundary bucket holds only the span its own retention level covers, and
+    # nothing exists before collection started, so a perfect ledger publishes no
+    # missing ticks at either end. The 03:40 phase leaves the closing bucket
+    # 2h40m of its own level, which only a whole-interval count reads as 2.
+    ledger_start = datetime(2026, 7, 1, 3, 40, tzinfo=timezone.utc)
+    hourly_ledger = [
+        tick(
+            (ledger_start + timedelta(hours=index)).isoformat().replace("+00:00", "Z"),
+            event_seq=30_000 + index,
+            lobby=5_000 + index,
+            notes=1_000 + index,
+        )
+        for index in range(32 * 24)
+    ]
+    perfect = derive_records(hourly_ledger, gap_seconds=4_000)
+    daily_buckets = [
+        bucket
+        for level in perfect["history"]["rollup_levels"]
+        if level["resolution_label"] == "1-day rollup"
+        for bucket in level["buckets"]
+        if bucket is not None
+    ]
+
+    assert perfect["gap_count"] == 0
+    assert daily_buckets[0]["start"] == "2026-07-01T00:00:00Z"
+    assert daily_buckets[0]["observation_count"] == 21
+    assert daily_buckets[0]["missing_count"] == 0
+    assert daily_buckets[0]["complete"] is True
+    assert daily_buckets[-1]["observation_count"] == 2
+    assert daily_buckets[-1]["missing_count"] == 0
+    assert daily_buckets[-1]["complete"] is True
+
+
+def test_opening_retention_bucket_counts_a_missing_cadence_slot():
+    ledger_start = datetime(2026, 7, 1, 3, 40, tzinfo=timezone.utc)
+    hourly_ledger = [
+        tick(
+            (ledger_start + timedelta(hours=index)).isoformat().replace("+00:00", "Z"),
+            event_seq=30_000 + index,
+            lobby=5_000 + index,
+            notes=1_000 + index,
+        )
+        for index in range(32 * 24)
+        if index != 10
+    ]
+
+    result = derive_records(hourly_ledger, gap_seconds=4_000)
+    first_daily_bucket = next(
+        bucket
+        for level in result["history"]["rollup_levels"]
+        if level["resolution_label"] == "1-day rollup"
+        for bucket in level["buckets"]
+        if bucket is not None
+    )
+
+    assert first_daily_bucket["observation_count"] == 20
+    assert first_daily_bucket["expected_tick_count"] == 21
+    assert first_daily_bucket["missing_count"] == 1
+    assert first_daily_bucket["complete"] is False
 
 
 def test_resolution_label_distinguishes_raw_scrubber_from_rollups():
@@ -2713,8 +3028,39 @@ def test_counter_decrease_is_not_rendered_as_a_negative_interval_rate():
         ),
     ]
     result = derive_records(source)
-    assert result["points"][1]["rates"]["public_rooms_per_second"]["value"] is None
+    point = result["points"][1]
+    assert point["rates"]["public_rooms_per_second"]["value"] is None
     assert any(gap["reason"] == "counter_decreased" for gap in result["gaps"])
+
+    # A sequence that fell below the chart baseline makes the cumulative since
+    # collection began unmeasurable, which is not an affirmative zero.
+    assert point["observed_public_rooms"] is None
+    assert point["series_display"]["rooms"]["value_text"] == "— observed"
+    assert point["series_display"]["lobby"]["value_text"] == "— messages"
+    assert point["series_display"]["notes"]["value_text"] == "— notes"
+    assert "measured 0" not in point["series_display"]["lobby"]["summary"]
+    assert ssr_values(result)["hero-value"] == "— observed"
+
+    rolled = derive_records(
+        [
+            *source,
+            tick(
+                "2026-08-29T09:30:00Z",
+                rooms=110,
+                notes=1_100,
+                lobby=5_100,
+                event_seq=30_100,
+            ),
+        ]
+    )
+    reset_bucket = next(
+        bucket
+        for level in rolled["history"]["rollup_levels"]
+        for bucket in level["buckets"]
+        if bucket is not None and bucket["observation_count"] == 2
+    )
+    assert reset_bucket["min"]["observed_public_rooms"] == 0
+    assert reset_bucket["max"]["observed_public_rooms"] == 0
 
 
 def test_validate_tick_rejects_event_window_mismatch():
@@ -3375,13 +3721,15 @@ def test_live_2_13_finalization_evidence_validates_and_derives_cleanly(
     assert "0 aged-out checks remained unfinalized" in coverage_text
 
 
-def test_2_14_collector_tick_passes_the_2_13_sampling_gates(tmp_path, monkeypatch):
-    # Collector 2.14.0 changes only how the coverage numbers are computed —
-    # terminal rows come from rollup counters instead of a per-tick rescan —
-    # not the published payload, so a 2.14.0 tick must satisfy every sampling
-    # gate introduced at or before 2.13.0 without any deriver change.
+def test_2_15_collector_tick_passes_the_existing_sampling_gates(
+    tmp_path,
+    monkeypatch,
+):
+    # Collector 2.15.0 changes other parts of the tick contract, while retaining
+    # the lifecycle-sampling payload introduced in 2.13.0. A current tick must
+    # therefore continue to satisfy every existing sampling gate.
     record = collector_finalization_tick(tmp_path, monkeypatch)
-    assert record["collector_version"] == "2.14.0"
+    assert record["collector_version"] == "2.15.0"
     assert derive.collector_version_at_least(
         record["collector_version"],
         derive.ROOM_AGED_OUT_FINALIZATION_COLLECTOR_VERSION,

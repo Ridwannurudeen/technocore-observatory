@@ -22,7 +22,7 @@ from api_contract import (
     utc_now,
 )
 
-INCIDENT_RULES_VERSION = "1.0.0"
+INCIDENT_RULES_VERSION = "1.1.0"
 VALID_FOR = timedelta(minutes=15)
 STATUS_WINDOW = timedelta(hours=1)
 MAX_ATTEMPTS = 50_000
@@ -79,6 +79,11 @@ def freshness(
 def latest_time(values: Iterable[str | None]) -> str | None:
     present = [value for value in values if value is not None]
     return max(present, key=parse_utc) if present else None
+
+
+def earliest_time(values: Iterable[str | None]) -> str | None:
+    present = [value for value in values if value is not None]
+    return min(present, key=parse_utc) if present else None
 
 
 def load_ticks(path: Path) -> tuple[list[dict[str, Any]], int]:
@@ -484,20 +489,20 @@ def status_resource(
     attempts = telemetry["attempts"]
     latest_attempt_at = attempts[-1]["observed_at"] if attempts else None
     latest_tick_at = ticks[-1]["ts"] if ticks else None
-    source_observed_at = latest_time((latest_tick_at, latest_attempt_at))
-    endpoints, endpoint_coverage = endpoint_summaries(attempts, latest_attempt_at)
-
     health_attempts = [
         attempt for attempt in attempts if attempt["route"] == "/healthz"
     ]
     latest_health = health_attempts[-1] if health_attempts else None
+    origin_source = latest_health["observed_at"] if latest_health else None
+    source_observed_at = earliest_time((latest_tick_at, origin_source))
+    endpoints, endpoint_coverage = endpoint_summaries(attempts, latest_attempt_at)
+
     if latest_health is None:
         origin_state = "not_observed"
     elif is_success(latest_health):
         origin_state = "reachable"
     else:
         origin_state = "observed_failure"
-    origin_source = latest_health["observed_at"] if latest_health else None
     origin = {
         "state": origin_state,
         "latest_outcome": latest_health["outcome"] if latest_health else None,
@@ -815,12 +820,12 @@ def affects_interpretation(route: str, field: str) -> bool:
     if route == "/config":
         return field.startswith(
             (
+                "settings.dupe_",
+                "settings.ephemeral_ttl_",
                 "settings.max_",
-                "settings.limit",
                 "settings.rate_",
                 "settings.static_cache_",
-                "limits.",
-                "cadence.",
+                "settings.wait_",
                 "service",
                 "version",
             )
@@ -836,7 +841,6 @@ def affects_interpretation(route: str, field: str) -> bool:
             "schema_version",
             "trust.",
             "version",
-            "url",
         )
     )
 
@@ -858,6 +862,7 @@ def parse_discovery_fields(value: Any, label: str) -> dict[str, Any]:
 def change_resource(
     discoveries: list[dict[str, Any]],
     *,
+    attempts: list[dict[str, Any]] | None = None,
     predecessors: dict[str, dict[str, Any]] | None = None,
     discovery_input: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
@@ -881,7 +886,9 @@ def change_resource(
                 old = previous.get(field, MISSING)
                 new = current.get(field, MISSING)
                 if old is new or (
-                    old is not MISSING and new is not MISSING and old == new
+                    old is not MISSING
+                    and new is not MISSING
+                    and json_bytes({"v": old}) == json_bytes({"v": new})
                 ):
                     continue
                 changes.append(
@@ -906,9 +913,19 @@ def change_resource(
         reverse=True,
     )
     bounded = changes[:MAX_CHANGES]
-    source_observed_at = discoveries[-1]["observed_at"] if discoveries else None
+    last_change_observed_at = discoveries[-1]["observed_at"] if discoveries else None
+    source_observed_at = (
+        latest_time(
+            attempt["observed_at"]
+            for attempt in attempts or ()
+            if attempt["route"] in ("/config", "/.well-known/agent.json")
+            and is_success(attempt)
+        )
+        or last_change_observed_at
+    )
     coverage = {
         "discovery_snapshots": accepted_snapshots,
+        "last_change_observed_at": last_change_observed_at,
         "records_returned": len(bounded),
         "records_derived": len(changes),
         "truncated": len(changes) > len(bounded),
@@ -926,6 +943,65 @@ def methodology_resource() -> dict[str, Any]:
             "numbers and earlier revision details are not inferred."
         ),
         "change_history": [
+            {
+                "version": "1.16.0",
+                "published_on": "2026-09-02",
+                "changes": [
+                    "Counted recorded gaps as collector cadence intervals rather "
+                    "than gap records, so an interval that also carried an "
+                    "incomplete event window, and an interval whose counters only "
+                    "fell, are no longer added to the total.",
+                    "Marked a rollup bucket as gapped only where a collector "
+                    "cadence gap overlaps it, and published a cadence_gap flag "
+                    "on each recorded gap so the page breaks its chart on the "
+                    "same rule the rollups use.",
+                    "Bounded each rollup bucket's expected tick count to the span "
+                    "its own retention level covers and to the time since "
+                    "collection started, so a boundary bucket no longer reports "
+                    "ticks as missing that began before collection or that are "
+                    "published in the neighbouring level.",
+                    "Reported the collection-UTC-date persistence stage of a "
+                    "legacy funnel tick as not recorded rather than as zero "
+                    "qualifying keys over zero observed dates.",
+                    "Published a cumulative series value as not recorded where "
+                    "the service's sequence fell below the chart baseline, "
+                    "instead of clamping the unmeasurable difference to zero; "
+                    "the chart now breaks at such a point rather than drawing "
+                    "it on the axis.",
+                    "Separated the two room-sampling denominators the signer "
+                    "funnel had merged: coverage.sampled_rooms is the count of "
+                    "sampled room reads that succeeded, and the new "
+                    "coverage.selected_rooms is the count the sampling "
+                    "manifest selected for a read.",
+                    "Stopped publishing the rollup bucket sum of the "
+                    "cumulative counters; a total summed across a bucket "
+                    "carried neither a window nor a denominator.",
+                    "Released the retired signer-state insertion cap for every "
+                    "state version from 3 onward rather than for versions 3 "
+                    "through 6 by name, so the next state version is not "
+                    "rejected for exceeding a cap that no longer gates "
+                    "insertion.",
+                ],
+                "limitations": [
+                    "Gap counts, rollup completeness, funnel coverage counts "
+                    "and cumulative series values published by earlier releases "
+                    "were derived under the previous rules and are not "
+                    "rewritten; in particular their coverage.sampled_rooms "
+                    "carried the manifest selection count, not the "
+                    "successful-read count it names now.",
+                    "Every recorded gap is still listed with its own reason and "
+                    "a cadence_gap flag; a counter decrease or an incomplete "
+                    "event window is recorded but no longer counted as a "
+                    "recorded gap or drawn as a break.",
+                    "Rollup buckets carry no event-window completeness field "
+                    "and the published gap list keeps only the newest 24 hours, "
+                    "so an incomplete event window older than that window is "
+                    "recorded in neither surface.",
+                    "A rollup bucket's expected count still uses the median "
+                    "gap-free accepted interval, so it describes cadence and "
+                    "never asserts that a specific missing tick existed.",
+                ],
+            },
             {
                 "version": "1.15.0",
                 "published_on": "2026-09-01",
@@ -1234,6 +1310,7 @@ def build_snapshots_from_records(
     )
     changes, changes_source, changes_coverage = change_resource(
         telemetry["discoveries"],
+        attempts=telemetry["attempts"],
         predecessors=telemetry["discovery_predecessors"],
         discovery_input=telemetry["discovery_input"],
     )

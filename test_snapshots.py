@@ -180,6 +180,83 @@ def test_status_counts_503_attempts_instead_of_reporting_zero_activity(tmp_path)
     assert endpoints["/rooms"]["observed_failures"] == 1
 
 
+@pytest.mark.parametrize(
+    ("tick_at", "attempt_at"),
+    (
+        pytest.param(
+            "2026-08-30T06:00:00Z", "2026-08-30T00:00:00Z", id="dead-pulse-probe"
+        ),
+        pytest.param(
+            "2026-08-30T00:00:00Z", "2026-08-30T06:00:00Z", id="dead-collector"
+        ),
+    ),
+)
+def test_status_envelope_freshness_follows_the_oldest_component(
+    tmp_path,
+    tick_at,
+    attempt_at,
+):
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(ticks, tick(tick_at))
+    with telemetry_database(telemetry) as connection:
+        add_attempt(
+            connection,
+            attempt_id=1,
+            route="/healthz",
+            observed_at=attempt_at,
+            outcome="success",
+            status=200,
+        )
+
+    result = build_snapshots(
+        ticks,
+        telemetry,
+        derived_at="2026-08-30T06:00:10Z",
+        published_at="2026-08-30T06:00:30Z",
+    )["status"]
+
+    assert result["source_observed_at"] == "2026-08-30T00:00:00Z"
+    assert result["valid_until"] == "2026-08-30T00:15:00Z"
+    assert result["freshness"] == "stale"
+    assert result["status"]["origin"]["source_observed_at"] == attempt_at
+    assert result["status"]["collector"]["source_observed_at"] == tick_at
+
+
+def test_status_envelope_uses_the_health_probe_not_a_newer_unrelated_attempt(tmp_path):
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(ticks, tick("2026-08-30T06:00:00Z"))
+    with telemetry_database(telemetry) as connection:
+        add_attempt(
+            connection,
+            attempt_id=1,
+            route="/healthz",
+            observed_at="2026-08-30T00:00:00Z",
+            outcome="success",
+            status=200,
+        )
+        add_attempt(
+            connection,
+            attempt_id=2,
+            route="/rooms",
+            observed_at="2026-08-30T06:00:00Z",
+            outcome="success",
+            status=200,
+        )
+
+    result = build_snapshots(
+        ticks,
+        telemetry,
+        derived_at="2026-08-30T06:00:10Z",
+        published_at="2026-08-30T06:00:30Z",
+    )["status"]
+
+    assert result["source_observed_at"] == "2026-08-30T00:00:00Z"
+    assert result["freshness"] == "stale"
+    assert result["status"]["origin"]["source_observed_at"] == ("2026-08-30T00:00:00Z")
+
+
 def test_snapshot_rejects_a_source_observation_after_derivation(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     telemetry = tmp_path / "telemetry.sqlite3"
@@ -574,9 +651,55 @@ def test_discovery_changes_publish_allowlisted_old_and_new_values(tmp_path):
             "first_observed_at": "2026-08-30T01:01:00Z",
             "source_route": "/config",
             "interpretation_affected": True,
-            "methodology_version": "1.0.0",
+            "methodology_version": "1.1.0",
         }
     ]
+
+
+def test_config_route_limits_are_interpretation_affected():
+    changes, _, _ = change_resource(
+        [
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T00:00:00Z",
+                "fields_json": json.dumps(
+                    {
+                        "settings": {
+                            "dupe_filter_seconds": 60,
+                            "ephemeral_ttl_seconds": 300,
+                            "wait_poll": 1,
+                        }
+                    }
+                ),
+            },
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T01:00:00Z",
+                "fields_json": json.dumps(
+                    {
+                        "settings": {
+                            "dupe_filter_seconds": 90,
+                            "ephemeral_ttl_seconds": 600,
+                            "wait_poll": 2,
+                        }
+                    }
+                ),
+            },
+        ]
+    )
+
+    assert {item["field"]: item["interpretation_affected"] for item in changes} == {
+        "settings.dupe_filter_seconds": True,
+        "settings.ephemeral_ttl_seconds": True,
+        "settings.wait_poll": True,
+    }
+
+
+def test_interpretation_allowlist_carries_no_uncollectable_prefix():
+    assert not snapshots.affects_interpretation("/config", "settings.limit_rooms")
+    assert not snapshots.affects_interpretation("/config", "limits.rooms")
+    assert not snapshots.affects_interpretation("/config", "cadence.seconds")
+    assert not snapshots.affects_interpretation("/.well-known/agent.json", "url")
 
 
 def test_discovery_cap_loads_route_predecessor_and_discloses_cutoff(
@@ -662,6 +785,32 @@ def test_discovery_changes_distinguish_explicit_null_from_field_absence():
     assert [(item["old"], item["new"]) for item in reversed(changes)] == [
         (None, {"state": "field_absent"}),
         ({"state": "field_absent"}, None),
+    ]
+
+
+def test_discovery_changes_publish_a_recorded_value_type_flip():
+    changes, _, _ = change_resource(
+        [
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T00:00:00Z",
+                "fields_json": json.dumps(
+                    {"settings": {"fsync": True, "max_rooms": 10}}
+                ),
+            },
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T01:00:00Z",
+                "fields_json": json.dumps(
+                    {"settings": {"fsync": 1, "max_rooms": 10.0}}
+                ),
+            },
+        ]
+    )
+
+    assert [(item["field"], item["old"], item["new"]) for item in changes] == [
+        ("settings.max_rooms", 10, 10.0),
+        ("settings.fsync", True, 1),
     ]
 
 
@@ -841,12 +990,15 @@ def test_huge_engagement_integers_remain_not_recorded_without_raising():
 def test_methodology_discloses_current_room_name_policy_and_history_boundary():
     methodology = snapshots.methodology_resource()
 
+    assert snapshots.INCIDENT_RULES_VERSION == "1.1.0"
+    assert methodology["rules_version"] == "1.1.0"
     assert methodology["history_boundary"] == (
         "Repository-backed methodology history begins at 1.3.0; absent version "
         "numbers and earlier revision details are not inferred."
     )
     history = methodology["change_history"]
     assert [entry["version"] for entry in history] == [
+        "1.16.0",
         "1.15.0",
         "1.14.0",
         "1.13.0",
@@ -868,28 +1020,57 @@ def test_methodology_discloses_current_room_name_policy_and_history_boundary():
     # reader cannot see what the live methodology changed.
     assert history[0]["version"] == derive.METHODOLOGY_VERSION
     assert history[0] == {
-        "version": "1.15.0",
-        "published_on": "2026-09-01",
+        "version": "1.16.0",
+        "published_on": "2026-09-02",
         "changes": [
-            "Separated checks attempted after their eligibility window closed "
-            "into a distinct attempted_late state, and began finalizing "
-            "never-attempted aged-out checks as terminal records in bounded "
-            "per-tick batches, publishing the count finalized each tick and "
-            "the backlog still remaining."
+            "Counted recorded gaps as collector cadence intervals rather than "
+            "gap records, so an interval that also carried an incomplete event "
+            "window, and an interval whose counters only fell, are no longer "
+            "added to the total.",
+            "Marked a rollup bucket as gapped only where a collector cadence "
+            "gap overlaps it, and published a cadence_gap flag on each recorded "
+            "gap so the page breaks its chart on the same rule the rollups use.",
+            "Bounded each rollup bucket's expected tick count to the span its "
+            "own retention level covers and to the time since collection "
+            "started, so a boundary bucket no longer reports ticks as missing "
+            "that began before collection or that are published in the "
+            "neighbouring level.",
+            "Reported the collection-UTC-date persistence stage of a legacy "
+            "funnel tick as not recorded rather than as zero qualifying keys "
+            "over zero observed dates.",
+            "Published a cumulative series value as not recorded where the "
+            "service's sequence fell below the chart baseline, instead of "
+            "clamping the unmeasurable difference to zero; the chart now breaks "
+            "at such a point rather than drawing it on the axis.",
+            "Separated the two room-sampling denominators the signer funnel had "
+            "merged: coverage.sampled_rooms is the count of sampled room reads "
+            "that succeeded, and the new coverage.selected_rooms is the count "
+            "the sampling manifest selected for a read.",
+            "Stopped publishing the rollup bucket sum of the cumulative "
+            "counters; a total summed across a bucket carried neither a window "
+            "nor a denominator.",
+            "Released the retired signer-state insertion cap for every state "
+            "version from 3 onward rather than for versions 3 through 6 by "
+            "name, so the next state version is not rejected for exceeding a "
+            "cap that no longer gates insertion.",
         ],
         "limitations": [
-            "Ticks recorded before collector 2.13.0 include late attempts in "
-            "their aged_out_unselected counts and publish attempted_late as "
-            "not recorded; their historical meaning is not rewritten.",
-            "Finalization is terminal bookkeeping that writes no attempt "
-            "evidence; a check finalized as aged out stays aged out even if "
-            "supersession evidence for its window is observed later.",
-            "A recorded origin read now outranks supersession evidence, so "
-            "from collector 2.13.0 a late-read check whose name was recreated "
-            "before the check fell due is counted as an eligible late attempt "
-            "rather than as ineligible and superseded before due. This shifts "
-            "the split between those two counts at the version boundary; "
-            "earlier ticks keep their original split.",
+            "Gap counts, rollup completeness, funnel coverage counts and "
+            "cumulative series values published by earlier releases were "
+            "derived under the previous rules and are not rewritten; in "
+            "particular their coverage.sampled_rooms carried the manifest "
+            "selection count, not the successful-read count it names now.",
+            "Every recorded gap is still listed with its own reason and a "
+            "cadence_gap flag; a counter decrease or an incomplete event window "
+            "is recorded but no longer counted as a recorded gap or drawn as a "
+            "break.",
+            "Rollup buckets carry no event-window completeness field and the "
+            "published gap list keeps only the newest 24 hours, so an "
+            "incomplete event window older than that window is recorded in "
+            "neither surface.",
+            "A rollup bucket's expected count still uses the median gap-free "
+            "accepted interval, so it describes cadence and never asserts that "
+            "a specific missing tick existed.",
         ],
     }
 
@@ -962,6 +1143,76 @@ def test_frozen_input_valid_until_never_slides_forward_on_rebuild(tmp_path):
     assert first["freshness"] == second["freshness"] == "stale"
     assert first["derived_at"] != second["derived_at"]
     assert first["published_at"] != second["published_at"]
+
+
+def test_changes_envelope_tracks_the_newest_re_confirmed_discovery_read(tmp_path):
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(ticks, tick("2026-09-02T19:00:00Z"))
+    with telemetry_database(telemetry) as connection:
+        add_attempt(
+            connection,
+            attempt_id=1,
+            route="/config",
+            observed_at="2026-08-30T19:00:00Z",
+            outcome="success",
+            status=200,
+        )
+        connection.execute(
+            "INSERT INTO discovery_snapshots VALUES (1, 1, '/config', ?, ?, ?)",
+            (
+                "2026-08-30T19:00:00Z",
+                f"{1:064x}",
+                json.dumps({"settings": {"max_rooms": 40_960}}),
+            ),
+        )
+        add_attempt(
+            connection,
+            attempt_id=2,
+            route="/config",
+            observed_at="2026-09-02T18:59:00Z",
+            outcome="success",
+            status=200,
+        )
+
+    result = build_snapshots(
+        ticks,
+        telemetry,
+        derived_at="2026-09-02T19:00:00Z",
+        published_at="2026-09-02T19:00:00Z",
+    )["changes"]
+
+    assert result["source_observed_at"] == "2026-09-02T18:59:00Z"
+    assert result["valid_until"] == "2026-09-02T19:14:00Z"
+    assert result["freshness"] == "fresh"
+    assert result["coverage"]["last_change_observed_at"] == "2026-08-30T19:00:00Z"
+
+
+def test_changes_envelope_falls_back_to_the_last_stored_snapshot_time():
+    _, source_observed_at, coverage = change_resource(
+        [
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T00:00:00Z",
+                "fields_json": json.dumps({"service": "technocore"}),
+            }
+        ],
+        attempts=[
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T02:00:00Z",
+                "outcome": "http_error",
+            },
+            {
+                "route": "/healthz",
+                "observed_at": "2026-08-30T03:00:00Z",
+                "outcome": "success",
+            },
+        ],
+    )
+
+    assert source_observed_at == "2026-08-30T00:00:00Z"
+    assert coverage["last_change_observed_at"] == "2026-08-30T00:00:00Z"
 
 
 def test_unfinished_cycle_is_unknown_and_never_an_incident(tmp_path):

@@ -56,7 +56,7 @@ jobs:
           for path in pathlib.Path('.').glob('*.py')]"
 
       - name: Check Ruff lint
-        run: python -m ruff check . --per-file-ignores derive.py:F841
+        run: python -m ruff check .
 
       - name: Check Ruff formatting
         run: python -m ruff format --check .

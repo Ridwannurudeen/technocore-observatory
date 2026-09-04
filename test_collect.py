@@ -352,25 +352,102 @@ def test_events_reject_sequences_outside_sqlite_integer_storage():
     assert caught.value.outcome == "invalid_response"
 
 
-@pytest.mark.parametrize(
-    "engagement",
-    (
-        pytest.param('{"score":NaN}', id="non-standard-number"),
-        pytest.param(r'{"label":"\ud800"}', id="lone-surrogate"),
-    ),
-)
-def test_rooms_reject_engagement_that_cannot_be_canonicalized(engagement):
-    body = (
-        '{"total":0,"capacity":100,"bytes":0,'
+def rooms_body_with_engagement(engagement):
+    return (
+        '{"total":1,"capacity":100,"bytes":0,'
         '"notes":{"total":0,"capacity":100,"bytes":0},'
         f'"rooms":[],"engagement":{engagement}}}'
     )
 
+
+def deeply_nested_object(depth):
+    value = {}
+    for _ in range(depth):
+        value = {"deeper": value}
+    return value
+
+
+@pytest.mark.parametrize(
+    "engagement",
+    (
+        pytest.param('{"nick_diversity":NaN}', id="non-standard-number"),
+        pytest.param('{"window_cap":Infinity}', id="non-standard-infinity"),
+    ),
+)
+def test_rooms_reject_engagement_that_cannot_be_canonicalized(engagement):
     with pytest.raises(CollectionError) as caught:
-        collect.parse_rooms(body)
+        collect.parse_rooms(rooms_body_with_engagement(engagement))
 
     assert caught.value.outcome == "invalid_response"
     assert caught.value.path == "/rooms"
+
+
+def test_rooms_project_engagement_to_the_fields_the_deriver_reads():
+    engagement = json.dumps(
+        {
+            "nick_diversity": 0.5,
+            "window_cap": 500,
+            "windowed_messages": "12",
+            "unbounded_text": "x" * 1_000_000,
+            "unbounded_depth": deeply_nested_object(500),
+        }
+    )
+
+    parsed = collect.parse_rooms(rooms_body_with_engagement(engagement))
+
+    assert parsed["engagement"] == {"nick_diversity": 0.5, "window_cap": 500}
+
+
+def test_projected_engagement_reaches_the_tick_and_validates(tmp_path, monkeypatch):
+    tick_ts = "2026-08-30T08:01:00Z"
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+
+    class EngagementClient:
+        def get(self, path, deadline=None):
+            if path == "/rooms?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "total": 1,
+                        "capacity": 100,
+                        "bytes": 10,
+                        "notes": {"total": 1, "capacity": 100, "bytes": 1},
+                        "rooms": [{"name": "lobby", "seq": 1, "idle": 0}],
+                        "engagement": {
+                            "nick_diversity": 0.5,
+                            "windowed_messages": "12",
+                            "unbounded_text": "x" * 1_000_000,
+                            "unbounded_depth": deeply_nested_object(500),
+                        },
+                    }
+                )
+            if path == "/r/events?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "room": "events",
+                        "messages": [
+                            {
+                                "seq": 1,
+                                "ts": tick_ts,
+                                "from": "server",
+                                "text": "created engagement-room",
+                            }
+                        ],
+                    }
+                )
+            if path.startswith("/r/"):
+                return room_body(message(1, "server"))
+            raise AssertionError(f"unexpected read: {path}")
+
+    tick = collect.collect_tick(EngagementClient(), tmp_path / "signers.json", 100)
+
+    from derive import validate_engagement, validate_tick
+
+    assert set(validate_engagement({})) == set(collect.ENGAGEMENT_FIELDS)
+    assert tick["engagement"] == {"nick_diversity": 0.5}
+    assert len(canonical_tick_bytes(tick)) < 8_192
+    validated = validate_tick(tick)
+    assert validated["engagement"]["nick_diversity"] == 0.5
+    assert validated["engagement"]["windowed_messages"] is None
 
 
 @pytest.mark.parametrize(
@@ -476,6 +553,16 @@ def test_identity_shards_accept_the_exact_upstream_budget_footer_after_rows():
     )
 
     assert collect.parse_shard_count(body, "did-ff") == 1
+
+
+def test_identity_shards_reject_rows_without_a_count_header_or_budget_footer():
+    body = "/kv/did-ff/00000000000000\n/kv/did-ff/00000000000001\n"
+
+    with pytest.raises(CollectionError, match="no recognized listing") as caught:
+        collect.parse_shard_count(body, "did-ff")
+
+    assert caught.value.outcome == "invalid_response"
+    assert caught.value.path == "/kv/{namespace}"
 
 
 @pytest.mark.parametrize(
@@ -627,8 +714,8 @@ def insert_record(
     )
 
 
-def test_collector_version_is_bumped_for_lifecycle_sampling():
-    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 11, 1)
+def test_collector_version_identifies_the_current_tick_contract():
+    assert COLLECTOR_VERSION == "2.15.0"
     assert collect.SIGNER_STATE_VERSION == 6
     assert collect.TICK_REVISIT_DEADLINE_SECONDS == 300
 
@@ -687,6 +774,51 @@ def test_client_retries_an_http_protocol_error_while_reading_the_body(
         ).fetchall() == [(1, "transport_error", None), (2, "success", 200)]
 
 
+def test_client_retries_a_content_length_body_cut_short(tmp_path, monkeypatch):
+    class Response:
+        def __init__(self, status, body, length):
+            self.status = status
+            self.body = io.BytesIO(body)
+            self.length = length
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read1(self, size=-1):
+            chunk = self.body.read(size)
+            self.length -= len(chunk)
+            return chunk
+
+    responses = iter(
+        (
+            Response(200, b'{"ok":', 11),
+            Response(200, b'{"ok":true}', 11),
+        )
+    )
+    monkeypatch.setattr(
+        collect, "open_origin", lambda request, timeout: next(responses)
+    )
+    monkeypatch.setattr(collect.time, "sleep", lambda delay: None)
+
+    with collect.TelemetryStore(tmp_path / "telemetry.sqlite3") as telemetry:
+        cycle_id = telemetry.start_cycle("collector", "2026-08-30T10:00:00Z")
+        client = collect.Client(
+            "https://example.invalid",
+            1,
+            1,
+            telemetry=telemetry,
+            cycle_id=cycle_id,
+        )
+
+        assert client.get("/kv/did-00") == '{"ok":true}'
+        assert telemetry.connection.execute(
+            "SELECT attempt, outcome, http_status FROM request_attempts ORDER BY id"
+        ).fetchall() == [(1, "transport_error", None), (2, "success", 200)]
+
+
 @pytest.mark.parametrize("pace", (float("nan"), float("inf"), -float("inf")))
 def test_census_rejects_a_nonfinite_pace_before_reading(tmp_path, pace):
     class MustNotReadClient:
@@ -695,6 +827,49 @@ def test_census_rejects_a_nonfinite_pace_before_reading(tmp_path, pace):
 
     with pytest.raises(ValueError, match="pace"):
         collect.run_census(MustNotReadClient(), tmp_path / "census.json", pace)
+
+
+@pytest.mark.parametrize("pace", ("0", "0.25"))
+def test_main_rejects_a_census_pace_below_the_metered_read_floor(
+    tmp_path,
+    monkeypatch,
+    pace,
+):
+    def client_must_not_start(*args, **kwargs):
+        raise AssertionError("invalid configuration reached the client")
+
+    monkeypatch.setattr(collect, "Client", client_must_not_start)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect.py",
+            "--base-url",
+            "https://example.invalid",
+            "--output",
+            str(tmp_path / "ticks.jsonl"),
+            "--census-pace",
+            pace,
+            "--once",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="0.5 seconds"):
+        collect.main()
+
+
+def test_census_pace_defaults_to_the_metered_read_floor(tmp_path):
+    assert collect.CENSUS_PACE_FLOOR_SECONDS == 0.5
+    arguments = collect.build_parser().parse_args(
+        [
+            "--base-url",
+            "https://example.invalid",
+            "--output",
+            str(tmp_path / "ticks.jsonl"),
+        ]
+    )
+
+    assert arguments.census_pace == collect.CENSUS_PACE_FLOOR_SECONDS
 
 
 @pytest.mark.parametrize(
@@ -978,7 +1153,12 @@ def test_census_continues_after_failures_and_retries_only_missing_shards(tmp_pat
             shard = path.rsplit("/", 1)[-1]
             attempts[shard] = attempts.get(shard, 0) + 1
             if shard == "did-01" or (shard == "did-00" and attempts[shard] == 1):
-                raise CollectionError(f"GET {path} failed with HTTP 503")
+                raise CollectionError(
+                    f"GET {path} failed with HTTP 503",
+                    outcome="http_error",
+                    status=503,
+                    path=path,
+                )
             return '["00000000000000"]'
 
     total, started_at, census_run = collect.run_census(
@@ -1010,6 +1190,60 @@ def test_census_continues_after_failures_and_retries_only_missing_shards(tmp_pat
         "failure_causes": {"http_503": 6},
         "stop_reason": "maximum_passes",
     }
+
+
+@pytest.mark.parametrize(
+    ("message", "outcome", "status", "cause"),
+    (
+        pytest.param(
+            "GET /kv/did-00 refused HTTP redirect 301",
+            "invalid_response",
+            301,
+            "invalid_shard_response",
+            id="redirect-refusal",
+        ),
+        pytest.param(
+            "GET /kv/did-00 failed: response deadline exceeded",
+            "deadline",
+            None,
+            "deadline",
+            id="last-attempt-deadline",
+        ),
+        pytest.param(
+            "GET /kv/did-00 exceeded the response byte limit",
+            "invalid_response",
+            200,
+            "invalid_shard_response",
+            id="byte-limit-refusal",
+        ),
+        pytest.param(
+            "GET /kv/did-00 failed with HTTP 503",
+            "http_error",
+            503,
+            "http_503",
+            id="http-error",
+        ),
+    ),
+)
+def test_census_publishes_the_failure_cause_the_client_recorded(
+    tmp_path,
+    message,
+    outcome,
+    status,
+    cause,
+):
+    class FailingClient:
+        def get(self, path, deadline=None):
+            raise CollectionError(message, outcome=outcome, status=status, path=path)
+
+    total, _, census_run = collect.run_census(
+        FailingClient(),
+        tmp_path / "census.json",
+        0,
+    )
+
+    assert total is None
+    assert census_run["failure_causes"] == {cause: 256 * collect.CENSUS_MAX_PASSES}
 
 
 def test_census_pacing_handles_deadline_crossed_between_clock_reads(
@@ -1541,6 +1775,25 @@ def test_atomic_json_is_fsynced_before_publication(tmp_path, monkeypatch):
     assert not path.with_name(path.name + ".tmp").exists()
 
 
+def test_atomic_json_leaves_no_temporary_after_a_failed_write(tmp_path):
+    path = tmp_path / "state.json"
+    collect.save_atomic_json(path, {"value": 1})
+    published = path.read_bytes()
+
+    with (
+        mock.patch.object(
+            collect.os,
+            "write",
+            side_effect=OSError("no space left on device"),
+        ),
+        pytest.raises(OSError, match="no space left on device"),
+    ):
+        collect.save_atomic_json(path, {"value": 2})
+
+    assert path.read_bytes() == published
+    assert not path.with_name(path.name + ".tmp").exists()
+
+
 def test_incomplete_census_tick_publishes_progress_but_no_count(
     tmp_path,
     monkeypatch,
@@ -1828,10 +2081,30 @@ def test_created_room_preserves_fractional_revisit_schedule_precision(signer_sto
     assert [row["created_seq"] for row in at_due["selected"]] == [10]
 
 
+def test_created_room_accepts_a_subsecond_origin_clock_lead(signer_store):
+    event = created_event(
+        10,
+        "2026-08-30T08:00:01.900000Z",
+        "sub-second-room",
+    )
+
+    assert (
+        record_created_rooms(
+            signer_store,
+            [event],
+            "2026-08-30T08:00:01Z",
+        )
+        == 1
+    )
+    assert signer_store.execute(
+        "SELECT created_at FROM room_ledger WHERE name = 'sub-second-room'"
+    ).fetchone() == ("2026-08-30T08:00:01.900000Z",)
+
+
 def test_created_room_rejects_an_event_after_its_observation(signer_store):
     event = created_event(
         10,
-        "2026-08-30T08:00:00.000001Z",
+        "2026-08-30T08:00:02.000001Z",
         "future-room",
     )
 
@@ -1839,7 +2112,7 @@ def test_created_room_rejects_an_event_after_its_observation(signer_store):
         record_created_rooms(
             signer_store,
             [event],
-            "2026-08-30T08:00:00Z",
+            "2026-08-30T08:00:01Z",
         )
 
 
@@ -2015,6 +2288,31 @@ def test_room_listing_updates_only_a_generation_visible_at_observation(signer_st
     assert signer_store.execute(
         "SELECT created_seq, last_listed_at FROM room_ledger ORDER BY created_seq"
     ).fetchall() == [(10, "2026-08-30T08:04:00Z"), (20, None)]
+
+
+def test_room_listing_credits_a_generation_created_within_the_same_second(
+    signer_store,
+):
+    record_created_rooms(
+        signer_store,
+        [
+            created_event(10, "2026-08-30T08:00:00Z", "reused-room"),
+            created_event(20, "2026-08-30T08:04:00.500000Z", "reused-room"),
+        ],
+        "2026-08-30T08:04:01Z",
+    )
+    state = new_signer_state(100)
+
+    collect.record_listed_rooms(
+        signer_store,
+        [{"name": "reused-room"}],
+        "2026-08-30T08:04:00.900000Z",
+        state,
+    )
+
+    assert signer_store.execute(
+        "SELECT created_seq, last_listed_at FROM room_ledger ORDER BY created_seq"
+    ).fetchall() == [(10, None), (20, "2026-08-30T08:04:00.900000Z")]
 
 
 def test_room_revisit_schedule_selects_only_active_eligible_stages(signer_store):
@@ -4424,6 +4722,18 @@ def test_room_search_uses_fts_and_room_ids_remain_non_unique(signer_store):
     ).fetchall() == [(renamed,)]
 
 
+def patch_listing_clock(monkeypatch, *timestamps):
+    values = iter([collect.parse_timestamp(value) for value in timestamps])
+    real_datetime = collect.datetime
+
+    class ListingClock(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(values)
+
+    monkeypatch.setattr(collect, "datetime", ListingClock)
+
+
 def test_successful_rooms_listing_updates_latest_listing_state(tmp_path, monkeypatch):
     signer_state_path = tmp_path / "signers.json"
     connection = connect_signer_database(
@@ -4437,7 +4747,9 @@ def test_successful_rooms_listing_updates_latest_listing_state(tmp_path, monkeyp
     connection.commit()
     connection.close()
     tick_ts = "2026-08-30T08:01:00Z"
+    listing_ts = "2026-08-30T08:01:00.250000Z"
     monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+    patch_listing_clock(monkeypatch, listing_ts)
 
     class ListingClient:
         def get(self, path, deadline=None):
@@ -4480,14 +4792,14 @@ def test_successful_rooms_listing_updates_latest_listing_state(tmp_path, monkeyp
             "SELECT name, last_listed_at FROM room_ledger ORDER BY name"
         ).fetchall() == [
             ("event-only-room", None),
-            ("listed-room", tick_ts),
+            ("listed-room", listing_ts),
         ]
         metadata = json.loads(
             stored.execute(
                 "SELECT state_json FROM signer_metadata WHERE singleton = 1"
             ).fetchone()[0]
         )
-        assert metadata["latest_room_listing_observed_at"] == tick_ts
+        assert metadata["latest_room_listing_observed_at"] == listing_ts
     finally:
         stored.close()
 
@@ -4514,8 +4826,8 @@ def test_collect_tick_does_not_backdate_a_recreated_generation_listing(
     collect.write_signer_metadata(connection, state)
     connection.commit()
     connection.close()
-    observed_times = iter(("2026-08-30T08:04:00Z", "2026-08-30T08:04:01Z"))
-    monkeypatch.setattr(collect, "utc_now", lambda: next(observed_times))
+    monkeypatch.setattr(collect, "utc_now", lambda: "2026-08-30T08:04:01Z")
+    patch_listing_clock(monkeypatch, "2026-08-30T08:04:00.400000Z")
 
     class RecreationClient:
         def get(self, path, deadline=None):
@@ -4556,7 +4868,7 @@ def test_collect_tick_does_not_backdate_a_recreated_generation_listing(
     try:
         assert stored.execute(
             "SELECT created_seq, last_listed_at FROM room_ledger ORDER BY created_seq"
-        ).fetchall() == [(10, "2026-08-30T08:04:00Z"), (20, None)]
+        ).fetchall() == [(10, "2026-08-30T08:04:00.400000Z"), (20, None)]
     finally:
         stored.close()
 
@@ -4957,6 +5269,37 @@ def test_v2_migration_preserves_all_funnel_counts(tmp_path):
         migrated.close()
 
 
+def test_v2_migration_back_fills_the_missing_revisit_rotation(tmp_path):
+    state = {
+        "version": 2,
+        "collection_started": "2026-08-28T08:00:00Z",
+        "persistence_started_at": "2026-08-28T08:00:00Z",
+        "persistence_reset_at": None,
+        "persistence_first_utc_date": None,
+        "persistence_last_utc_date": None,
+        "persistence_collection_utc_dates_count": 0,
+        "tracked_cap": 10,
+        "cap_hit": False,
+        "census": None,
+        "dids": {},
+        "selector_version": collect.SELECTOR_VERSION,
+        "selector_seed": REVISIT_SELECTOR_SEED,
+        "selector_epoch": -1,
+        "selector_frame": [],
+        "selector_position": 0,
+    }
+    source = tmp_path / "signers-v2.json"
+    metadata = tmp_path / "signers.json"
+    source.write_text(json.dumps(state), encoding="utf-8")
+
+    source_counts, sqlite_counts = migrate_signers(source, metadata)
+
+    assert source_counts == sqlite_counts == dict.fromkeys(source_counts, 0)
+    migrated_metadata = json.loads(metadata.read_text(encoding="utf-8"))
+    assert migrated_metadata["version"] == collect.SIGNER_STATE_VERSION
+    assert migrated_metadata["revisit_allocation_rotation"] == 0
+
+
 @pytest.mark.parametrize(
     "invalid_value",
     (
@@ -5145,6 +5488,89 @@ def test_census_main_fails_when_the_committed_outbox_cannot_be_published(
 
     assert collect.main() == 1
     assert drain_calls == 2
+
+
+def test_main_reports_deferred_publication_when_metadata_save_fails_after_commit(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    output = tmp_path / "ticks.jsonl"
+    signer_state = tmp_path / "signers.json"
+    tick_ts = "2026-08-30T08:01:00Z"
+
+    class TickClient:
+        telemetry_degraded = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, path, deadline=None):
+            if path == "/rooms?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "total": 1,
+                        "capacity": 100,
+                        "bytes": 10,
+                        "notes": {"total": 1, "capacity": 100, "bytes": 1},
+                        "rooms": [{"name": "lobby", "seq": 1, "idle": 0}],
+                    }
+                )
+            if path == "/r/events?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "room": "events",
+                        "messages": [
+                            {
+                                "seq": 1,
+                                "ts": tick_ts,
+                                "from": "server",
+                                "text": "created committed-room",
+                            }
+                        ],
+                    }
+                )
+            if path.startswith("/r/"):
+                return room_body(message(1, "server"))
+            raise AssertionError(f"unexpected read: {path}")
+
+    real_save = collect.save_atomic_json
+    save_calls = 0
+
+    def fail_post_commit_save(path, payload):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise OSError("metadata publication failed")
+        return real_save(path, payload)
+
+    monkeypatch.setattr(collect, "Client", TickClient)
+    monkeypatch.setattr(collect, "save_atomic_json", fail_post_commit_save)
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect.py",
+            "--base-url",
+            "https://example.invalid",
+            "--output",
+            str(output),
+            "--signer-state",
+            str(signer_state),
+            "--once",
+        ],
+    )
+
+    assert collect.main() == 1
+    assert save_calls == 2
+    assert "collection committed; publication deferred" in capsys.readouterr().err
+    connection = connect_signer_database(collect.signer_database_path(signer_state))
+    try:
+        assert collect.load_tick_outbox(connection) is not None
+    finally:
+        connection.close()
+    assert not output.exists()
 
 
 def test_sqlite_error_skips_tick_and_daemon_loop_continues(

@@ -11,6 +11,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Callable
 from contextlib import closing
@@ -44,7 +45,7 @@ QUERY_VALIDITY = timedelta(minutes=15)
 ROOM_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 DID_RE = re.compile(r"^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{20,100}$")
 INVALID_PERCENT_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
-CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+UNPRINTABLE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 STATE_VOCABULARY = (
     "unknown",
     "not_yet_checked",
@@ -362,12 +363,16 @@ def validate_query_text(value: str) -> str:
         not value
         or len(value) > MAX_QUERY_CHARACTERS
         or len(value.encode("utf-8")) > MAX_QUERY_BYTES
-        or CONTROL_RE.search(value) is not None
+        or any(
+            unicodedata.category(character) in UNPRINTABLE_CATEGORIES
+            for character in value
+        )
     ):
         raise ApiError(
             400,
             "invalid_query",
-            "q must contain 1 to 80 characters, at most 320 UTF-8 bytes, and no controls",
+            "q must contain 1 to 80 characters, at most 320 UTF-8 bytes, and no "
+            "control, format or separator characters",
         )
     return value
 
@@ -704,7 +709,7 @@ class QueryApplication:
                     "local evidence contains an invalid observation timestamp",
                 ) from error
             valid_until = format_utc(valid_at)
-            freshness = "fresh" if now <= valid_at else "stale"
+            freshness = "fresh" if now.replace(microsecond=0) <= valid_at else "stale"
         context = common_metadata(
             source_observed_at=observed_at,
             valid_until=valid_until,
@@ -870,7 +875,7 @@ class QueryApplication:
                 first_observed_at = html.escape(str(result["first_observed_at"]))
                 entries.append(
                     '<article class="result-record">'
-                    f'<span class="result-index" aria-hidden="true">{index:02d}</span>'
+                    f'<span class="index" aria-hidden="true">{index:02d}</span>'
                     '<div class="result-primary">'
                     '<p class="figure-label">Untrusted room name</p>'
                     f"<h3>{safe_name}</h3></div>"
@@ -1100,7 +1105,7 @@ class QueryApplication:
             )
             check_rows.append(
                 '<div class="ledger-row result-record">'
-                f'<span class="result-index" aria-hidden="true">{index:02d}</span>'
+                f'<span class="index" aria-hidden="true">{index:02d}</span>'
                 '<div class="result-primary">'
                 '<p class="figure-label">Checkpoint</p>'
                 f"<h3>{stage_seconds} seconds</h3></div>"
@@ -1485,6 +1490,12 @@ class QueryApplication:
                 503, "snapshot_invalid", f"{resource} snapshot is invalid"
             ) from error
         self.validate_snapshot_payload(payload, resource)
+        payload = dict(payload)
+        payload["generated_at"] = format_utc(self.config.clock())
+        if payload["source_observed_at"] is not None:
+            valid_until = parse_utc(payload["valid_until"], "valid_until")
+            generated_at = parse_utc(payload["generated_at"], "generated_at")
+            payload["freshness"] = "fresh" if generated_at <= valid_until else "stale"
         if filtered:
             values = payload[resource]
             selected = []
@@ -1497,7 +1508,6 @@ class QueryApplication:
                 selected.append(item)
             if limit is not None:
                 selected = selected[:limit]
-            payload = dict(payload)
             payload[resource] = selected
             payload["coverage"] = {
                 **payload["coverage"],
@@ -1505,15 +1515,7 @@ class QueryApplication:
                 "filter_since": since_text,
                 "filter_limit": limit,
             }
-            now = self.config.clock()
-            payload["generated_at"] = format_utc(now)
-            source_observed_at = payload["source_observed_at"]
-            if source_observed_at is None:
-                payload["freshness"] = "not_observed"
-            else:
-                valid_until = parse_utc(payload["valid_until"], "valid_until")
-                payload["freshness"] = "fresh" if now <= valid_until else "stale"
-            self.validate_snapshot_payload(payload, resource)
+        self.validate_snapshot_payload(payload, resource)
         return self.payload_response(
             payload,
             representation,
@@ -1604,11 +1606,15 @@ class QueryApplication:
             '<meta property="og:description" content="Bounded forward-collected Technocore evidence.">'
             '<meta property="og:type" content="website">'
             f"<title>{html.escape(title)} — Technocore Observatory</title>"
+            '<script>try{const stored=localStorage.getItem("observatory-theme");'
+            'if(stored==="light"||stored==="dark")'
+            "document.documentElement.dataset.theme=stored;}catch{"
+            'document.documentElement.dataset.themeStorage="unavailable";}</script>'
             '<link rel="stylesheet" href="/assets/styles.css">'
             '<script src="/assets/site.js" defer></script>'
             '</head><body data-page="evidence">'
             '<a class="skip-link" href="#main-content">Skip to main content</a>'
-            '<header class="site-header"><div class="site-header-inner">'
+            '<header class="site-header">'
             '<a class="wordmark" href="/" aria-label="Technocore Observatory home">'
             "TECHNOCORE OBSERVATORY</a>"
             '<nav class="priority-nav" aria-label="Primary">'
@@ -1625,19 +1631,19 @@ class QueryApplication:
             '<a href="/methodology/">METHODOLOGY</a>'
             '<a href="/about/">ABOUT</a></nav></details>'
             '<button class="theme-control" id="theme-toggle" type="button" '
-            'aria-label="Theme: auto" data-theme-value="system">'
-            "THEME AUTO</button></div></header>"
+            'data-theme-value="system" hidden>'
+            "THEME AUTO</button></header>"
             '<main id="main-content" class="page-shell" tabindex="-1">'
             '<header class="page-lede">'
             '<p class="eyebrow">LOCAL EVIDENCE / READ-ONLY</p>'
             f"<h1>{html.escape(heading)}</h1>"
             "<p>Local forward-collected evidence. Labels are untrusted where shown. "
             "Not observed is not absent.</p></header>"
-            f'<section class="page-section query-content">{content}</section></main>'
+            f'<section class="page-section">{content}</section></main>'
             '<footer class="site-footer">'
             "<p>Independent instrument. Public observations, bounded claims.</p>"
             '<p><a href="/api/v1/status.txt">STATUS AS TEXT</a> · '
-            '<a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.0.0</p></footer>'
+            '<a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.1.0</p></footer>'
             "</body></html>"
         ).encode("utf-8")
 
@@ -1659,6 +1665,7 @@ class ObservatoryRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "TechnocoreObservatory"
     sys_version = ""
+    timeout = 10
 
     def version_string(self) -> str:
         return self.server_version

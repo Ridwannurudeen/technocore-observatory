@@ -8,7 +8,7 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.1.0"
 MAX_RESPONSE_BYTES = 64 * 1024
 COMMON_FIELDS = (
     "contract_version",

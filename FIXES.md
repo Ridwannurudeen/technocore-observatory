@@ -62,7 +62,8 @@ recorded and the undercount is permanent.
 `derive.py` refused the new ticks (`tracked DID count exceeds its cap`) because it asserted the
 tracked count never exceeds the cap. True while the cap gates insertion, wrong once retired: it now
 applies only to ticks that do not declare the cap retired, and a legacy over-cap tick is still
-refused. Rollback and the pre-migration store are at `/root/f5a-deploy-20260830-094808/`.
+refused. Rollback and the pre-migration store are in a root-owned backup directory outside the
+repository.
 
 **A collector change has now been rejected by an unrevised `derive.py` validator three times** —
 the 20-entry sampling bound, the read budget, and this. Each was caught by hand, never by the

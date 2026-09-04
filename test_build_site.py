@@ -3,6 +3,8 @@ import os
 import re
 import stat
 import struct
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -10,7 +12,7 @@ import pytest
 import build_site
 import guards
 import snapshots
-from api_contract import MAX_RESPONSE_BYTES
+from api_contract import CONTRACT_VERSION, MAX_RESPONSE_BYTES
 from build_site import build_release
 from test_snapshots import add_attempt, telemetry_database, tick, write_ticks
 
@@ -196,6 +198,7 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     release, _ = built_release
     home = (release / "index.html").read_text(encoding="utf-8")
     rooms = (release / "rooms/index.html").read_text(encoding="utf-8")
+    status = (release / "status/index.html").read_text(encoding="utf-8")
     script = (release / "assets/site.js").read_text(encoding="utf-8")
 
     shell_markers = (
@@ -205,7 +208,7 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
         '<details class="site-index">',
         "<summary>INDEX</summary>",
         '<nav aria-label="Site index">',
-        '<button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>',
+        '<button class="theme-control" id="theme-toggle" type="button" data-theme-value="system" hidden>THEME AUTO</button>',
         '<main id="main-content" class="page-shell" tabindex="-1">',
         '<footer class="site-footer">',
     )
@@ -251,9 +254,24 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
         home,
     )
 
+    head = home.split("</head>", 1)[0]
+    assert head.index('localStorage.getItem("observatory-theme")') < head.index(
+        '<link rel="stylesheet"'
+    )
+    assert re.search(
+        r'<time id="status-valid-until" datetime="20\d\d-\d\d-\d\dT[^"]+">',
+        status,
+    )
+    assert 'data-freshness-for="status-valid-until"' in status
+    assert 'data-freshness-for="collector-valid-until"' in home
+    assert 'document.querySelectorAll("[data-freshness-for]")' in script
+    assert (
+        'word.textContent = printed === printed.toLowerCase() ? "stale" : "Stale";'
+        in script
+    )
+
     assert 'const themes = ["system", "light", "dark"];' in script
     assert "themeToggle.textContent = `THEME ${label.toUpperCase()}`;" in script
-    assert 'themeToggle.setAttribute("aria-label", `Theme: ${label}`);' in script
     assert "themeToggle.dataset.themeValue = theme;" in script
     assert 'localStorage.getItem("observatory-theme")' in script
     assert 'localStorage.setItem("observatory-theme", theme)' in script
@@ -449,7 +467,8 @@ def test_discovery_documents_and_static_contracts_are_valid(built_release):
     }
     assert agent["interfaces"]["room_evidence"].endswith("/api/v1/rooms/{room_id}")
     assert agent["interfaces"]["trace"].endswith("/api/v1/dids/{did}")
-    assert status["contract_version"] == "1.0.0"
+    assert CONTRACT_VERSION == "1.1.0"
+    assert status["contract_version"] == "1.1.0"
     assert status["schema_version"] == 6
     assert status["status"]["origin"]["state"] == "reachable"
 
@@ -472,8 +491,56 @@ def test_changes_page_is_escaped_and_preserves_evidence_fields(built_release):
     assert "%%VALID_UNTIL%%" in changes
     assert "/config" in changes
     assert "2026-08-30T00:01:40Z" in changes
-    assert "Methodology 1.0.0" in changes
+    assert "Methodology 1.1.0" in changes
     assert 'href="/api/v1/changes"' in changes
+
+
+def test_incident_stamp_escapes_its_timestamps_and_never_prints_none_counts():
+    rows = build_site.incident_rows(
+        [
+            {
+                "title": "Observed health probe failures",
+                "rule": "health_probe_failed",
+                "state": "open",
+                "description": "Bounded observation record.",
+                "opened_at": "<script>alert(1)</script>",
+                "last_observed_at": "2026-08-30T00:01:00Z",
+                "resolved_at": None,
+                "attempts": None,
+                "observed_failures": None,
+                "methodology_version": "1.0.0",
+            }
+        ]
+    )
+
+    assert "<script>alert(1)</script>" not in rows
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in rows
+    assert "Opened &lt;script&gt;" in rows
+    assert "Resolved Still open" in rows
+    assert "None attempts" not in rows
+    assert "Not observed attempts · Not observed observed failures" in rows
+
+
+def test_endpoint_measure_never_prints_none_as_a_count():
+    rows = build_site.endpoint_rows(
+        [
+            {
+                "route": "/healthz",
+                "attempts": None,
+                "successes": None,
+                "server_errors": None,
+                "latency_ms": {"p95": None},
+                "first_observed_at": "2026-08-30T00:00:00Z",
+                "last_observed_at": "2026-08-30T00:01:00Z",
+            }
+        ]
+    )
+
+    assert "None attempts" not in rows
+    assert (
+        "Not observed attempts · Not observed successes · "
+        "Not observed observed 5xx" in rows
+    )
 
 
 def test_incident_and_change_machine_links_use_public_api_routes(built_release):
@@ -574,7 +641,7 @@ def test_build_release_samples_clock_after_the_telemetry_snapshot(
     status = json.loads((release / "api/v1/status.json").read_bytes())
 
     assert release.name.startswith("20260830000003-")
-    assert status["source_observed_at"] == "2026-08-30T00:00:02Z"
+    assert status["status"]["origin"]["source_observed_at"] == "2026-08-30T00:00:02Z"
     assert status["derived_at"] == "2026-08-30T00:00:03Z"
     assert status["published_at"] == "2026-08-30T00:00:03Z"
     assert status["generated_at"] == "2026-08-30T00:00:03Z"
@@ -655,6 +722,34 @@ def test_observatory_source_has_phase_three_accessibility_contracts():
     assert 'data-theme-value="system"' in source
     assert '"observatory-theme"' in source
 
+    # The theme button does nothing without scripting, so it is hidden until
+    # the script that drives it runs, and its visible text is its whole
+    # accessible name.
+    assert 'data-theme-value="system" hidden>THEME AUTO</button>' in source
+    assert "themeToggle.hidden = false;" in source
+    assert 'setAttribute("aria-label"' not in source
+
+    # The stored theme is applied before the stylesheet, so a stored dark
+    # preference never paints light first.
+    head = source.split("</head>", 1)[0]
+    assert head.index('localStorage.getItem("observatory-theme")') < head.index(
+        "<style>"
+    )
+
+    # The scrubber thumb is a real pointer target on both engines.
+    assert "  width: 24px;\n  height: 44px;\n  margin-top: -21px;\n" in source
+    assert source.count("  width: 24px;\n  height: 44px;\n") == 2
+
+    # Nothing that needs scripting may render as a bare em dash or paint at the
+    # chart origin before the script places it.
+    assert '<circle id="point" class="point" r="4" cx="-10" cy="-10">' in source
+    assert source.count("With scripting disabled they are not rendered here.") == 2
+
+    # A tick without sampling evidence writes the not-recorded pair rather than
+    # leaving the previous tick's numbers under an older observation.
+    assert "const LIFECYCLE_SAMPLING_FALLBACK = {" in source
+    assert "if (!display) return;" not in source
+
     # The newest-tick timestamp and the scrubbed observation are separate
     # published values; scrubbing must never rewrite the status timestamp.
     assert 'data-ssr="timestamp"' in source
@@ -721,7 +816,7 @@ def test_theme_tokens_meet_text_chart_and_non_text_contrast_thresholds():
         "text": "#171B18",
         "text-muted": "#535B55",
         "line": "#747D76",
-        "line-subtle": "#D2CEC3",
+        "line-subtle": "#8C8880",
         "data-ink": "#27302A",
         "accent": "#176B3A",
         "accent-ink": "#FAF8F1",
@@ -738,7 +833,7 @@ def test_theme_tokens_meet_text_chart_and_non_text_contrast_thresholds():
         "text": "#E7ECE8",
         "text-muted": "#A8B0A9",
         "line": "#606C63",
-        "line-subtle": "#343C36",
+        "line-subtle": "#5F6960",
         "data-ink": "#C7D0C9",
         "accent": "#63D286",
         "accent-ink": "#07100A",
@@ -763,14 +858,13 @@ def test_theme_tokens_meet_text_chart_and_non_text_contrast_thresholds():
         assert contrast(palette["accent-ink"], palette["accent"]) >= 4.5, selector
         assert contrast(palette["warning"], palette["warning-bg"]) >= 4.5, selector
         assert contrast(palette["danger"], palette["danger-bg"]) >= 4.5, selector
-        assert (
-            contrast(
-                palette["line"],
-                palette["surface-muted"],
-                palette["surface-muted"],
-            )
-            >= 3
-        ), selector
+        for name in ("line", "line-subtle"):
+            for ground in ("bg", "surface"):
+                assert contrast(palette[name], palette[ground]) >= 3, (
+                    selector,
+                    name,
+                    ground,
+                )
 
     # The observatory page is self-contained, so it carries its own copy of the
     # tokens. The copy has to be the same system, value for value, or the two
@@ -791,14 +885,13 @@ def test_theme_tokens_meet_text_chart_and_non_text_contrast_thresholds():
         assert contrast(palette["accent-ink"], palette["accent"]) >= 4.5, selector
         assert contrast(palette["warning"], palette["warning-bg"]) >= 4.5, selector
         assert contrast(palette["danger"], palette["danger-bg"]) >= 4.5, selector
-        assert (
-            contrast(
-                palette["line"],
-                palette["surface-muted"],
-                palette["surface-muted"],
-            )
-            >= 3
-        ), selector
+        for name in ("line", "line-subtle"):
+            for ground in ("bg", "surface"):
+                assert contrast(palette[name], palette[ground]) >= 3, (
+                    selector,
+                    name,
+                    ground,
+                )
 
 
 def test_observatory_ssr_and_scripted_views_agree_value_for_value(built_release):
@@ -850,6 +943,292 @@ def test_observatory_ssr_and_scripted_views_agree_value_for_value(built_release)
     assert without_script
     assert set(without_script) == set(with_script)
     assert without_script == with_script
+
+
+def test_chart_breaks_at_an_unmeasurable_value_and_not_at_an_on_cadence_decrease(
+    tmp_path,
+):
+    """The polyline must say what the readout says.
+
+    A cumulative below its baseline is unmeasurable, so the line breaks there
+    and draws no vertex; drawing it at zero put an affirmative zero on the axis
+    beside a hero readout of "—". A counter that fell between two ticks that
+    both arrived on cadence is not a missed observation and must not break the
+    line either, or the raw segment breaks where the rollup segment does not.
+    """
+    sync_api = pytest.importorskip("playwright.sync_api")
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(
+        ticks,
+        tick("2026-08-30T08:00:00Z", event_seq=30_000),
+        # Rooms fall inside the polling threshold: a recorded gap, not a break.
+        tick(
+            "2026-08-30T08:05:00Z",
+            event_seq=30_010,
+            rooms=90,
+            notes=1_010,
+            lobby=5_010,
+        ),
+        tick(
+            "2026-08-30T08:10:00Z",
+            event_seq=30_020,
+            rooms=95,
+            notes=1_020,
+            lobby=5_020,
+        ),
+        # The event sequence resets below the chart baseline: unmeasurable.
+        tick(
+            "2026-08-30T08:15:00Z",
+            event_seq=29_900,
+            rooms=96,
+            notes=900,
+            lobby=4_900,
+        ),
+    )
+    with telemetry_database(telemetry) as connection:
+        add_attempt(
+            connection,
+            attempt_id=1,
+            route="/healthz",
+            observed_at="2026-08-30T08:16:00Z",
+            outcome="success",
+            status=200,
+        )
+    release = build_release(
+        ticks,
+        telemetry,
+        tmp_path / "public",
+        Path("index.html"),
+        derived_at="2026-08-30T08:16:30Z",
+        published_at="2026-08-30T08:17:00Z",
+    )
+    page_uri = (release / "observatory/index.html").resolve().as_uri()
+    read = (
+        "() => ({"
+        " path: document.getElementById('series-path').getAttribute('d'),"
+        " marker: document.getElementById('point').style.display,"
+        " cursor: document.getElementById('cursor').style.display,"
+        " hero: document.getElementById('hero-value').textContent })"
+    )
+    with sync_api.sync_playwright() as playwright:
+        browser = None
+        for channel in ("chrome", "msedge", None):
+            try:
+                browser = (
+                    playwright.chromium.launch(channel=channel)
+                    if channel
+                    else playwright.chromium.launch()
+                )
+                break
+            except Exception:
+                continue
+        if browser is None:
+            pytest.skip("no Chromium browser is installed")
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            page.goto(page_uri)
+            page.wait_for_timeout(400)
+            drawn = page.evaluate(read)
+            page.close()
+        finally:
+            browser.close()
+
+    # Three measurable observations, one unbroken segment, no fourth vertex.
+    assert drawn["path"].count("M") == 1
+    assert drawn["path"].count("L") == 2
+    assert drawn["marker"] == "none"
+    assert drawn["cursor"] == ""
+    assert drawn["hero"] == "— observed"
+
+
+def test_published_freshness_restates_itself_against_the_reader_clock(
+    built_release,
+):
+    """The freshness word is baked at build time; a dead rebuild must not lie.
+
+    The server-rendered word stays for readers without scripting. With
+    scripting, every page that prints a validity boundary re-reads it against
+    the reader's own clock.
+    """
+    sync_api = pytest.importorskip("playwright.sync_api")
+    release, _ = built_release
+    pages = {
+        "status/index.html": ("status-valid-until", "fresh", "stale"),
+        "index.html": ("collector-valid-until", "Fresh", "Stale"),
+    }
+
+    with sync_api.sync_playwright() as playwright:
+        browser = None
+        for channel in ("chrome", "msedge", None):
+            try:
+                browser = (
+                    playwright.chromium.launch(channel=channel)
+                    if channel
+                    else playwright.chromium.launch()
+                )
+                break
+            except Exception:
+                continue
+        if browser is None:
+            pytest.skip("no Chromium browser is installed")
+        try:
+            for relative, (anchor, fresh, stale) in pages.items():
+                built = release / relative
+                source = built.read_text(encoding="utf-8")
+                validity = re.search(
+                    rf'<time id="{anchor}" datetime="([^"]+)">', source
+                )
+                assert validity is not None, relative
+                assert f">{fresh}</span>" in source
+                for offset, expected in ((-1000, fresh), (1000, stale)):
+                    page = browser.new_page(viewport={"width": 1280, "height": 900})
+                    page.add_init_script(
+                        f"Date.now = () => Date.parse('{validity.group(1)}') "
+                        f"+ ({offset});"
+                    )
+                    page.goto(built.resolve().as_uri())
+                    page.wait_for_timeout(50)
+                    word = page.locator(f'[data-freshness-for="{anchor}"]')
+                    assert word.text_content() == expected, (relative, offset)
+                    page.close()
+        finally:
+            browser.close()
+
+
+def test_lifecycle_sampling_scrubs_back_to_the_not_recorded_pair(tmp_path):
+    """Scrubbing back to a tick without sampling evidence must clear the DOM.
+
+    The renderer used to return early, so the newer tick's numbers stayed on
+    screen under the older observation timestamp.
+    """
+    sync_api = pytest.importorskip("playwright.sync_api")
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(
+        ticks,
+        tick("2026-08-30T00:00:00Z"),
+        tick(
+            "2026-08-30T00:01:00Z",
+            event_seq=30_001,
+            rooms=101,
+            notes=1_001,
+            lobby=5_001,
+        ),
+    )
+    telemetry_database(telemetry).close()
+    release = build_release(
+        ticks,
+        telemetry,
+        tmp_path / "public",
+        Path("index.html"),
+        derived_at="2026-08-30T00:02:00Z",
+        published_at="2026-08-30T00:02:00Z",
+    )
+
+    built = release / "observatory/index.html"
+    source = built.read_text(encoding="utf-8")
+    assert source.count("With scripting disabled they are not rendered here.") == 2
+    opening = '<script id="observatory-data" type="application/json">'
+    head, _, rest = source.partition(opening)
+    encoded, _, tail = rest.partition("</script>")
+    payload = json.loads(encoded)
+    assert len(payload["points"]) == 2
+
+    # An older published payload predates the sampling-evidence contract.
+    del payload["points"][0]["room_lifecycle_sampling_display"]
+    payload["points"][1]["room_lifecycle_sampling_display"] = {
+        "selection": {"value_text": "42 selected", "context": "recorded selection"},
+        "aged_out": {"value_text": "7 aged out", "context": "recorded aged out"},
+        "stages": {
+            stage: {"value_text": f"{stage} completed", "context": f"{stage} evidence"}
+            for stage in ("300", "3600", "86400")
+        },
+    }
+    rewritten = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace(
+        "<", "\\u003c"
+    )
+    built.write_text(head + opening + rewritten + "</script>" + tail, encoding="utf-8")
+
+    with sync_api.sync_playwright() as playwright:
+        browser = None
+        for channel in ("chrome", "msedge", None):
+            try:
+                browser = (
+                    playwright.chromium.launch(channel=channel)
+                    if channel
+                    else playwright.chromium.launch()
+                )
+                break
+            except Exception:
+                continue
+        if browser is None:
+            pytest.skip("no Chromium browser is installed")
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            page.goto(built.resolve().as_uri())
+            page.wait_for_timeout(200)
+            assert (
+                page.locator("#lifecycle-sampling-selection").text_content()
+                == "42 selected"
+            )
+            page.evaluate("() => update(0)")
+            for identifier in (
+                "lifecycle-sampling-selection",
+                "lifecycle-sampling-aged-out",
+                "lifecycle-stage-300",
+                "lifecycle-stage-3600",
+                "lifecycle-stage-86400",
+            ):
+                assert (
+                    page.locator(f"#{identifier}").text_content() == "Not recorded"
+                ), identifier
+                context = page.locator(f"#{identifier}-context").text_content()
+                assert "predates room-lifecycle sampling evidence" in context
+            page.close()
+        finally:
+            browser.close()
+
+
+def test_theme_storage_failure_is_disclosed_without_disabling_the_control(
+    built_release,
+):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    release, _ = built_release
+
+    with sync_api.sync_playwright() as playwright:
+        browser = None
+        for channel in ("chrome", "msedge", None):
+            try:
+                browser = (
+                    playwright.chromium.launch(channel=channel)
+                    if channel
+                    else playwright.chromium.launch()
+                )
+                break
+            except Exception:
+                continue
+        if browser is None:
+            pytest.skip("no Chromium browser is installed")
+        try:
+            for relative in ("status/index.html", "observatory/index.html"):
+                page = browser.new_page(viewport={"width": 1280, "height": 900})
+                page.add_init_script(
+                    "Storage.prototype.getItem = function () { throw new Error('blocked'); };"
+                    "Storage.prototype.setItem = function () { throw new Error('blocked'); };"
+                )
+                page.goto((release / relative).resolve().as_uri())
+                page.wait_for_timeout(100)
+                root = page.locator("html")
+                toggle = page.locator("#theme-toggle")
+                assert root.get_attribute("data-theme-storage") == "unavailable"
+                assert toggle.is_visible()
+                toggle.click()
+                assert toggle.get_attribute("data-theme-value") == "light"
+                assert root.get_attribute("data-theme") == "light"
+                page.close()
+        finally:
+            browser.close()
 
 
 def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
@@ -916,30 +1295,36 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
                     ), relative
 
                     toggle = page.locator("#theme-toggle")
+                    assert (
+                        page.evaluate(
+                            "() => document.querySelector('#theme-toggle').hidden"
+                        )
+                        is False
+                    ), relative
                     assert toggle.text_content() == "THEME AUTO"
-                    assert toggle.get_attribute("aria-label") == "Theme: auto"
+                    assert toggle.get_attribute("aria-label") is None
                     assert toggle.get_attribute("data-theme-value") == "system"
                     assert page.locator("html").get_attribute("data-theme") is None
                     toggle.click()
                     assert toggle.text_content() == "THEME LIGHT"
-                    assert toggle.get_attribute("aria-label") == "Theme: light"
+                    assert toggle.get_attribute("aria-label") is None
                     assert toggle.get_attribute("data-theme-value") == "light"
                     assert page.locator("html").get_attribute("data-theme") == "light"
                     assert_index_focus(page)
                     toggle.click()
                     assert toggle.text_content() == "THEME DARK"
-                    assert toggle.get_attribute("aria-label") == "Theme: dark"
+                    assert toggle.get_attribute("aria-label") is None
                     assert toggle.get_attribute("data-theme-value") == "dark"
                     assert page.locator("html").get_attribute("data-theme") == "dark"
                     assert_index_focus(page)
                     toggle.click()
                     assert toggle.text_content() == "THEME AUTO"
-                    assert toggle.get_attribute("aria-label") == "Theme: auto"
+                    assert toggle.get_attribute("aria-label") is None
                     assert toggle.get_attribute("data-theme-value") == "system"
                     assert page.locator("html").get_attribute("data-theme") is None
 
                     short_controls = page.locator(
-                        "button, select, input, summary"
+                        "button, select, input, summary, .section-link a"
                     ).evaluate_all(
                         "els => els.filter(el => { const r=el.getBoundingClientRect(); return r.width && r.height && (r.width < 44 || r.height < 44); }).map(el => el.id || el.textContent.trim())"
                     )
@@ -957,7 +1342,14 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
                 # The self-contained page drives the same theme contract as the
                 # templated shell, from its own inline script.
                 toggle = page.locator("#theme-toggle")
+                assert (
+                    page.evaluate(
+                        "() => document.querySelector('#theme-toggle').hidden"
+                    )
+                    is False
+                )
                 assert toggle.text_content() == "THEME AUTO"
+                assert toggle.get_attribute("aria-label") is None
                 assert page.locator("html").get_attribute("data-theme") is None
                 toggle.click()
                 assert toggle.get_attribute("data-theme-value") == "light"
@@ -977,6 +1369,56 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
                 page.close()
         finally:
             browser.close()
+
+
+def test_no_js_guard_fails_when_every_bar_anchor_disappears(monkeypatch):
+    class Page:
+        def goto(self, uri):
+            return None
+
+        def evaluate(self, script):
+            if "data-ssr-width" in script:
+                return []
+            return {"hero-value": "100", "status": "1"}
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+    class Browser:
+        def new_context(self, **options):
+            return Context()
+
+        def close(self):
+            return None
+
+    class Chromium:
+        def launch(self, **options):
+            return Browser()
+
+    class Playwright:
+        chromium = Chromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = Playwright
+    package = types.ModuleType("playwright")
+    package.sync_api = sync_api
+    monkeypatch.setitem(sys.modules, "playwright", package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    findings = guards.guard_no_js_state(
+        Path("index.html"), {"points": [{"observed_public_rooms": 100}]}
+    )
+
+    assert findings == [
+        "no data-ssr-width anchors remain, so no bar width can be verified"
+    ]
 
 
 def test_render_guards_hold_on_a_built_release(built_release):

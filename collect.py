@@ -24,6 +24,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from api_contract import escape_plain_text
 from telemetry import TelemetryStore, normalize_route
 from verify_ledger import (
     CHAIN_FIELD,
@@ -70,6 +71,15 @@ PREFIX_CLASSES = (
     ("d-", "ownable"),
     ("e-", "ephemeral"),
 )
+# The published tick keeps only the engagement fields derive.validate_engagement
+# reads: the /rooms object is the service's, and the ledger never rotates.
+ENGAGEMENT_FIELDS = (
+    "windowed_note_to_message_ratio",
+    "zero_response_share",
+    "nick_diversity",
+    "window_cap",
+    "windowed_messages",
+)
 ROOM_READ_BUDGET = 80
 PUBLISHED_READS_PER_MINUTE = 600
 MAX_READ_SHARE = 0.20
@@ -83,10 +93,14 @@ ROOM_REVISIT_PUBLICATION_BATCH_LIMIT = 305
 ROOM_REVISIT_AGED_OUT_FINALIZATION_LIMIT = 2000
 TICK_REVISIT_DEADLINE_SECONDS = 300
 ROOM_REVISIT_STAGES_SECONDS = (5 * 60, 60 * 60, 24 * 60 * 60)
+# Origin event timestamps carry microseconds while a tick observation is
+# truncated to whole seconds, so two honest clocks disagree by under a second.
+ORIGIN_CLOCK_TOLERANCE = timedelta(seconds=1)
 CENSUS_MAX_PASSES = 5
 CENSUS_DEADLINE_SECONDS = 30 * 60
+CENSUS_PACE_FLOOR_SECONDS = RATE_BUDGET_WINDOW_SECONDS / TOTAL_READ_BUDGET
 CENSUS_STATE_VERSION = 2
-COLLECTOR_VERSION = "2.14.0"
+COLLECTOR_VERSION = "2.15.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
 SIGNER_STATE_VERSION = 6
@@ -125,6 +139,10 @@ class CollectionError(RuntimeError):
         self.outcome = outcome
         self.status = status
         self.path = normalize_route(path)[0] if path is not None else None
+
+
+class TickOutboxCommittedError(OSError):
+    """The durable tick exists, but its metadata mirror was not published."""
 
 
 def utc_now() -> str:
@@ -302,6 +320,9 @@ def read_response_body(
         if time.monotonic() > deadline:
             raise TimeoutError("response deadline exceeded")
         if not chunk:
+            expected = getattr(response, "length", None)
+            if isinstance(expected, int) and expected > 0:
+                raise http.client.IncompleteRead(b"".join(chunks), expected)
             return b"".join(chunks), False
         if not isinstance(chunk, bytes):
             raise CollectionError("origin response did not contain bytes")
@@ -818,6 +839,12 @@ def parse_rooms_json(body: str) -> dict[str, Any]:
 
     engagement = payload.get("engagement")
     if isinstance(engagement, dict):
+        engagement = {
+            key: value
+            for key, value in engagement.items()
+            if key in ENGAGEMENT_FIELDS
+            and (value is None or isinstance(value, (bool, int, float)))
+        }
         try:
             json.dumps(
                 engagement,
@@ -1393,7 +1420,7 @@ def parse_shard_count(body: str, shard: str) -> int:
         seen.add(key)
         rows += 1
 
-    if declared is None and rows == 0 and not saw_budget_footer:
+    if declared is None and not saw_budget_footer:
         raise CollectionError(
             f"{shard} plaintext has no recognized listing",
             outcome="invalid_response",
@@ -2286,6 +2313,33 @@ def _checkpointed_ledger_tip(
             or verified_stat.st_ctime_ns != ledger_stat.st_ctime_ns
         ):
             raise CollectionError("tick ledger changed during full verification")
+        grown_offset = ledger["size"]
+        grown_payload = b""
+        try:
+            with path.open("rb") as source:
+                source.seek(ledger["size"])
+                offset = ledger["size"]
+                for line in source:
+                    if line.strip():
+                        grown_offset = offset
+                        grown_payload = line.removesuffix(b"\n")
+                    offset += len(line)
+        except OSError as error:
+            raise CollectionError(f"cannot validate tick ledger {path}") from error
+        grown_hash, grown_tick_hash, grown_user_payload = _parse_chained_tick(
+            grown_payload
+        )
+        if grown_hash != verified[0]:
+            raise CollectionError("tick ledger changed during full verification")
+        rebound = _checkpoint_from_tip(
+            verified_stat,
+            grown_offset,
+            grown_payload,
+            grown_tick_hash,
+            None,
+            hashlib.sha256(grown_user_payload).hexdigest(),
+        )
+        _save_ledger_checkpoint(checkpoint_path, rebound)
         return verified
 
     metadata_matches = (
@@ -2620,29 +2674,36 @@ def save_atomic_json(path: Path, value: dict[str, Any]) -> None:
         )
         + "\n"
     ).encode("utf-8")
-    descriptor = os.open(
-        temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-        0o600,
-    )
     try:
-        os.chmod(temporary, 0o600)
-        remaining = memoryview(payload)
-        while remaining:
-            written = os.write(descriptor, remaining)
-            if written == 0:
-                raise OSError("zero-byte write while saving JSON state")
-            remaining = remaining[written:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
-    if os.name != "nt":
-        parent = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
         try:
-            os.fsync(parent)
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written == 0:
+                    raise OSError("zero-byte write while saving JSON state")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
         finally:
-            os.close(parent)
+            os.close(descriptor)
+        os.replace(temporary, path)
+        if os.name != "nt":
+            parent = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def save_census_state(path: Path, state: dict[str, Any]) -> None:
@@ -2650,13 +2711,11 @@ def save_census_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def census_failure_cause(error: CollectionError) -> str:
-    message = str(error)
-    status_match = re.search(r"\bHTTP (\d{3})$", message)
-    if status_match:
-        return f"http_{status_match.group(1)}"
-    if "exceeded its deadline" in message:
+    if error.outcome == "http_error":
+        return f"http_{error.status}"
+    if error.outcome == "deadline":
         return "deadline"
-    if message.startswith("GET "):
+    if error.outcome in ("timeout", "transport_error", "decode_error"):
         return "transport_or_decode"
     return "invalid_shard_response"
 
@@ -5025,7 +5084,7 @@ def record_created_rooms(
     for event in events:
         try:
             created_at = parse_timestamp(event["ts"])
-            if created_at > observation:
+            if created_at > observation + ORIGIN_CLOCK_TOLERANCE:
                 raise CollectionError(
                     "room-creation event occurs after its observation"
                 )
@@ -6447,7 +6506,7 @@ def collect_tick(
         parse_rooms,
         client.get("/rooms?format=json&limit=200"),
     )
-    rooms_observed_at = utc_now()
+    rooms_observed_at = timestamp_text(datetime.now(timezone.utc))
     # The whole load-modify-save cycle on the signer state runs under one
     # exclusive lock: an unlocked cycle here let the daemon clobber a census
     # result the cron invocation had just recorded.
@@ -6584,7 +6643,10 @@ def collect_tick(
             outbox = _insert_tick_outbox(connection, tick)
             write_signer_metadata(connection, state)
             connection.commit()
-            save_atomic_json(signer_state_path, state)
+            try:
+                save_atomic_json(signer_state_path, state)
+            except OSError as error:
+                raise TickOutboxCommittedError(str(error)) from error
         except Exception:
             connection.rollback()
             raise
@@ -6616,7 +6678,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--census", action="store_true")
     parser.add_argument("--census-state", type=absolute_path)
-    parser.add_argument("--census-pace", type=float, default=0.25)
+    parser.add_argument("--census-pace", type=float, default=CENSUS_PACE_FLOOR_SECONDS)
     parser.add_argument("--signer-state", type=absolute_path)
     parser.add_argument("--signer-cap", type=int, default=200_000)
     return parser
@@ -6632,7 +6694,7 @@ def main() -> int:
         or args.timeout <= 0
         or args.retries < 0
         or args.retries > MAX_RETRIES
-        or args.census_pace < 0
+        or args.census_pace < CENSUS_PACE_FLOOR_SECONDS
         or args.signer_cap <= 0
         or args.signer_cap > SQLITE_INTEGER_MAX
     ):
@@ -6640,7 +6702,7 @@ def main() -> int:
             "interval, timeout, and pace must be finite; interval must be at least "
             f"60 seconds; timeout and signer cap must be positive; retries must be "
             f"between 0 and {MAX_RETRIES}; signer cap must fit SQLite; pace cannot "
-            "be negative"
+            f"be below {CENSUS_PACE_FLOOR_SECONDS} seconds"
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -6658,6 +6720,7 @@ def main() -> int:
         while True:
             started = time.monotonic()
             tick_written = False
+            outbox_committed = False
             cycle_id: int | None = None
             client: Client | None = None
             if telemetry is None:
@@ -6696,7 +6759,9 @@ def main() -> int:
                 )
                 if startup_drained:
                     tick_written = True
-                else:
+                # A census invocation still walks its shards after a startup
+                # drain: skipping the walk would silently spend its cron slot.
+                if args.census or not startup_drained:
                     client = Client(
                         args.base_url,
                         args.timeout,
@@ -6737,6 +6802,7 @@ def main() -> int:
                         census_run,
                         lock_timeout=signer_lock_timeout,
                     )
+                    outbox_committed = True
                     if not drain_tick_outbox(
                         args.output,
                         signer_state_path,
@@ -6748,6 +6814,8 @@ def main() -> int:
                         )
                     tick_written = True
             except (CollectionError, OSError, sqlite3.Error) as error:
+                if isinstance(error, TickOutboxCommittedError):
+                    outbox_committed = True
                 if isinstance(error, CollectionError):
                     error_outcome = error.outcome
                     if error_outcome not in {
@@ -6785,12 +6853,19 @@ def main() -> int:
                                 file=sys.stderr,
                             )
                         telemetry = None
-                failure = (
-                    "collection failed after tick write; census publication will replay"
-                    if tick_written
-                    else "collection failed; no tick written"
+                if tick_written:
+                    failure = (
+                        "collection failed after tick write; "
+                        "census publication will replay"
+                    )
+                elif outbox_committed:
+                    failure = "collection committed; publication deferred"
+                else:
+                    failure = "collection failed; no tick written"
+                print(
+                    f"{utc_now()} {failure}: {escape_plain_text(str(error))[:512]}",
+                    file=sys.stderr,
                 )
-                print(f"{utc_now()} {failure}: {error}", file=sys.stderr)
                 if args.once or args.census:
                     return 1
             else:

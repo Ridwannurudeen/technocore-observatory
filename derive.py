@@ -34,7 +34,7 @@ HOURLY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DAILY_RETENTION_SECONDS = 365 * 24 * 60 * 60
 HOURLY_ROLLUP_SECONDS = 60 * 60
 DAILY_ROLLUP_SECONDS = 24 * 60 * 60
-METHODOLOGY_VERSION = "1.15.0"
+METHODOLOGY_VERSION = "1.16.0"
 CENSUS_SHARD_COUNT = 256
 CENSUS_RUN_FIELDS = {
     "walk_started_at",
@@ -281,8 +281,9 @@ def validate_room_sampling(value: Any) -> dict[str, Any] | None:
 def validate_engagement(value: Any) -> dict[str, Any] | None:
     """Validate the service-published engagement object, field by field.
 
-    The collector stores the /rooms `engagement` object verbatim, so its
-    contents are the service's choice, not the collector's. Rejecting the
+    The collector projects the /rooms `engagement` object down to the fields
+    read here, keeping only bool, int, float and null values, so those
+    values are the service's choice, not the collector's. Rejecting the
     whole tick over a malformed field would hand the service a lever to
     invalidate forward-collected history, so this validator never raises:
     a field that is absent or ill-typed becomes None and is published as
@@ -1430,7 +1431,10 @@ def validate_funnel(value: Any) -> dict[str, Any] | None:
     )
     result["tracked_dids"] = integer(value.get("tracked_dids"), "tracked_dids")
     result["tracked_cap"] = integer(value.get("tracked_cap"), "tracked_cap", 1)
-    cap_gates = result["signer_state_version"] not in (3, 4, 5, 6) and not (
+    cap_gates = not (
+        result["signer_state_version"] is not None
+        and result["signer_state_version"] >= 3
+    ) and not (
         result["signer_state_version"] is None
         and result["tracking_disclosure"] is not None
     )
@@ -1653,18 +1657,34 @@ def rollup_snapshot(point: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def is_cadence_gap(gap: dict[str, Any], gap_seconds: float) -> bool:
+    """Whether a gap record means the collector missed an observation.
+
+    A polling gap always does. A counter decrease does only where the interval
+    also ran past the polling threshold; within the threshold every tick
+    arrived and only the service's counter moved backwards. An identity counter
+    decrease spans census to census, not collector ticks.
+    """
+    if gap["reason"] == "polling_gap":
+        return True
+    return gap["reason"] == "counter_decreased" and gap["seconds"] > gap_seconds
+
+
 def aggregate_rollup_bucket(
     points: list[dict[str, Any]],
     start: datetime,
     end: datetime,
-    gaps: list[dict[str, Any]],
+    cadence_gaps: list[dict[str, Any]],
     expected_tick_seconds: float,
+    window_start: datetime,
+    window_end: datetime,
 ) -> dict[str, Any] | None:
     if not points:
         return None
 
     values = {
-        field: [point[field] for point in points] for field in ROLLUP_VALUE_FIELDS
+        field: [point[field] for point in points if point[field] is not None]
+        for field in ROLLUP_VALUE_FIELDS
     }
     ratios: dict[str, dict[str, Any]] = {}
     observed_seconds = 0.0
@@ -1694,22 +1714,49 @@ def aggregate_rollup_bucket(
             "observation_count": observations,
         }
 
+    # A boundary bucket only holds the span its own retention level covers, and
+    # nothing exists before collection started, so expected counts that span and
+    # never the ticks published by the neighbouring level.
+    covered_start = max(start, window_start)
+    covered_seconds = max(
+        0.0,
+        (min(end, window_end) - covered_start).total_seconds(),
+    )
+    # A level's lower cutoff is inclusive. Its opening bucket therefore counts
+    # a cadence observation at that boundary, including the fractional interval
+    # left before the bucket ends. The upper cutoff is exclusive and belongs to
+    # the next level, so every later boundary bucket keeps the whole-interval
+    # count.
+    expected_from_span = (
+        math.ceil(covered_seconds / expected_tick_seconds)
+        if start <= window_start < end
+        else int(covered_seconds // expected_tick_seconds)
+    )
     expected = max(
         len(points),
-        round((end - start).total_seconds() / expected_tick_seconds),
+        expected_from_span,
     )
     missing = max(0, expected - len(points))
+    # Only a collector cadence gap breaks the line. An incomplete event window
+    # is published in composition.complete, and a counter decrease inside the
+    # polling threshold already suppresses that interval's rates.
     has_gap = any(
-        parse_ts(gap["from"]) < end and parse_ts(gap["to"]) > start for gap in gaps
+        parse_ts(gap["from"]) < end and parse_ts(gap["to"]) > start
+        for gap in cadence_gaps
     )
     return {
         "start": utc_text(start),
         "end": utc_text(end),
         "first": rollup_snapshot(points[0]),
         "last": rollup_snapshot(points[-1]),
-        "min": {field: min(field_values) for field, field_values in values.items()},
-        "max": {field: max(field_values) for field, field_values in values.items()},
-        "sum": {field: sum(field_values) for field, field_values in values.items()},
+        "min": {
+            field: min(field_values) if field_values else None
+            for field, field_values in values.items()
+        },
+        "max": {
+            field: max(field_values) if field_values else None
+            for field, field_values in values.items()
+        },
         "ratios": ratios,
         "observation_count": len(points),
         "expected_tick_count": expected,
@@ -1722,10 +1769,12 @@ def aggregate_rollup_bucket(
 
 def rollup_level(
     points: list[dict[str, Any]],
-    gaps: list[dict[str, Any]],
+    cadence_gaps: list[dict[str, Any]],
     resolution_seconds: int,
     resolution_label: str,
     expected_tick_seconds: float,
+    window_start: datetime,
+    window_end: datetime,
 ) -> dict[str, Any] | None:
     if not points:
         return None
@@ -1752,8 +1801,10 @@ def rollup_level(
                 bucket_points,
                 bucket_start,
                 bucket_end,
-                gaps,
+                cadence_gaps,
                 expected_tick_seconds,
+                window_start,
+                window_end,
             )
         )
         bucket_start = bucket_end
@@ -1806,6 +1857,8 @@ def reduce_payload_history(
     archive_points = [point for point in points if parse_ts(point["ts"]) < daily_cutoff]
 
     tick_seconds = expected_tick_interval(points, gap_seconds)
+    collection_start = parse_ts(points[0]["ts"])
+    cadence_gaps = [gap for gap in gaps if is_cadence_gap(gap, gap_seconds)]
     levels: list[dict[str, Any]] = []
     if archive_points:
         archive_start = aligned_floor(
@@ -1820,8 +1873,10 @@ def reduce_payload_history(
             archive_points,
             archive_start,
             archive_end,
-            gaps,
+            cadence_gaps,
             tick_seconds,
+            collection_start,
+            daily_cutoff,
         )
         levels.append(
             {
@@ -1836,23 +1891,33 @@ def reduce_payload_history(
     for level in (
         rollup_level(
             daily_points,
-            gaps,
+            cadence_gaps,
             DAILY_ROLLUP_SECONDS,
             "1-day rollup",
             tick_seconds,
+            max(daily_cutoff, collection_start),
+            hourly_cutoff,
         ),
         rollup_level(
             hourly_points,
-            gaps,
+            cadence_gaps,
             HOURLY_ROLLUP_SECONDS,
             "1-hour rollup",
             tick_seconds,
+            max(hourly_cutoff, collection_start),
+            raw_cutoff,
         ),
     ):
         if level is not None:
             levels.append(level)
 
-    recent_gaps = [gap for gap in gaps if parse_ts(gap["to"]) >= raw_cutoff]
+    # Every recorded gap is still published; cadence_gap says which of them the
+    # chart may break on, so the page cannot re-derive the rule and disagree.
+    recent_gaps = [
+        {**gap, "cadence_gap": is_cadence_gap(gap, gap_seconds)}
+        for gap in gaps
+        if parse_ts(gap["to"]) >= raw_cutoff
+    ]
     history = {
         "raw_retention_seconds": RAW_RETENTION_SECONDS,
         "raw_started_at": raw_points[0]["ts"] if raw_points else None,
@@ -2275,6 +2340,12 @@ def room_lifecycle_display(
             "context": (
                 f"exact created-room names retained privately in SQLite since "
                 f"{lifecycle['ledger_started_at']} · {generation_evidence_text}"
+                if lifecycle["ledger_started_at"] is not None
+                else (
+                    "exact created-room names retained privately in SQLite since "
+                    "the ledger began; no start timestamp is recorded · "
+                    f"{generation_evidence_text}"
+                )
             ),
         },
         "revisited": {
@@ -2546,7 +2617,10 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     sustained = funnel["sustained_reciprocal_footprint"]
     date_count = funnel["persistence_collection_utc_dates_count"]
     tracking_disclosure = funnel["tracking_disclosure"]
-    cap_gates = funnel["signer_state_version"] not in (3, 4, 5, 6) and not (
+    cap_gates = not (
+        funnel["signer_state_version"] is not None
+        and funnel["signer_state_version"] >= 3
+    ) and not (
         funnel["signer_state_version"] is None and tracking_disclosure is not None
     )
 
@@ -2599,7 +2673,12 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
         if observed > 0
         else "Captured cohort denominator unavailable"
     )
-    if two_dates == 0 and date_count < 2:
+    if funnel["legacy_persistence_reset"]:
+        two_dates_context = (
+            "not recorded · this tick predates collection-UTC-date persistence "
+            "measurement; legacy message-derived dates are not reinterpreted"
+        )
+    elif two_dates == 0 and date_count < 2:
         two_dates_context = (
             "0 qualify · collection has observed 1 distinct collection UTC date; "
             "collection has not yet crossed a UTC day boundary, so no key can yet qualify"
@@ -2666,7 +2745,7 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
             f"{read_budget_text}"
             f"{format_int(coverage['cumulative_unique_rooms'])} / "
             f"{format_int(frame_size)} distinct room hashes selected; "
-            f"{format_int(coverage['sampled_rooms'])} selected this tick; "
+            f"{format_int(coverage['selected_rooms'])} selected this tick; "
             f"{format_int(coverage['failed_reads'])} cumulative failed reads and "
             f"{format_int(coverage['repeat_count'])} repeated selections in this frame epoch. "
             f"Selector version {format_int(coverage['selector_version'])}. "
@@ -2683,7 +2762,11 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
     stages = [
         ("observed", observed, observed_context),
         ("two_ticks", two_ticks, two_ticks_context),
-        ("two_dates", two_dates, two_dates_context),
+        (
+            "two_dates",
+            None if funnel["legacy_persistence_reset"] else two_dates,
+            two_dates_context,
+        ),
         ("sustained", sustained, sustained_context),
     ]
     return {
@@ -2840,6 +2923,7 @@ def display_funnel(
     result = dict(funnel)
     coverage = {
         "sampled_rooms": funnel["coverage"]["sampled_rooms"],
+        "selected_rooms": None,
         "newest_listing_rooms": newest_listing_rooms,
         "rooms_total": rooms_total,
         "frame_size": None,
@@ -2854,7 +2938,6 @@ def display_funnel(
     }
     if room_sampling is not None:
         for key in (
-            "sampled_rooms",
             "frame_size",
             "read_budget",
             "cumulative_unique_rooms",
@@ -2866,6 +2949,10 @@ def display_funnel(
             "frame_id",
         ):
             coverage[key] = room_sampling[key]
+        # The manifest counts rooms selected for a read; the funnel's own
+        # sampled_rooms counts the reads that succeeded. They are different
+        # numbers and neither may stand in for the other.
+        coverage["selected_rooms"] = room_sampling["sampled_rooms"]
     result["coverage"] = coverage
 
     # Honesty invariant: never present a census under a "latest" promise when
@@ -2910,7 +2997,8 @@ def methodology_definitions() -> dict[str, str]:
             "aggregate. Rollup ratios are recomputed from summed numerators and "
             "denominators, never from averaged percentages or rates. Empty buckets are "
             "null, partial buckets publish expected and missing counts, and chart lines "
-            "do not cross a bucket containing a recorded gap. Expected tick counts use "
+            "do not cross a bucket containing a recorded collector cadence gap. "
+            "Expected tick counts use "
             "the median gap-free accepted interval in the complete input. The scrubber "
             "addresses only the 24-hour raw window; older history is a derived chart "
             "series, not raw observations."
@@ -2933,14 +3021,20 @@ def methodology_definitions() -> dict[str, str]:
         ),
         "room_growth": (
             "Numerator: change in /r/events latest sequence. Denominator: elapsed UTC "
-            "seconds between two consecutive accepted, gap-free ticks. Endpoint: "
+            "seconds between two consecutive accepted, gap-free ticks. A decrease in "
+            "any of the four counted totals suppresses all four interval rates for "
+            "that interval, and the last computed rate is carried forward with the "
+            "time it was measured. Endpoint: "
             "/r/events?format=json&limit=200. Deduplication key: event sequence. This is "
             "a forward sample and lower bound when the 200-event window is incomplete; "
             "missing is null, never zero."
         ),
         "lobby_velocity": (
             "Numerator: change in /r/lobby latest sequence. Denominator: elapsed UTC "
-            "seconds between two consecutive accepted, gap-free ticks. Endpoint: "
+            "seconds between two consecutive accepted, gap-free ticks. A decrease in "
+            "any of the four counted totals suppresses all four interval rates for "
+            "that interval, and the last computed rate is carried forward with the "
+            "time it was measured. Endpoint: "
             "/r/lobby?format=json&limit=200. Deduplication key: message sequence. This "
             "is a forward sample; missing is null, never zero."
         ),
@@ -2980,9 +3074,10 @@ def methodology_definitions() -> dict[str, str]:
             "max(0, cap - total), and fill fraction is min(1, total / cap). "
             "Net-change rate is "
             "(last total - first total) / elapsed UTC seconds over at most 24 hours of "
-            "gap-free samples under one unchanged cap; its sample count and window are "
-            "published. These are point observations and a trailing measurement, not a "
-            "forecast. A cap change starts a new rate window."
+            "consecutive samples within the polling threshold under one unchanged cap; "
+            "a counter decrease does not end the window. Its sample count and window "
+            "are published. These are point observations and a trailing measurement, "
+            "not a forecast. A cap change starts a new rate window."
         ),
         "room_sampling": (
             "Frame: the deduplicated newest-room listing plus lobby. The per-tick "
@@ -3021,14 +3116,15 @@ def methodology_definitions() -> dict[str, str]:
             "shortened did:key value. "
             "Window: persistence_started_at through the displayed tick. Legacy "
             "message-timestamp date fields are not reinterpreted as collection dates; "
-            "legacy persistence and all downstream stages are reset to zero. Endpoints: "
+            "legacy persistence and all downstream stages are reset to zero in the "
+            "validated record and published as not recorded. Endpoints: "
             "successful sampled /r/<name>?format=json&limit=200 reads and /kv/did-XX "
             "census shards. Missing room reads add no signers and never mean inactivity. "
             "The newest-room sampling frame biases the result toward new and short-lived "
             "rooms. Funnel bars are drawn as proportions of the observed-signing cohort; "
             "the census count is published beside the funnel and is never a bar "
             "denominator, because the two populations do not contain each other. "
-            "Signer-state versions 3 through 5 store observed DIDs in SQLite without "
+            "Signer-state versions 3 and later store observed DIDs in SQLite without "
             "an insertion cap; version 4 resets the old co-occurrence flags and "
             "rebuilds them only from signed reciprocal alternation, while version 5 "
             "adds the separate room-lifecycle ledger. tracked_cap and cap_hit "
@@ -3292,11 +3388,13 @@ def sampling_display(coverage: Any) -> dict[str, str]:
             SAMPLING_NOT_RECORDED,
         )
     else:
+        # The merged funnel coverage names the manifest count selected_rooms and
+        # keeps sampled_rooms for successful reads; a bare manifest carries the
+        # same selection count under its own sampled_rooms.
+        selected = coverage.get("selected_rooms", coverage.get("sampled_rooms"))
         values = {
             "frame": f"{format_int(frame_size)} rooms in the recorded frame",
-            "sampled": (
-                f"{format_int(coverage.get('sampled_rooms'))} selected this tick"
-            ),
+            "sampled": f"{format_int(selected)} selected this tick",
             "unique": (
                 f"{format_int(coverage.get('cumulative_unique_rooms'))} / "
                 f"{format_int(frame_size)} unique room hashes in this frame epoch"
@@ -3309,7 +3407,7 @@ def sampling_display(coverage: Any) -> dict[str, str]:
                 f"{format_int(coverage.get('failed_reads'))} cumulative failures "
                 f"in this frame epoch · "
                 f"{format_int(coverage.get('failed_reads_this_tick'))} / "
-                f"{format_int(coverage.get('sampled_rooms'))} selected reads "
+                f"{format_int(selected)} selected reads "
                 "failed this tick"
             ),
             "selector": (
@@ -3339,11 +3437,15 @@ def series_snapshot_value(
     point: dict[str, Any],
     key: str,
     baseline: dict[str, Any],
-) -> int:
+) -> int | None:
+    # A counter below the chart baseline means the service's sequence reset,
+    # so the cumulative since collection began is unmeasurable, not zero.
     if key == "lobby":
-        return max(0, point["lobby_last_seq"] - baseline["lobby_last_seq"])
+        delta = point["lobby_last_seq"] - baseline["lobby_last_seq"]
+        return delta if delta >= 0 else None
     if key == "notes":
-        return max(0, point["notes_total"] - baseline["notes_total"])
+        delta = point["notes_total"] - baseline["notes_total"]
+        return delta if delta >= 0 else None
     return point["observed_public_rooms"]
 
 
@@ -3583,7 +3685,11 @@ def derive_records(
             "identity_census_run": census_run,
             "identity_census_run_display": identity_census_run_display(census_run),
             "census_display": census_display(latest_census),
-            "observed_public_rooms": max(0, tick["events_last_seq"] - first_event_seq),
+            "observed_public_rooms": (
+                tick["events_last_seq"] - first_event_seq
+                if tick["events_last_seq"] >= first_event_seq
+                else None
+            ),
             "room_sampling": room_sampling,
             "rates": {
                 "public_rooms_per_second": empty_rate(),
@@ -3814,7 +3920,17 @@ def derive_records(
         },
         "points": raw_points,
         "gaps": recent_gaps,
-        "gap_count": len(gaps),
+        # "Recorded gaps" counts collector cadence gaps as intervals, not
+        # records: one interval can carry a polling gap and an incomplete
+        # event window, and a counter decrease inside the polling threshold is
+        # not a missed observation.
+        "gap_count": len(
+            {
+                (gap["from"], gap["to"])
+                for gap in gaps
+                if is_cadence_gap(gap, gap_seconds)
+            }
+        ),
         "history": history,
         "composition_display": composition_display(raw_points),
         "ledger_chain": ledger_chain_summary(ticks),

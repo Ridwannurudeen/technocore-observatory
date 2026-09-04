@@ -258,13 +258,49 @@ PY_RELEASE_MAINTENANCE
 
 release_maintenance recover "$releases_root" "$public_root/current"
 
+ledger_copy=$(mktemp)
+trap 'rm -f -- "$ledger_copy"' 0
+if [ ! -f "${ticks_path}.lock" ]; then
+    echo "ledger lock is unavailable: ${ticks_path}.lock" >&2
+    exit 1
+fi
+exec 8<"${ticks_path}.lock"
+if ! flock 8; then
+    echo "ledger lock is unavailable: ${ticks_path}.lock" >&2
+    exit 1
+fi
+cp -- "$ticks_path" "$ledger_copy"
+exec 8<&-
+
 release_path=$(
     "$python_bin" "$script_dir/build_site.py" \
-        "$ticks_path" \
+        "$ledger_copy" \
         "$telemetry_path" \
         "$public_root" \
         --template "$script_dir/index.html"
 )
+
+next_link="$public_root/.current.$$"
+published=0
+is_active_release() {
+    current_path=$(CDPATH= cd -- "$public_root/current" 2>/dev/null && pwd -P) || return 1
+    [ "$current_path" = "$release_path" ]
+}
+cleanup() {
+    status=$?
+    trap - 0 HUP INT TERM
+    rm -f -- "$ledger_copy" || :
+    rm -f -- "$next_link" || :
+    if [ "$published" -eq 0 ] && ! is_active_release; then
+        release_maintenance discard-unpublished "$releases_root" "$release_path" || \
+            echo "failed to clean unpublished release: $release_path" >&2
+    fi
+    exit "$status"
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 case "$release_path" in
     "$releases_root"/*) ;;
@@ -278,27 +314,6 @@ test -d "$release_path"
 release_path=$(CDPATH= cd -- "$release_path" && pwd -P)
 release_maintenance validate-unpublished "$releases_root" "$release_path"
 
-next_link="$public_root/.current.$$"
-published=0
-is_active_release() {
-    current_path=$(CDPATH= cd -- "$public_root/current" 2>/dev/null && pwd -P) || return 1
-    [ "$current_path" = "$release_path" ]
-}
-cleanup() {
-    status=$?
-    trap - 0 HUP INT TERM
-    rm -f -- "$next_link" || :
-    if [ "$published" -eq 0 ] && ! is_active_release; then
-        release_maintenance discard-unpublished "$releases_root" "$release_path" || \
-            echo "failed to clean unpublished release: $release_path" >&2
-    fi
-    exit "$status"
-}
-trap cleanup 0
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
 mkdir -m 0755 "$release_path/errors"
 cp "$script_dir"/deploy/fallback/* "$release_path/errors/"
 chmod 0644 "$release_path"/errors/*
@@ -306,7 +321,7 @@ chmod 0644 "$release_path"/errors/*
 "$python_bin" "$script_dir/guards.py" \
     --html "$release_path/observatory/index.html" \
     --derive "$script_dir/derive.py" \
-    --ticks "$ticks_path" \
+    --ticks "$ledger_copy" \
     --site-root "$release_path"
 
 previous_release=""

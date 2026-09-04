@@ -23,7 +23,6 @@
     if (themeToggle) {
       const label = theme === "system" ? "auto" : theme;
       themeToggle.textContent = `THEME ${label.toUpperCase()}`;
-      themeToggle.setAttribute("aria-label", `Theme: ${label}`);
       themeToggle.dataset.themeValue = theme;
     }
   }
@@ -41,6 +40,7 @@
   }
 
   if (themeToggle) {
+    themeToggle.hidden = false;
     themeToggle.addEventListener("click", () => {
       const nextIndex = (themes.indexOf(theme) + 1) % themes.length;
       theme = themes[nextIndex];
@@ -54,6 +54,15 @@
       applyTheme(theme);
     });
   }
+
+  document.querySelectorAll("[data-freshness-for]").forEach((word) => {
+    const validity = document.getElementById(word.dataset.freshnessFor);
+    if (!validity) return;
+    const expiry = Date.parse(validity.getAttribute("datetime"));
+    if (!Number.isFinite(expiry) || Date.now() <= expiry) return;
+    const printed = word.textContent.trim();
+    word.textContent = printed === printed.toLowerCase() ? "stale" : "Stale";
+  });
 
   const search = document.querySelector(".room-search");
   const query = document.querySelector("#room-query");

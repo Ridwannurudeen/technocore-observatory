@@ -699,6 +699,37 @@ def test_recover_pending_jsonl_without_an_outbox_recovers_every_prefix(
     assert checkpoint["operation_id"] is None
 
 
+def test_unjournaled_growth_rebinds_the_checkpoint_to_the_verified_tip(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "ticks.jsonl"
+    checkpoint_path = sidecar_path(path, ".ledger-checkpoint.json")
+    collect.append_jsonl(path, {"ts": "2026-08-30T10:00:00Z", "value": "alpha"})
+    append_unjournaled_tick(
+        path,
+        {"ts": "2026-08-30T10:01:00Z", "value": "bravo"},
+    )
+
+    full_verifications = []
+    real_verify_ledger = collect.verify_ledger
+
+    def track_full_verification(ledger_path):
+        full_verifications.append(ledger_path)
+        return real_verify_ledger(ledger_path)
+
+    monkeypatch.setattr(collect, "verify_ledger", track_full_verification)
+    verified = collect._ledger_tip_for_append(path, checkpoint_path)
+    checkpoint = read_sidecar(checkpoint_path)
+    revisited = collect._ledger_tip_for_append(path, checkpoint_path)
+
+    assert full_verifications == [path]
+    assert checkpoint["ledger"]["size"] == path.stat().st_size
+    assert checkpoint["tip"]["canonical_sha256"] == verified[0]
+    assert checkpoint["operation_id"] is None
+    assert (revisited[0], revisited[1]) == (verified[0], verified[1])
+
+
 def test_quiet_recovery_rejects_a_malformed_checkpoint(tmp_path):
     path = tmp_path / "ticks.jsonl"
     checkpoint_path = sidecar_path(path, ".ledger-checkpoint.json")

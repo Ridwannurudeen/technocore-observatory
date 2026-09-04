@@ -42,6 +42,7 @@ DEPLOY_FILES = {
         for stem in API_FALLBACKS
         for suffix in ("json", "txt")
     ),
+    FALLBACK / "query-rate-limited.html",
     FALLBACK / "query-unavailable.html",
     ROOT / "recover_publication.py",
     ROOT / "rebuild.sh",
@@ -49,8 +50,25 @@ DEPLOY_FILES = {
 }
 
 
+ROBOTS = "noindex, nofollow, noarchive"
+CACHEABLE = "public, max-age=60, stale-if-error=300"
+
+
 def read(path):
     return path.read_text(encoding="utf-8")
+
+
+def nginx_map_value(source, header, key):
+    """Resolve a key the way nginx does: first listed regex wins, else the default."""
+    body = source.split(header, 1)[1].split("}", 1)[0]
+    for line in body.splitlines():
+        rule = line.strip()
+        if not rule.startswith("~"):
+            continue
+        pattern, value = rule.split(maxsplit=1)
+        if re.search(pattern.removeprefix("~"), key):
+            return value.strip(";").strip('"')
+    return ""
 
 
 def test_all_deployment_assets_are_tracked():
@@ -84,11 +102,61 @@ def test_nginx_http_context_is_query_private_and_supplies_shared_maps():
     assert "map $args $observatory_static_request_valid" in source
     assert "map $status $observatory_retry_after" in source
     assert '429 "60"' in source
-    assert "map $request_uri $observatory_robots" in source
+    assert "map $uri $observatory_robots" in source
     assert "$observatory_cache_control" in source
     assert "api/v1/rooms" in source
     assert "api/v1/dids" in source
     assert source.count("{") == source.count("}")
+
+    # nginx routes on the normalised $uri, so keying either map on $request_uri lets
+    # `///api/v1/rooms/search`, `/api/v1/%72ooms/search`, and `/api/v1/./rooms/search`
+    # reach the query daemon with neither header. Both maps must read the same $uri
+    # nginx matched the location on, including after an error_page internal redirect.
+    assert "$request_uri" not in source
+    for target, expected in (
+        ("/api/v1/rooms/search", ROBOTS),
+        ("/api/v1/dids/did:key:z6MkExampleKey", ROBOTS),
+        ("/errors/api-bad-request.txt", ROBOTS),
+        ("/errors/api-rate-limited.txt", ROBOTS),
+        ("/errors/query-rate-limited.html", ROBOTS),
+        ("/rooms/", ROBOTS),
+        ("/rooms/index.html", ROBOTS),
+        ("/rooms/0123456789abcdef/", ROBOTS),
+        ("/keys/did:key:z6MkExampleKey/", ROBOTS),
+        ("/api/v1/status", ""),
+        ("/api/v1/status.txt", ""),
+        ("/api/v1/status.json", ""),
+        ("/api/v1/incidents.txt", ""),
+        ("/index.html", ""),
+        ("/", ""),
+    ):
+        assert (
+            nginx_map_value(source, "map $uri $observatory_robots {", target)
+            == expected
+        ), target
+    for key, expected in (
+        ("200:0:/api/v1/rooms/search", "no-store"),
+        ("404:0:/api/v1/rooms/search", "no-store"),
+        ("400:0:/errors/api-bad-request.txt", "no-store"),
+        ("400:1:/errors/api-bad-request.txt", "no-store"),
+        ("429:0:/errors/api-rate-limited.txt", "no-store"),
+        ("429:0:/errors/query-rate-limited.html", "no-store"),
+        ("200:0:/rooms/", "no-store"),
+        ("200:1:/rooms/index.html", "no-store"),
+        ("404:0:/rooms/0123456789abcdef/", "no-store"),
+        ("400:0:/keys/did:key:z6MkExampleKey/", "no-store"),
+        ("200:0:/api/v1/incidents", "no-store"),
+        ("200:1:/api/v1/status", CACHEABLE),
+        ("200:1:/api/v1/status.txt", CACHEABLE),
+        ("200:1:/api/v1/status.json", CACHEABLE),
+        ("200:1:/api/v1/incidents", CACHEABLE),
+        ("200:1:/api/v1/incidents.txt", CACHEABLE),
+        ("200:1:/api/v1/changes.txt", CACHEABLE),
+        ("200:1:/api/v1/methodology.txt", CACHEABLE),
+    ):
+        assert (
+            nginx_map_value(source, "$observatory_cache_control {", key) == expected
+        ), key
 
 
 def test_nginx_vhost_mirrors_tls_and_keeps_headers_out_of_locations():
@@ -97,7 +165,10 @@ def test_nginx_vhost_mirrors_tls_and_keeps_headers_out_of_locations():
     assert "listen 80;" in source
     assert "listen [::]:80;" in source
     assert "include /etc/nginx/snippets/acme-challenge.conf;" in source
-    assert "return 301 https://$host$request_uri;" in source
+    # Reflecting the client's Host header would make this an open redirect wherever the
+    # block is reachable as the shared host's default :80 server.
+    assert "return 301 https://technocore.gudman.xyz$request_uri;" in source
+    assert "https://$host" not in source
     assert "listen 443 ssl http2;" in source
     assert "listen [::]:443 ssl http2;" in source
     assert (
@@ -226,6 +297,12 @@ def test_every_nginx_proxy_location_discards_get_and_head_bodies():
     for body in proxy_locations:
         assert re.search(r"(?m)^\s*proxy_pass_request_body off;\s*$", body)
         assert re.search(r'(?m)^\s*proxy_set_header Content-Length "";\s*$', body)
+        # The daemon's own budget is 0.5s; without these a hung daemon would hold an
+        # nginx worker for the 60s default. A read timeout is a 504, which the
+        # error_page 502 503 504 mapping already turns into the bounded 503 artifact.
+        assert re.search(r"(?m)^\s*proxy_connect_timeout 2s;\s*$", body)
+        assert re.search(r"(?m)^\s*proxy_read_timeout 5s;\s*$", body)
+        assert re.search(r"(?m)^\s*proxy_send_timeout 5s;\s*$", body)
 
 
 def test_nginx_errors_are_no_store_while_static_api_successes_are_cacheable():
@@ -233,25 +310,22 @@ def test_nginx_errors_are_no_store_while_static_api_successes_are_cacheable():
     vhost = read(NGINX_VHOST)
 
     assert (
-        'map "$status:$observatory_static_request_valid:$request_uri" '
+        'map "$status:$observatory_static_request_valid:$uri" '
         "$observatory_cache_control {" in context
     )
     cache_map = context.split("$observatory_cache_control {", 1)[1].split("}", 1)[0]
     assert '~^(?:400|405|429|503): "no-store";' in cache_map
     assert (
-        "~^(?:200|206|304):1:/api/v1/"
-        "(?:status|incidents|changes|methodology)(?:\\?|$) "
+        "~^(?:200|206|304):1:/api/v1/(?:status|incidents|changes|methodology)$ "
         '"public, max-age=60, stale-if-error=300";' in cache_map
     )
     alias_rule = next(
-        line.strip()
-        for line in cache_map.splitlines()
-        if "/(?:status|methodology)\\." in line
+        line.strip() for line in cache_map.splitlines() if "\\.(?:txt|json)" in line
     )
     alias_pattern, alias_policy = alias_rule.split(maxsplit=1)
     assert alias_policy == '"public, max-age=60, stale-if-error=300";'
     for status in (200, 206, 304):
-        for resource in ("status", "methodology"):
+        for resource in ("status", "incidents", "changes", "methodology"):
             for suffix in ("txt", "json"):
                 assert re.fullmatch(
                     alias_pattern.removeprefix("~"),
@@ -260,6 +334,23 @@ def test_nginx_errors_are_no_store_while_static_api_successes_are_cacheable():
     assert (
         vhost.count("add_header Cache-Control $observatory_cache_control always;") == 2
     )
+    # The shared host's http {} block gzip-negotiates these cacheable static
+    # representations, so the vhost must declare the varying request header itself.
+    assert "gzip_vary on;" in vhost
+    assert "gzip_vary" not in context
+
+
+def test_static_text_representations_declare_utf8():
+    vhost = read(NGINX_VHOST)
+
+    # Static text representations are served from files, so nginx types them from the
+    # extension and would ship a bare `text/plain` while the proxied representations
+    # of the same resources declare `text/plain; charset=utf-8`.
+    assert "charset utf-8;" in vhost
+    assert "charset_types text/plain;" in vhost
+    tls = vhost.split("listen 443 ssl http2;", 1)[1]
+    assert "charset utf-8;" in tls
+    assert "charset_types text/plain;" in tls
 
 
 def test_rooms_index_is_static_without_args_and_search_requests_are_proxied():
@@ -282,6 +373,21 @@ def test_rooms_index_is_static_without_args_and_search_requests_are_proxied():
         "proxy_pass http://127.0.0.1:8765;"
     )
     assert "rooms/index.html" in guards.STATIC_RELEASE_FILES
+
+    # Both human surfaces already fall back to a styled page on 502/503/504. A 429 is
+    # the same audience, so it must not hand a browser the plain-text API artifact.
+    assert "location @html_rate_limited {" in vhost
+    assert "try_files /errors/query-rate-limited.html =429;" in vhost
+    assert vhost.count("error_page 429 =429 @html_rate_limited;") == 2
+    assert "error_page 429 =429 @html_rate_limited;" in location
+    did_match = re.search(
+        r'(?ms)^\s*location ~ "\^/\(\?:rooms/\[0-9a-f\]\{16\}\|keys/\[\^/\]\+\)/\$" \{'
+        r"(.*?)^\s{4}\}",
+        vhost,
+    )
+    assert did_match is not None
+    assert "error_page 429 =429 @html_rate_limited;" in did_match.group(1)
+    assert "errors/query-rate-limited.html" in guards.STATIC_RELEASE_FILES
 
 
 def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
@@ -325,6 +431,9 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     assert f"--methodology-version {derive.METHODOLOGY_VERSION}" in query
     assert "ProtectSystem=strict" in query
     assert "ProtectHome=read-only" in query
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in query
+    assert "IPAddressDeny=any" in query
+    assert "IPAddressAllow=localhost" in query
     assert (
         "ReadOnlyPaths=/home/technocore/observatory /opt/technocore-observatory"
         in query
@@ -345,12 +454,14 @@ def test_rebuild_orders_failure_prone_steps_before_the_atomic_flip():
     lock_acquire = source.index("flock -n 9")
     recovery = source.index("release_maintenance recover")
     build = source.index("build_site.py")
+    trap_install = source.index("trap cleanup 0")
     unpublished_validation = source.index("release_maintenance validate-unpublished")
     fallbacks = source.index("deploy/fallback")
     guards_call = source.index("guards.py")
     link = source.index("ln -s")
     flip = source.index("mv -Tf")
     assert lock_open < lock_acquire < recovery < build
+    assert build < trap_install < unpublished_validation
     assert build < unpublished_validation < fallbacks < guards_call < link < flip
     assert "command -v flock" in source
     assert "--template" in source
@@ -369,6 +480,118 @@ def test_rebuild_orders_failure_prone_steps_before_the_atomic_flip():
     assert source.index("mv -Tf") < source.index("release_maintenance prune")
     assert "max_release_count=1008" in source
     assert "max_release_bytes=2147483648" in source
+
+
+def test_rebuild_reads_one_locked_ledger_copy_for_the_build_and_the_guards():
+    source = read(ROOT / "rebuild.sh")
+
+    make_copy = source.index("ledger_copy=$(mktemp)")
+    discard_copy = source.index("trap 'rm -f -- \"$ledger_copy\"' 0")
+    lock_open = source.index('exec 8<"${ticks_path}.lock"')
+    lock_acquire = source.index("flock 8")
+    locked_copy = source.index('cp -- "$ticks_path" "$ledger_copy"')
+    build = source.index("build_site.py")
+    guards_call = source.index("guards.py")
+
+    assert (
+        make_copy
+        < discard_copy
+        < lock_open
+        < lock_acquire
+        < locked_copy
+        < build
+        < guards_call
+    )
+    assert source.count('cp -- "$ticks_path" "$ledger_copy"') == 1
+    assert '        "$ledger_copy" \\' in source
+    assert '--ticks "$ledger_copy"' in source
+    assert '--ticks "$ticks_path"' not in source
+    assert 'rm -f -- "$ledger_copy" || :' in source
+    assert source.index('rm -f -- "$ledger_copy" || :') < source.index(
+        'rm -f -- "$next_link" || :'
+    )
+
+
+@pytest.mark.parametrize("lock_exists", (False, True), ids=("missing", "unusable"))
+def test_rebuild_stops_before_building_when_the_ledger_lock_is_unavailable(
+    tmp_path,
+    lock_exists,
+):
+    if os.name == "nt":
+        git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+        bash = str(git_bash) if git_bash.is_file() else None
+    else:
+        bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip(
+            "bash is unavailable; ledger locking received structural validation only"
+        )
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    shutil.copy2(ROOT / "rebuild.sh", checkout / "rebuild.sh")
+    marker = tmp_path / "build-called"
+    (checkout / "build_site.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['TEST_BUILD_MARKER']).write_bytes(b'called')\n"
+        "raise SystemExit(41)\n",
+        encoding="utf-8",
+    )
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    ticks.write_text("", encoding="utf-8")
+    if lock_exists:
+        ticks.with_name(f"{ticks.name}.lock").write_bytes(b"")
+    telemetry.write_bytes(b"")
+    public = tmp_path / "public"
+    public.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_flock = fake_bin / "flock"
+    fake_flock.write_text(
+        '#!/bin/sh\n[ "$1" = "-n" ] && exit 0\nexit 70\n',
+        encoding="utf-8",
+    )
+    fake_flock.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "OBSERVATORY_PYTHON": Path(sys.executable).as_posix(),
+            "TEST_BUILD_MARKER": str(marker),
+            "PATH": str(fake_bin) + os.pathsep + environment["PATH"],
+        }
+    )
+
+    result = subprocess.run(
+        [
+            bash,
+            (checkout / "rebuild.sh").as_posix(),
+            ticks.as_posix(),
+            telemetry.as_posix(),
+            public.as_posix(),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert "ledger lock is unavailable" in result.stderr
+    assert not marker.exists()
+
+
+def test_guards_validate_the_static_release_before_rendering_it():
+    source = read(ROOT / "guards.py")
+
+    ledger = source.index('("tick ledger hash chain"')
+    payload = source.index('("payload contract"')
+    static = source.index('("static release"')
+    zero_width = source.index('("zero-width render"')
+    no_js = source.index('("no-JS honesty"')
+
+    assert ledger < payload < static < zero_width < no_js
 
 
 def release_maintenance_source():
@@ -574,6 +797,7 @@ def test_rebuild_removes_an_unpublished_release_when_guards_fail(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     telemetry = tmp_path / "telemetry.sqlite3"
     ticks.write_text("", encoding="utf-8")
+    ticks.with_name(f"{ticks.name}.lock").write_bytes(b"")
     telemetry.write_bytes(b"")
     public = tmp_path / "public"
     public.mkdir()
@@ -892,9 +1116,11 @@ def test_runbook_checks_invalid_queries_only_after_query_service_restart():
     assert stopped < restart < invalid
 
 
-def test_docs_state_the_scoped_lint_waiver_and_failure_metadata_boundary():
+def test_docs_state_the_unwaived_lint_command_and_failure_metadata_boundary():
+    # The `derive.py:F841` waiver was dead: the pinned Ruff reports nothing under it.
     for path in (ROOT / "README.md", ROOT / "DEPLOY.md"):
-        assert 'ruff check . --per-file-ignores "derive.py:F841"' in read(path)
+        assert "ruff check ." in read(path)
+        assert "--per-file-ignores" not in read(path)
 
     demo = read(ROOT / "DEMO.md")
     assert "Every successful evidence response carries source time" in demo
@@ -920,15 +1146,19 @@ def test_docs_state_the_scoped_lint_waiver_and_failure_metadata_boundary():
 
 
 def test_fallback_contracts_are_bounded_credential_free_and_non_indexable():
-    html = read(FALLBACK / "query-unavailable.html")
-
-    assert '<meta name="robots" content="noindex,nofollow,noarchive">' in html
-    assert "local query service is unavailable" in html.lower()
-    assert "<script" not in html.lower()
-    assert 'id="theme-toggle"' not in html
+    for name, claim in (
+        ("query-unavailable", "local query service is unavailable"),
+        ("query-rate-limited", "exceeded the local query rate"),
+    ):
+        html = read(FALLBACK / f"{name}.html")
+        assert '<meta name="robots" content="noindex,nofollow,noarchive">' in html
+        assert claim in html.lower()
+        assert "<script" not in html.lower()
+        assert 'id="theme-toggle"' not in html
     for stem, error in API_FALLBACKS.items():
         payload = json.loads(read(FALLBACK / f"{stem}.json"))
         plain = (FALLBACK / f"{stem}.txt").read_bytes()
+        assert payload["contract_version"] == "1.1.0"
         assert payload["error"] == error
         assert payload["freshness"] == "not_observed"
         assert set(payload) == {
@@ -1039,6 +1269,37 @@ def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
     assert any("innerHTML" in finding for finding in findings)
     index_path.write_text(index_source, encoding="utf-8")
 
+    index_path.write_text(
+        index_source.replace(
+            "</body>",
+            "<style>@import url(https://example.invalid/fonts.css);</style></body>",
+        ),
+        encoding="utf-8",
+    )
+    findings = guards.guard_static_release(release)
+    assert findings == ["`index.html` loads an external resource"]
+    index_path.write_text(index_source, encoding="utf-8")
+
+    rooms_path = release / "rooms/index.html"
+    rooms_source = rooms_path.read_text(encoding="utf-8")
+    rooms_path.write_text(
+        re.sub(r"<form\b.*?</form>", "", rooms_source, flags=re.S),
+        encoding="utf-8",
+    )
+    findings = guards.guard_static_release(release)
+    assert findings == [
+        "`rooms/index.html` contains no progressive-enhancement GET form"
+    ]
+    rooms_path.write_text(rooms_source, encoding="utf-8")
+
+    stray = release / "assets/styles.css.map"
+    stray.write_text("stray", encoding="utf-8")
+    findings = guards.guard_static_release(release)
+    assert findings == [
+        "static release contains an unexpected file `assets/styles.css.map`"
+    ]
+    stray.unlink()
+
     openapi_path = release / "openapi.json"
     openapi = json.loads(openapi_path.read_text(encoding="utf-8"))
     del openapi["paths"]["/api/v1/status"]["head"]
@@ -1061,6 +1322,21 @@ def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
     )
     findings = guards.guard_static_release(release)
     assert any("llms.txt" in finding and "{room_id}" in finding for finding in findings)
+
+    rate_limited_path = release / "errors/query-rate-limited.html"
+    rate_limited = rate_limited_path.read_text(encoding="utf-8")
+    rate_limited_path.write_text(
+        rate_limited.replace(
+            '<meta name="robots" content="noindex,nofollow,noarchive">', ""
+        ),
+        encoding="utf-8",
+    )
+    findings = guards.guard_static_release(release)
+    assert any(
+        "query-rate-limited.html" in finding and "noindex" in finding
+        for finding in findings
+    )
+    rate_limited_path.write_text(rate_limited, encoding="utf-8")
 
     openapi_path.unlink()
     findings = guards.guard_static_release(release)
@@ -1138,3 +1414,15 @@ def test_query_unit_pins_the_versions_the_code_actually_publishes():
     pinned = dict(re.findall(r"--(collector|methodology)-version (\S+)", unit))
     assert pinned["collector"] == collect.COLLECTOR_VERSION
     assert pinned["methodology"] == derive.METHODOLOGY_VERSION
+
+    # The runbook's post-start check names a collector version the operator reads off a
+    # live tick, and it drifted behind the pin. Scope the search to that step: the
+    # deploy-order sections legitimately name older collector versions.
+    deploy = read(ROOT / "DEPLOY.md")
+    step = re.search(
+        r"2\. Start `technocore-observatory\.service`.*?in local state\.",
+        deploy,
+        re.S,
+    )
+    assert step is not None
+    assert set(re.findall(r"2\.\d+\.\d+", step.group())) == {collect.COLLECTOR_VERSION}

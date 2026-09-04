@@ -141,7 +141,11 @@ python .\query_service.py `
   --snapshot-root "$release" `
   --host 127.0.0.1 `
   --port 8765
+```
 
+`query_service.py` calls `serve_forever`, so it holds that shell; run the guards in a second one.
+
+```powershell
 python .\guards.py `
   --html "$release\observatory\index.html" `
   --derive "$repo\derive.py" `
@@ -151,7 +155,7 @@ python .\guards.py `
 
 `query_service.py` refuses a relative database or snapshot path and refuses any bind address other
 than `127.0.0.1`. The signer database is `signers.sqlite3`, derived by the collector from the
-`--signer-state signers.json` metadata path. The current public contract is methodology 1.15.0;
+`--signer-state signers.json` metadata path. The current public contract is methodology 1.16.0;
 the deployed query unit must advertise that exact version.
 
 For a complete test run:
@@ -160,12 +164,9 @@ For a complete test run:
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 python -m py_compile (Get-ChildItem -Filter *.py | ForEach-Object FullName)
-python -m ruff check . --per-file-ignores "derive.py:F841"
+python -m ruff check .
 python -m ruff format --check .
 ```
-
-The Ruff command records the one known pre-existing unused local in `derive.py:2808` as an explicit
-waiver; the roadmap implementation does not change that dead-code finding.
 
 On Windows, the deployment tests perform structural nginx and systemd validation and say so in
 their skip messages. They do not claim that `nginx -t` or `systemd-analyze verify` ran. Those two

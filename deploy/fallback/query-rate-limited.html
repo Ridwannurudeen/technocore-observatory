@@ -3,17 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="The local Technocore evidence query service is unavailable. Static evidence remains available.">
+  <meta name="description" content="The local Technocore evidence query service is rate limited. Static evidence remains available.">
   <meta name="robots" content="noindex,nofollow,noarchive">
   <meta name="theme-color" content="#0B0E0C">
-  <meta property="og:title" content="Search unavailable — Technocore Observatory">
-  <meta property="og:description" content="The local Technocore evidence query service is unavailable. Static evidence remains available.">
+  <meta property="og:title" content="Search is rate limited — Technocore Observatory">
+  <meta property="og:description" content="The local Technocore evidence query service is rate limited. Static evidence remains available.">
   <meta property="og:type" content="website">
-  <title>Search unavailable — Technocore Observatory</title>
+  <title>Search is rate limited — Technocore Observatory</title>
   <link rel="stylesheet" href="/assets/styles.css">
 
 </head>
-<body data-page="query-unavailable">
+<body data-page="query-rate-limited">
   <a class="skip-link" href="#main-content">SKIP TO CONTENT</a>
   <header class="site-header">
     <a class="wordmark" href="/" aria-label="Technocore Observatory home">TECHNOCORE OBSERVATORY</a>
@@ -42,23 +42,23 @@
   <main id="main-content" class="page-shell" tabindex="-1">
     <header class="page-lede">
       <p class="eyebrow">STATE / QUERY SERVICE</p>
-      <h1>SEARCH IS UNAVAILABLE</h1>
-      <p>The local query service is unavailable. Static evidence still serves.</p>
+      <h1>SEARCH IS RATE LIMITED</h1>
+      <p>This client exceeded the local query rate. Retry shortly; static evidence still serves.</p>
     </header>
     <section class="page-section evidence-page" aria-labelledby="fallback-title">
       <div class="section-heading">
         <div>
           <p class="figure-label">01 / RECORDED STATE</p>
-          <h2 id="fallback-title">Local queries stopped</h2>
+          <h2 id="fallback-title">Local queries were declined</h2>
         </div>
         <p>This fallback makes no claim about rooms or their absence.</p>
       </div>
-      <p class="state-field state-danger">QUERY SERVICE UNAVAILABLE</p>
+      <p class="state-field state-danger">QUERY SERVICE RATE LIMITED</p>
       <dl class="evidence-rail" aria-label="Fallback evidence">
         <div class="missing"><dt>OBSERVED</dt><dd>NOT RECORDED</dd></div>
         <div><dt>WINDOW</dt><dd>NOT APPLICABLE</dd></div>
         <div><dt>COVERAGE</dt><dd>Static evidence remains available</dd></div>
-        <div><dt>METHOD</dt><dd>Local service fallback</dd></div>
+        <div><dt>METHOD</dt><dd>Local service rate limit</dd></div>
       </dl>
       <section class="result-register" aria-labelledby="available-title">
         <div class="ledger-heading">
@@ -80,7 +80,7 @@
   </main>
   <footer class="site-footer">
     <p>PUBLIC OBSERVATIONS. BOUNDED CLAIMS.</p>
-    <p><a href="/api/v1/status.txt">STATUS AS TEXT</a> · <a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.1.0</p>
+    <p><a href="/api/v1/status.txt">STATUS AS TEXT</a> · <a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.0.0</p>
   </footer>
 </body>
 </html>
