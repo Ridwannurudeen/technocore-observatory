@@ -14,7 +14,6 @@ from unittest import mock
 import pytest
 
 import benchmark_search
-import guards
 import query_service
 from api_contract import (
     CONTRACT_VERSION,
@@ -1435,9 +1434,10 @@ def test_query_shell_header_has_computed_grid_layout(running_server):
         sources.append(body.decode("utf-8"))
 
     with sync_api.sync_playwright() as playwright:
-        browser = guards.launch_browser(playwright)
-        if browser is None:
-            pytest.skip("no Chromium browser is installed")
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
         try:
             page = browser.new_page(viewport={"width": 1280, "height": 900})
             for source in sources:
