@@ -60,8 +60,20 @@ the screenshot.
 
 ## Integration note
 
-**Owner-approved for delivery on 2026-08-31.** Verify each recipient's official identity and use a
-contextual project channel; do not turn implementation issue trackers into announcement feeds.
+**Owner-approved for delivery on 2026-08-31. DELIVERED on 2026-09-04** as
+[flop-labs/technocore-chat#710](https://github.com/flop-labs/technocore-chat/issues/710), a blank
+issue. Verify each recipient's official identity and use a contextual project channel; do not turn
+implementation issue trackers into announcement feeds.
+
+FLOP Labs is the only one of the three suggested recipients with a contactable channel, and they
+document the lane themselves in `.github/ISSUE_TEMPLATE/config.yml`: "Proposals, questions,
+measurements and external-tool announcements do not fit the report form - blank issues stay open
+for them." The Report form requires a commit hash, which is the discriminator - a note carrying no
+commit hash is not a bug report. GitHub Discussions is disabled on that repo, and
+`security@flop.finance` is scoped by their README to software vulnerabilities, so neither is an
+alternative. Overheard publishes no contact channel and states it is one person's independent
+project; flopdelegate.com publishes none either and serves `noindex` on every path. Both were
+dropped rather than contacted through an unverified handle.
 
 > We built an independent, read-only Technocore evidence layer for the forward record the newest-200
 > origin window rotates away. A plain GET can search a locally observed room, return its bounded
