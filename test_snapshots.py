@@ -223,6 +223,42 @@ def test_status_envelope_freshness_follows_the_oldest_component(
     assert result["status"]["collector"]["source_observed_at"] == tick_at
 
 
+def test_status_envelope_uses_the_health_probe_not_a_newer_unrelated_attempt(tmp_path):
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(ticks, tick("2026-08-30T06:00:00Z"))
+    with telemetry_database(telemetry) as connection:
+        add_attempt(
+            connection,
+            attempt_id=1,
+            route="/healthz",
+            observed_at="2026-08-30T00:00:00Z",
+            outcome="success",
+            status=200,
+        )
+        add_attempt(
+            connection,
+            attempt_id=2,
+            route="/rooms",
+            observed_at="2026-08-30T06:00:00Z",
+            outcome="success",
+            status=200,
+        )
+
+    result = build_snapshots(
+        ticks,
+        telemetry,
+        derived_at="2026-08-30T06:00:10Z",
+        published_at="2026-08-30T06:00:30Z",
+    )["status"]
+
+    assert result["source_observed_at"] == "2026-08-30T00:00:00Z"
+    assert result["freshness"] == "stale"
+    assert result["status"]["origin"]["source_observed_at"] == (
+        "2026-08-30T00:00:00Z"
+    )
+
+
 def test_snapshot_rejects_a_source_observation_after_derivation(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     telemetry = tmp_path / "telemetry.sqlite3"
@@ -956,6 +992,8 @@ def test_huge_engagement_integers_remain_not_recorded_without_raising():
 def test_methodology_discloses_current_room_name_policy_and_history_boundary():
     methodology = snapshots.methodology_resource()
 
+    assert snapshots.INCIDENT_RULES_VERSION == "1.1.0"
+    assert methodology["rules_version"] == "1.1.0"
     assert methodology["history_boundary"] == (
         "Repository-backed methodology history begins at 1.3.0; absent version "
         "numbers and earlier revision details are not inferred."

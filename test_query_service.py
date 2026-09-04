@@ -1374,6 +1374,7 @@ def test_progressive_room_html_escapes_names_and_uses_generic_previews(running_s
     )
     for marker in shared_shell:
         assert marker in source
+    assert 'dataset.themeStorage="unavailable"' in source
     assert '<nav class="priority-nav" aria-label="Primary">' in source
     form = source.partition('<form class="room-search"')[2].partition("</form>")[0]
     assert form

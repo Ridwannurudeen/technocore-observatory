@@ -395,6 +395,68 @@ def test_rebuild_reads_one_locked_ledger_copy_for_the_build_and_the_guards():
     )
 
 
+def test_rebuild_stops_before_building_when_the_ledger_lock_is_missing(tmp_path):
+    if os.name == "nt":
+        git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+        bash = str(git_bash) if git_bash.is_file() else None
+    else:
+        bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash is unavailable; ledger locking received structural validation only")
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    shutil.copy2(ROOT / "rebuild.sh", checkout / "rebuild.sh")
+    marker = tmp_path / "build-called"
+    (checkout / "build_site.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['TEST_BUILD_MARKER']).write_bytes(b'called')\n"
+        "raise SystemExit(41)\n",
+        encoding="utf-8",
+    )
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    ticks.write_text("", encoding="utf-8")
+    telemetry.write_bytes(b"")
+    public = tmp_path / "public"
+    public.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_flock = fake_bin / "flock"
+    fake_flock.write_text(
+        '#!/bin/sh\n[ "$1" = "-n" ] && exit 0\nexit 70\n',
+        encoding="utf-8",
+    )
+    fake_flock.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "OBSERVATORY_PYTHON": Path(sys.executable).as_posix(),
+            "TEST_BUILD_MARKER": str(marker),
+            "PATH": str(fake_bin) + os.pathsep + environment["PATH"],
+        }
+    )
+
+    result = subprocess.run(
+        [
+            bash,
+            (checkout / "rebuild.sh").as_posix(),
+            ticks.as_posix(),
+            telemetry.as_posix(),
+            public.as_posix(),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert "ledger lock is unavailable" in result.stderr
+    assert not marker.exists()
+
+
 def test_guards_validate_the_static_release_before_rendering_it():
     source = read(ROOT / "guards.py")
 
@@ -965,6 +1027,7 @@ def test_fallback_contracts_are_bounded_credential_free_and_non_indexable():
     for stem, error in API_FALLBACKS.items():
         payload = json.loads(read(FALLBACK / f"{stem}.json"))
         plain = (FALLBACK / f"{stem}.txt").read_bytes()
+        assert payload["contract_version"] == "1.1.0"
         assert payload["error"] == error
         assert payload["freshness"] == "not_observed"
         assert set(payload) == {

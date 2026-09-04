@@ -2896,6 +2896,34 @@ def test_rollup_preserves_empty_buckets_first_last_and_gap_boundaries():
     assert daily_buckets[-1]["complete"] is True
 
 
+def test_opening_retention_bucket_counts_a_missing_cadence_slot():
+    ledger_start = datetime(2026, 7, 1, 3, 40, tzinfo=timezone.utc)
+    hourly_ledger = [
+        tick(
+            (ledger_start + timedelta(hours=index)).isoformat().replace("+00:00", "Z"),
+            event_seq=30_000 + index,
+            lobby=5_000 + index,
+            notes=1_000 + index,
+        )
+        for index in range(32 * 24)
+        if index != 10
+    ]
+
+    result = derive_records(hourly_ledger, gap_seconds=4_000)
+    first_daily_bucket = next(
+        bucket
+        for level in result["history"]["rollup_levels"]
+        if level["resolution_label"] == "1-day rollup"
+        for bucket in level["buckets"]
+        if bucket is not None
+    )
+
+    assert first_daily_bucket["observation_count"] == 20
+    assert first_daily_bucket["expected_tick_count"] == 21
+    assert first_daily_bucket["missing_count"] == 1
+    assert first_daily_bucket["complete"] is False
+
+
 def test_resolution_label_distinguishes_raw_scrubber_from_rollups():
     result = derive_records(
         [

@@ -100,7 +100,7 @@ CENSUS_MAX_PASSES = 5
 CENSUS_DEADLINE_SECONDS = 30 * 60
 CENSUS_PACE_FLOOR_SECONDS = RATE_BUDGET_WINDOW_SECONDS / TOTAL_READ_BUDGET
 CENSUS_STATE_VERSION = 2
-COLLECTOR_VERSION = "2.14.0"
+COLLECTOR_VERSION = "2.15.0"
 SELECTOR_VERSION = 1
 ROOM_ID_HEX_LENGTH = 16
 SIGNER_STATE_VERSION = 6
@@ -139,6 +139,10 @@ class CollectionError(RuntimeError):
         self.outcome = outcome
         self.status = status
         self.path = normalize_route(path)[0] if path is not None else None
+
+
+class TickOutboxCommittedError(OSError):
+    """The durable tick exists, but its metadata mirror was not published."""
 
 
 def utc_now() -> str:
@@ -6639,7 +6643,10 @@ def collect_tick(
             outbox = _insert_tick_outbox(connection, tick)
             write_signer_metadata(connection, state)
             connection.commit()
-            save_atomic_json(signer_state_path, state)
+            try:
+                save_atomic_json(signer_state_path, state)
+            except OSError as error:
+                raise TickOutboxCommittedError(str(error)) from error
         except Exception:
             connection.rollback()
             raise
@@ -6807,6 +6814,8 @@ def main() -> int:
                         )
                     tick_written = True
             except (CollectionError, OSError, sqlite3.Error) as error:
+                if isinstance(error, TickOutboxCommittedError):
+                    outbox_committed = True
                 if isinstance(error, CollectionError):
                     error_outcome = error.outcome
                     if error_outcome not in {

@@ -714,8 +714,8 @@ def insert_record(
     )
 
 
-def test_collector_version_is_bumped_for_lifecycle_sampling():
-    assert tuple(map(int, COLLECTOR_VERSION.split("."))) > (2, 11, 1)
+def test_collector_version_identifies_the_current_tick_contract():
+    assert COLLECTOR_VERSION == "2.15.0"
     assert collect.SIGNER_STATE_VERSION == 6
     assert collect.TICK_REVISIT_DEADLINE_SECONDS == 300
 
@@ -5488,6 +5488,89 @@ def test_census_main_fails_when_the_committed_outbox_cannot_be_published(
 
     assert collect.main() == 1
     assert drain_calls == 2
+
+
+def test_main_reports_deferred_publication_when_metadata_save_fails_after_commit(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    output = tmp_path / "ticks.jsonl"
+    signer_state = tmp_path / "signers.json"
+    tick_ts = "2026-08-30T08:01:00Z"
+
+    class TickClient:
+        telemetry_degraded = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, path, deadline=None):
+            if path == "/rooms?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "total": 1,
+                        "capacity": 100,
+                        "bytes": 10,
+                        "notes": {"total": 1, "capacity": 100, "bytes": 1},
+                        "rooms": [{"name": "lobby", "seq": 1, "idle": 0}],
+                    }
+                )
+            if path == "/r/events?format=json&limit=200":
+                return json.dumps(
+                    {
+                        "room": "events",
+                        "messages": [
+                            {
+                                "seq": 1,
+                                "ts": tick_ts,
+                                "from": "server",
+                                "text": "created committed-room",
+                            }
+                        ],
+                    }
+                )
+            if path.startswith("/r/"):
+                return room_body(message(1, "server"))
+            raise AssertionError(f"unexpected read: {path}")
+
+    real_save = collect.save_atomic_json
+    save_calls = 0
+
+    def fail_post_commit_save(path, payload):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise OSError("metadata publication failed")
+        return real_save(path, payload)
+
+    monkeypatch.setattr(collect, "Client", TickClient)
+    monkeypatch.setattr(collect, "save_atomic_json", fail_post_commit_save)
+    monkeypatch.setattr(collect, "utc_now", lambda: tick_ts)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect.py",
+            "--base-url",
+            "https://example.invalid",
+            "--output",
+            str(output),
+            "--signer-state",
+            str(signer_state),
+            "--once",
+        ],
+    )
+
+    assert collect.main() == 1
+    assert save_calls == 2
+    assert "collection committed; publication deferred" in capsys.readouterr().err
+    connection = connect_signer_database(collect.signer_database_path(signer_state))
+    try:
+        assert collect.load_tick_outbox(connection) is not None
+    finally:
+        connection.close()
+    assert not output.exists()
 
 
 def test_sqlite_error_skips_tick_and_daemon_loop_continues(

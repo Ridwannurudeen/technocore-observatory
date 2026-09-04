@@ -12,7 +12,7 @@ import pytest
 import build_site
 import guards
 import snapshots
-from api_contract import MAX_RESPONSE_BYTES
+from api_contract import CONTRACT_VERSION, MAX_RESPONSE_BYTES
 from build_site import build_release
 from test_snapshots import add_attempt, telemetry_database, tick, write_ticks
 
@@ -467,7 +467,8 @@ def test_discovery_documents_and_static_contracts_are_valid(built_release):
     }
     assert agent["interfaces"]["room_evidence"].endswith("/api/v1/rooms/{room_id}")
     assert agent["interfaces"]["trace"].endswith("/api/v1/dids/{did}")
-    assert status["contract_version"] == "1.0.0"
+    assert CONTRACT_VERSION == "1.1.0"
+    assert status["contract_version"] == "1.1.0"
     assert status["schema_version"] == 6
     assert status["status"]["origin"]["state"] == "reachable"
 
@@ -727,7 +728,6 @@ def test_observatory_source_has_phase_three_accessibility_contracts():
     assert 'data-theme-value="system" hidden>THEME AUTO</button>' in source
     assert "themeToggle.hidden = false;" in source
     assert 'setAttribute("aria-label"' not in source
-    assert "themeStorage" not in source
 
     # The stored theme is applied before the stylesheet, so a stored dark
     # preference never paints light first.
@@ -1186,6 +1186,47 @@ def test_lifecycle_sampling_scrubs_back_to_the_not_recorded_pair(tmp_path):
                 context = page.locator(f"#{identifier}-context").text_content()
                 assert "predates room-lifecycle sampling evidence" in context
             page.close()
+        finally:
+            browser.close()
+
+
+def test_theme_storage_failure_is_disclosed_without_disabling_the_control(
+    built_release,
+):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    release, _ = built_release
+
+    with sync_api.sync_playwright() as playwright:
+        browser = None
+        for channel in ("chrome", "msedge", None):
+            try:
+                browser = (
+                    playwright.chromium.launch(channel=channel)
+                    if channel
+                    else playwright.chromium.launch()
+                )
+                break
+            except Exception:
+                continue
+        if browser is None:
+            pytest.skip("no Chromium browser is installed")
+        try:
+            for relative in ("status/index.html", "observatory/index.html"):
+                page = browser.new_page(viewport={"width": 1280, "height": 900})
+                page.add_init_script(
+                    "Storage.prototype.getItem = function () { throw new Error('blocked'); };"
+                    "Storage.prototype.setItem = function () { throw new Error('blocked'); };"
+                )
+                page.goto((release / relative).resolve().as_uri())
+                page.wait_for_timeout(100)
+                root = page.locator("html")
+                toggle = page.locator("#theme-toggle")
+                assert root.get_attribute("data-theme-storage") == "unavailable"
+                assert toggle.is_visible()
+                toggle.click()
+                assert toggle.get_attribute("data-theme-value") == "light"
+                assert root.get_attribute("data-theme") == "light"
+                page.close()
         finally:
             browser.close()
 
