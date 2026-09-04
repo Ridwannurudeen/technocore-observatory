@@ -707,16 +707,48 @@ def test_rebuild_stops_before_building_when_the_ledger_lock_is_unavailable(
     assert not marker.exists()
 
 
-def test_guards_validate_the_static_release_before_rendering_it():
-    source = read(ROOT / "guards.py")
+def test_guards_validate_the_static_release_before_rendering_it(tmp_path, monkeypatch):
+    html = tmp_path / "index.html"
+    html.write_text("<!doctype html>", encoding="utf-8")
+    events = []
 
-    ledger = source.index('("tick ledger hash chain"')
-    payload = source.index('("payload contract"')
-    static = source.index('("static release"')
-    zero_width = source.index('("zero-width render"')
-    no_js = source.index('("no-JS honesty"')
+    def fake_build_page(_html, _derive, _ticks, into):
+        (into / "data.json").write_text('{"points":[]}', encoding="utf-8")
+        return into / "index.html"
 
-    assert ledger < payload < static < zero_width < no_js
+    def record(name):
+        def guard(*_args):
+            events.append(name)
+            return []
+
+        return guard
+
+    monkeypatch.setattr(guards, "build_page", fake_build_page)
+    monkeypatch.setattr(guards, "guard_ledger_chain", lambda _ticks: [])
+    monkeypatch.setattr(
+        guards, "guard_payload_contract", lambda _html, _derive, _ticks: []
+    )
+    monkeypatch.setattr(guards, "guard_static_release", record("static release"))
+    monkeypatch.setattr(guards, "guard_zero_width_render", record("zero-width render"))
+    monkeypatch.setattr(guards, "guard_no_js_state", record("no-JS honesty"))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "guards.py",
+            "--html",
+            str(html),
+            "--derive",
+            str(tmp_path / "derive.py"),
+            "--ticks",
+            str(tmp_path / "ticks.jsonl"),
+            "--site-root",
+            str(tmp_path / "site"),
+        ],
+    )
+
+    assert guards.main() == 0
+    assert events == ["static release", "zero-width render", "no-JS honesty"]
 
 
 def release_maintenance_source():
