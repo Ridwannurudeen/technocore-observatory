@@ -495,6 +495,21 @@ must be updated in the same deploy; earlier payloads keep the old meaning. The q
 methodology the snapshots beside it no longer use. Deploy the tree, restart the query unit, then
 rebuild.
 
+### Rebuild memory ceiling
+
+`derive.py` peak RSS scales with the tick ledger. Measured on 2026-09-04 against a 155 MB
+`ticks.jsonl`: **719 MB peak, 13.9 s wall clock** when it is given enough memory. Under the
+original `MemoryMax=512M` the same work swapped instead, and every rebuild from roughly 03:20Z that
+day failed with `result 'timeout'` against `TimeoutStartSec=5min` — the publication root silently
+stopped advancing for nine hours while the collector kept accepting ticks normally. The failure
+mode is a timeout, not an OOM kill, so nothing in the journal names memory as the cause.
+
+The unit now allows `MemoryMax=2G` and `TimeoutStartSec=15min`; a full rebuild takes about 70 s.
+The ceiling is not a reservation. **This will recur**: the ledger grows roughly 22 MB/day, so the
+ceiling buys time rather than fixing the shape of the problem — `derive.py` loads the ledger rather
+than streaming it. When a rebuild starts timing out again, check peak RSS against the ceiling
+before assuming the origin or the collector is at fault.
+
 ### Deploy order at 2.15.0
 
 No store migration: 2.15.0 adds no table, column, trigger or schema version, so unlike 2.14.0 its
