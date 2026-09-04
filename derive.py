@@ -8,9 +8,13 @@ import html
 import json
 import math
 import re
+import sqlite3
+import tempfile
+from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 CLASSES = (
     "unlisted",
@@ -1670,406 +1674,142 @@ def is_cadence_gap(gap: dict[str, Any], gap_seconds: float) -> bool:
     return gap["reason"] == "counter_decreased" and gap["seconds"] > gap_seconds
 
 
-def aggregate_rollup_bucket(
-    points: list[dict[str, Any]],
-    start: datetime,
-    end: datetime,
-    cadence_gaps: list[dict[str, Any]],
-    expected_tick_seconds: float,
-    window_start: datetime,
-    window_end: datetime,
-) -> dict[str, Any] | None:
-    if not points:
-        return None
+class JsonlTicks:
+    def __init__(self, lines: Iterable[str]) -> None:
+        self.lines = lines
+        self.rejected = 0
 
-    values = {
-        field: [point[field] for point in points if point[field] is not None]
-        for field in ROLLUP_VALUE_FIELDS
-    }
-    ratios: dict[str, dict[str, Any]] = {}
-    observed_seconds = 0.0
-    for point in points:
-        interval = point["rates"]["public_rooms_per_second"]
-        if interval["samples"] and interval["seconds"] is not None:
-            observed_seconds += interval["seconds"]
-
-    for field in ROLLUP_RATE_FIELDS:
-        numerator = 0.0
-        denominator = 0.0
-        observations = 0
-        for point in points:
-            rate_value = point["rates"][field]
-            if (
-                rate_value["samples"]
-                and rate_value["value"] is not None
-                and rate_value["seconds"] is not None
-            ):
-                numerator += rate_value["value"] * rate_value["seconds"]
-                denominator += rate_value["seconds"]
-                observations += 1
-        ratios[field] = {
-            "numerator": numerator,
-            "denominator": denominator,
-            "value": numerator / denominator if denominator else None,
-            "observation_count": observations,
-        }
-
-    # A boundary bucket only holds the span its own retention level covers, and
-    # nothing exists before collection started, so expected counts that span and
-    # never the ticks published by the neighbouring level.
-    covered_start = max(start, window_start)
-    covered_seconds = max(
-        0.0,
-        (min(end, window_end) - covered_start).total_seconds(),
-    )
-    # A level's lower cutoff is inclusive. Its opening bucket therefore counts
-    # a cadence observation at that boundary, including the fractional interval
-    # left before the bucket ends. The upper cutoff is exclusive and belongs to
-    # the next level, so every later boundary bucket keeps the whole-interval
-    # count.
-    expected_from_span = (
-        math.ceil(covered_seconds / expected_tick_seconds)
-        if start <= window_start < end
-        else int(covered_seconds // expected_tick_seconds)
-    )
-    expected = max(
-        len(points),
-        expected_from_span,
-    )
-    missing = max(0, expected - len(points))
-    # Only a collector cadence gap breaks the line. An incomplete event window
-    # is published in composition.complete, and a counter decrease inside the
-    # polling threshold already suppresses that interval's rates.
-    has_gap = any(
-        parse_ts(gap["from"]) < end and parse_ts(gap["to"]) > start
-        for gap in cadence_gaps
-    )
-    return {
-        "start": utc_text(start),
-        "end": utc_text(end),
-        "first": rollup_snapshot(points[0]),
-        "last": rollup_snapshot(points[-1]),
-        "min": {
-            field: min(field_values) if field_values else None
-            for field, field_values in values.items()
-        },
-        "max": {
-            field: max(field_values) if field_values else None
-            for field, field_values in values.items()
-        },
-        "ratios": ratios,
-        "observation_count": len(points),
-        "expected_tick_count": expected,
-        "missing_count": missing,
-        "observed_seconds": observed_seconds,
-        "complete": missing == 0 and not has_gap,
-        "has_gap": has_gap,
-    }
-
-
-def rollup_level(
-    points: list[dict[str, Any]],
-    cadence_gaps: list[dict[str, Any]],
-    resolution_seconds: int,
-    resolution_label: str,
-    expected_tick_seconds: float,
-    window_start: datetime,
-    window_end: datetime,
-) -> dict[str, Any] | None:
-    if not points:
-        return None
-
-    first_time = parse_ts(points[0]["ts"])
-    last_time = parse_ts(points[-1]["ts"])
-    start = aligned_floor(first_time, resolution_seconds)
-    end = aligned_end(last_time, resolution_seconds)
-    buckets: list[dict[str, Any] | None] = []
-    point_index = 0
-    bucket_start = start
-    while bucket_start < end:
-        bucket_end = bucket_start + timedelta(seconds=resolution_seconds)
-        bucket_points: list[dict[str, Any]] = []
-        while point_index < len(points):
-            point_time = parse_ts(points[point_index]["ts"])
-            if point_time >= bucket_end:
-                break
-            if point_time >= bucket_start:
-                bucket_points.append(points[point_index])
-            point_index += 1
-        buckets.append(
-            aggregate_rollup_bucket(
-                bucket_points,
-                bucket_start,
-                bucket_end,
-                cadence_gaps,
-                expected_tick_seconds,
-                window_start,
-                window_end,
-            )
-        )
-        bucket_start = bucket_end
-
-    return {
-        "resolution_seconds": resolution_seconds,
-        "resolution_label": resolution_label,
-        "start": utc_text(start),
-        "end": utc_text(end),
-        "buckets": buckets,
-    }
-
-
-def expected_tick_interval(
-    points: list[dict[str, Any]],
-    gap_seconds: float,
-) -> float:
-    intervals = [
-        (parse_ts(right["ts"]) - parse_ts(left["ts"])).total_seconds()
-        for left, right in zip(points, points[1:])
-    ]
-    usable = sorted(interval for interval in intervals if 0 < interval <= gap_seconds)
-    if not usable:
-        return gap_seconds
-    middle = len(usable) // 2
-    if len(usable) % 2:
-        return usable[middle]
-    return (usable[middle - 1] + usable[middle]) / 2
-
-
-def reduce_payload_history(
-    points: list[dict[str, Any]],
-    gaps: list[dict[str, Any]],
-    newest: datetime,
-    gap_seconds: float,
-) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
-    raw_cutoff = newest - timedelta(seconds=RAW_RETENTION_SECONDS)
-    hourly_cutoff = newest - timedelta(seconds=HOURLY_RETENTION_SECONDS)
-    daily_cutoff = newest - timedelta(seconds=DAILY_RETENTION_SECONDS)
-
-    raw_points = [point for point in points if parse_ts(point["ts"]) >= raw_cutoff]
-    hourly_points = [
-        point for point in points if hourly_cutoff <= parse_ts(point["ts"]) < raw_cutoff
-    ]
-    daily_points = [
-        point
-        for point in points
-        if daily_cutoff <= parse_ts(point["ts"]) < hourly_cutoff
-    ]
-    archive_points = [point for point in points if parse_ts(point["ts"]) < daily_cutoff]
-
-    tick_seconds = expected_tick_interval(points, gap_seconds)
-    collection_start = parse_ts(points[0]["ts"])
-    cadence_gaps = [gap for gap in gaps if is_cadence_gap(gap, gap_seconds)]
-    levels: list[dict[str, Any]] = []
-    if archive_points:
-        archive_start = aligned_floor(
-            parse_ts(archive_points[0]["ts"]),
-            DAILY_ROLLUP_SECONDS,
-        )
-        archive_end = aligned_end(
-            parse_ts(archive_points[-1]["ts"]),
-            DAILY_ROLLUP_SECONDS,
-        )
-        archive_bucket = aggregate_rollup_bucket(
-            archive_points,
-            archive_start,
-            archive_end,
-            cadence_gaps,
-            tick_seconds,
-            collection_start,
-            daily_cutoff,
-        )
-        levels.append(
-            {
-                "resolution_seconds": None,
-                "resolution_label": "lifetime archive rollup",
-                "start": utc_text(archive_start),
-                "end": utc_text(archive_end),
-                "buckets": [archive_bucket],
-            }
-        )
-
-    for level in (
-        rollup_level(
-            daily_points,
-            cadence_gaps,
-            DAILY_ROLLUP_SECONDS,
-            "1-day rollup",
-            tick_seconds,
-            max(daily_cutoff, collection_start),
-            hourly_cutoff,
-        ),
-        rollup_level(
-            hourly_points,
-            cadence_gaps,
-            HOURLY_ROLLUP_SECONDS,
-            "1-hour rollup",
-            tick_seconds,
-            max(hourly_cutoff, collection_start),
-            raw_cutoff,
-        ),
-    ):
-        if level is not None:
-            levels.append(level)
-
-    # Every recorded gap is still published; cadence_gap says which of them the
-    # chart may break on, so the page cannot re-derive the rule and disagree.
-    recent_gaps = [
-        {**gap, "cadence_gap": is_cadence_gap(gap, gap_seconds)}
-        for gap in gaps
-        if parse_ts(gap["to"]) >= raw_cutoff
-    ]
-    history = {
-        "raw_retention_seconds": RAW_RETENTION_SECONDS,
-        "raw_started_at": raw_points[0]["ts"] if raw_points else None,
-        "raw_resolution_label": "collector-tick raw · 24-hour retention",
-        "chart_resolution_label": (
-            "Chart: lifetime / 1-day / 1-hour rollups; scrubber: collector-tick raw (24 hours)"
-        ),
-        "expected_tick_seconds": tick_seconds,
-        "rollup_levels": levels,
-    }
-    return raw_points, history, recent_gaps
-
-
-def ledger_chain_summary(ticks: list[dict[str, Any]]) -> dict[str, Any]:
-    genesis_index = next(
-        (
-            index
-            for index, tick in enumerate(ticks)
-            if tick["ledger_chain"] is not None
-            and tick["ledger_chain"]["previous_sha256"] is None
-        ),
-        None,
-    )
-    if genesis_index is None:
-        return {
-            "version": 1,
-            "algorithm": "sha256",
-            "genesis_ts": None,
-            "unchained_prefix_ticks": len(ticks),
-            "chained_ticks": 0,
-            "tip_tick_sha256": None,
-            "externally_anchored": False,
-            "display": (
-                f"Hash chain not started · {format_int(len(ticks))} ticks remain "
-                "unchained and rest on operator trust"
-            ),
-            "anchor_display": LEDGER_ANCHOR_NOT_RECORDED,
-        }
-
-    chained = [
-        tick["ledger_chain"]
-        for tick in ticks[genesis_index:]
-        if tick["ledger_chain"] is not None
-    ]
-    return {
-        "version": 1,
-        "algorithm": "sha256",
-        "genesis_ts": ticks[genesis_index]["ts"],
-        "unchained_prefix_ticks": genesis_index,
-        "chained_ticks": len(chained),
-        "tip_tick_sha256": chained[-1]["tick_sha256"],
-        "externally_anchored": False,
-        "display": (
-            f"SHA-256 chain from {ticks[genesis_index]['ts']} · "
-            f"{format_int(len(chained))} chained ticks · "
-            f"{format_int(genesis_index)} pre-genesis ticks remain unchained · "
-            "internal consistency only; no proof of collection time without "
-            "an external anchor"
-        ),
-        "anchor_display": LEDGER_ANCHOR_NOT_RECORDED,
-    }
+    def __iter__(self):
+        previous_time: datetime | None = None
+        for line in self.lines:
+            if not line.strip():
+                continue
+            try:
+                tick = validate_tick(json.loads(line))
+                if previous_time is not None and tick["_datetime"] <= previous_time:
+                    raise ValueError("tick timestamps are not strictly increasing")
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                self.rejected += 1
+                continue
+            previous_time = tick["_datetime"]
+            yield tick
 
 
 def read_jsonl(lines: Iterable[str]) -> tuple[list[dict[str, Any]], int]:
-    ticks: list[dict[str, Any]] = []
-    rejected = 0
-    previous_time: datetime | None = None
+    source = JsonlTicks(lines)
+    ticks = list(source)
 
-    for line in lines:
-        if not line.strip():
-            continue
+    return ticks, source.rejected
+
+
+class DerivationState:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.connection.executescript(
+            """
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
+            PRAGMA temp_store = FILE;
+            PRAGMA cache_size = -2048;
+            CREATE TABLE intervals (
+                id INTEGER PRIMARY KEY,
+                seconds REAL NOT NULL
+            );
+            CREATE INDEX intervals_by_seconds ON intervals(seconds);
+            CREATE TABLE sampled_rooms (
+                frame_slot INTEGER NOT NULL,
+                room_id TEXT NOT NULL,
+                PRIMARY KEY (frame_slot, room_id)
+            ) WITHOUT ROWID;
+            """
+        )
+        self.frame_slots: dict[tuple[Any, ...], int] = {}
+        self.walk_targets: set[str] = set()
+        self.coverage_by_frame: dict[tuple[Any, ...], dict[str, int]] = {}
+        self.census_runs_by_walk: dict[str, dict[str, Any]] = {}
+        self.interval_count = 0
+
+    def scan(
+        self,
+        records: Iterable[dict[str, Any]],
+        gap_seconds: float,
+    ) -> datetime | None:
+        recent_keys: deque[tuple[datetime, tuple[Any, ...] | None, str | None]] = (
+            deque()
+        )
+        previous_time: datetime | None = None
+        newest: datetime | None = None
+        for tick in records:
+            tick_time = tick["_datetime"]
+            if previous_time is not None:
+                elapsed = (tick_time - previous_time).total_seconds()
+                if elapsed <= gap_seconds:
+                    self.connection.execute(
+                        "INSERT INTO intervals(seconds) VALUES (?)",
+                        (elapsed,),
+                    )
+                    self.interval_count += 1
+
+            cutoff = tick_time - timedelta(seconds=RAW_RETENTION_SECONDS)
+            while recent_keys and recent_keys[0][0] < cutoff:
+                recent_keys.popleft()
+
+            manifest = tick["room_sampling"]
+            frame_key = (
+                (
+                    manifest["selector_version"],
+                    manifest["seed"],
+                    manifest["epoch"],
+                    manifest["frame_id"],
+                    manifest["frame_size"],
+                )
+                if manifest is not None
+                else None
+            )
+            run = tick["identity_census_run"]
+            walk_started_at = run["walk_started_at"] if run is not None else None
+            if frame_key is not None or walk_started_at is not None:
+                recent_keys.append((tick_time, frame_key, walk_started_at))
+
+            previous_time = tick_time
+            newest = tick_time
+
+        for _, frame_key, walk_started_at in recent_keys:
+            if frame_key is not None and frame_key not in self.frame_slots:
+                self.frame_slots[frame_key] = len(self.frame_slots)
+            if walk_started_at is not None:
+                self.walk_targets.add(walk_started_at)
+        self.connection.commit()
+        return newest
+
+    def expected_tick_seconds(self, default: float) -> float:
+        if not self.interval_count:
+            return default
+        middle = (self.interval_count - 1) // 2
+        limit = 1 if self.interval_count % 2 else 2
+        values = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT seconds FROM intervals ORDER BY seconds LIMIT ? OFFSET ?",
+                (limit, middle),
+            )
+        ]
+        return values[0] if limit == 1 else (values[0] + values[1]) / 2
+
+
+@contextmanager
+def temporary_derivation_state() -> Iterator[DerivationState]:
+    with tempfile.TemporaryDirectory(prefix="technocore-derive-") as directory:
+        connection = sqlite3.connect(Path(directory) / "state.sqlite3")
         try:
-            tick = validate_tick(json.loads(line))
-            if previous_time is not None and tick["_datetime"] <= previous_time:
-                raise ValueError("tick timestamps are not strictly increasing")
-        except (json.JSONDecodeError, ValueError, RecursionError):
-            rejected += 1
-            continue
-        ticks.append(tick)
-        previous_time = tick["_datetime"]
-
-    return ticks, rejected
-
-
-def trailing_segment(
-    ticks: list[dict[str, Any]],
-    index: int,
-    cap_field: str,
-    gap_seconds: float,
-) -> list[dict[str, Any]]:
-    current = ticks[index]
-    segment = [current]
-    for candidate_index in range(index - 1, -1, -1):
-        candidate = ticks[candidate_index]
-        later = ticks[candidate_index + 1]
-        elapsed = (later["_datetime"] - candidate["_datetime"]).total_seconds()
-        window = (current["_datetime"] - candidate["_datetime"]).total_seconds()
-        if (
-            elapsed > gap_seconds
-            or window > TRAILING_WINDOW_SECONDS
-            or candidate[cap_field] != current[cap_field]
-        ):
-            break
-        segment.append(candidate)
-    segment.reverse()
-    return segment
-
-
-def measured_capacity(
-    ticks: list[dict[str, Any]],
-    index: int,
-    total_field: str,
-    cap_field: str,
-    gap_seconds: float,
-) -> dict[str, Any]:
-    tick = ticks[index]
-    total = tick[total_field]
-    cap = tick[cap_field]
-    headroom = max(0, cap - total)
-    result: dict[str, Any] = {
-        "total": total,
-        "cap": cap,
-        "headroom": headroom,
-        "headroom_fraction": headroom / cap,
-        "fill_fraction": min(1.0, total / cap),
-        "trailing_rate": None,
-        "trailing_window": {"seconds": None, "samples": 0},
-        "cap_change": None,
-    }
-
-    if index:
-        previous = ticks[index - 1]
-        if previous[cap_field] != cap:
-            result["cap_change"] = {
-                "ts": tick["ts"],
-                "previous": previous[cap_field],
-                "new": cap,
-            }
-
-    segment = trailing_segment(ticks, index, cap_field, gap_seconds)
-    if len(segment) >= 2:
-        elapsed = (segment[-1]["_datetime"] - segment[0]["_datetime"]).total_seconds()
-        result["trailing_rate"] = (
-            segment[-1][total_field] - segment[0][total_field]
-        ) / elapsed
-        result["trailing_window"] = {"seconds": elapsed, "samples": len(segment)}
-    return result
+            yield DerivationState(connection)
+        finally:
+            connection.close()
 
 
 def derived_room_sampling(
     manifest: dict[str, Any] | None,
-    coverage_by_frame: dict[tuple[Any, ...], dict[str, Any]],
+    state: DerivationState,
 ) -> dict[str, Any] | None:
     if manifest is None:
         return None
@@ -2081,22 +1821,30 @@ def derived_room_sampling(
         manifest["frame_id"],
         manifest["frame_size"],
     )
-    state = coverage_by_frame.setdefault(
+    frame_slot = state.frame_slots.get(key)
+    if frame_slot is None:
+        return None
+    aggregate = state.coverage_by_frame.setdefault(
         key,
-        {"ids": set(), "attempts": 0, "failures": 0},
+        {"unique": 0, "attempts": 0, "failures": 0},
     )
     sampled = manifest["sampled"]
     failed_this_tick = sum(not entry["success"] for entry in sampled)
-    state["attempts"] += len(sampled)
-    state["failures"] += failed_this_tick
-    state["ids"].update(entry["id"] for entry in sampled)
+    aggregate["attempts"] += len(sampled)
+    aggregate["failures"] += failed_this_tick
+    changes = state.connection.total_changes
+    state.connection.executemany(
+        "INSERT OR IGNORE INTO sampled_rooms(frame_slot, room_id) VALUES (?, ?)",
+        ((frame_slot, entry["id"]) for entry in sampled),
+    )
+    aggregate["unique"] += state.connection.total_changes - changes
 
     return {
         **manifest,
         "sampled_rooms": len(sampled),
-        "cumulative_unique_rooms": len(state["ids"]),
-        "repeat_count": state["attempts"] - len(state["ids"]),
-        "failed_reads": state["failures"],
+        "cumulative_unique_rooms": aggregate["unique"],
+        "repeat_count": aggregate["attempts"] - aggregate["unique"],
+        "failed_reads": aggregate["failures"],
         "failed_reads_this_tick": failed_this_tick,
     }
 
@@ -2801,12 +2549,12 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
 
 def derived_identity_census_run(
     run: dict[str, Any] | None,
-    runs_by_walk: dict[str, dict[str, Any]],
+    state: DerivationState,
 ) -> dict[str, Any] | None:
-    if run is None:
+    if run is None or run["walk_started_at"] not in state.walk_targets:
         return None
 
-    aggregate = runs_by_walk.setdefault(
+    aggregate = state.census_runs_by_walk.setdefault(
         run["walk_started_at"],
         {
             "invocations": 0,
@@ -3551,91 +3299,345 @@ def composition_display(raw_points: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def derive_records(
+class RollupAccumulator:
+    def __init__(self, point: dict[str, Any], resolution_seconds: int) -> None:
+        point_time = parse_ts(point["ts"])
+        self.start = aligned_floor(point_time, resolution_seconds)
+        self.end = aligned_end(point_time, resolution_seconds)
+        self.first = rollup_snapshot(point)
+        self.last = self.first
+        self.minimum = dict.fromkeys(ROLLUP_VALUE_FIELDS)
+        self.maximum = dict.fromkeys(ROLLUP_VALUE_FIELDS)
+        self.ratios = {
+            field: {"numerator": 0.0, "denominator": 0.0, "observation_count": 0}
+            for field in ROLLUP_RATE_FIELDS
+        }
+        self.observation_count = 0
+        self.observed_seconds = 0.0
+        self.has_gap = False
+        self.add(point, resolution_seconds)
+
+    def add(self, point: dict[str, Any], resolution_seconds: int) -> None:
+        point_time = parse_ts(point["ts"])
+        self.end = aligned_end(point_time, resolution_seconds)
+        self.last = rollup_snapshot(point)
+        for field in ROLLUP_VALUE_FIELDS:
+            value = point[field]
+            if value is None:
+                continue
+            current_minimum = self.minimum[field]
+            current_maximum = self.maximum[field]
+            self.minimum[field] = (
+                value if current_minimum is None else min(current_minimum, value)
+            )
+            self.maximum[field] = (
+                value if current_maximum is None else max(current_maximum, value)
+            )
+
+        public_room_rate = point["rates"]["public_rooms_per_second"]
+        if public_room_rate["samples"] and public_room_rate["seconds"] is not None:
+            self.observed_seconds += public_room_rate["seconds"]
+
+        for field in ROLLUP_RATE_FIELDS:
+            rate_value = point["rates"][field]
+            if (
+                rate_value["samples"]
+                and rate_value["value"] is not None
+                and rate_value["seconds"] is not None
+            ):
+                ratio = self.ratios[field]
+                ratio["numerator"] += rate_value["value"] * rate_value["seconds"]
+                ratio["denominator"] += rate_value["seconds"]
+                ratio["observation_count"] += 1
+        self.observation_count += 1
+
+    def mark_gap(self, start: datetime, end: datetime) -> None:
+        if start < self.end and end > self.start:
+            self.has_gap = True
+
+    def payload(
+        self,
+        expected_tick_seconds: float,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> dict[str, Any]:
+        covered_start = max(self.start, window_start)
+        covered_seconds = max(
+            0.0,
+            (min(self.end, window_end) - covered_start).total_seconds(),
+        )
+        expected_from_span = (
+            math.ceil(covered_seconds / expected_tick_seconds)
+            if self.start <= window_start < self.end
+            else int(covered_seconds // expected_tick_seconds)
+        )
+        expected = max(self.observation_count, expected_from_span)
+        missing = max(0, expected - self.observation_count)
+        return {
+            "start": utc_text(self.start),
+            "end": utc_text(self.end),
+            "first": self.first,
+            "last": self.last,
+            "min": self.minimum,
+            "max": self.maximum,
+            "ratios": {
+                field: {
+                    "numerator": ratio["numerator"],
+                    "denominator": ratio["denominator"],
+                    "value": (
+                        ratio["numerator"] / ratio["denominator"]
+                        if ratio["denominator"]
+                        else None
+                    ),
+                    "observation_count": ratio["observation_count"],
+                }
+                for field, ratio in self.ratios.items()
+            },
+            "observation_count": self.observation_count,
+            "expected_tick_count": expected,
+            "missing_count": missing,
+            "observed_seconds": self.observed_seconds,
+            "complete": missing == 0 and not self.has_gap,
+            "has_gap": self.has_gap,
+        }
+
+
+def streaming_capacity(
+    history: deque[dict[str, Any]],
+    tick: dict[str, Any],
+    previous: dict[str, Any] | None,
+    total_field: str,
+    cap_field: str,
+    gap_seconds: float,
+) -> dict[str, Any]:
+    total = tick[total_field]
+    cap = tick[cap_field]
+    headroom = max(0, cap - total)
+    result: dict[str, Any] = {
+        "total": total,
+        "cap": cap,
+        "headroom": headroom,
+        "headroom_fraction": headroom / cap,
+        "fill_fraction": min(1.0, total / cap),
+        "trailing_rate": None,
+        "trailing_window": {"seconds": None, "samples": 0},
+        "cap_change": None,
+    }
+    if previous is not None:
+        elapsed = (tick["_datetime"] - previous["_datetime"]).total_seconds()
+        if elapsed > gap_seconds or previous[cap_field] != cap:
+            history.clear()
+        if previous[cap_field] != cap:
+            result["cap_change"] = {
+                "ts": tick["ts"],
+                "previous": previous[cap_field],
+                "new": cap,
+            }
+    while (
+        history
+        and (tick["_datetime"] - history[0]["_datetime"]).total_seconds()
+        > TRAILING_WINDOW_SECONDS
+    ):
+        history.popleft()
+    history.append(
+        {
+            "_datetime": tick["_datetime"],
+            total_field: total,
+            cap_field: cap,
+        }
+    )
+    if len(history) >= 2:
+        elapsed = (history[-1]["_datetime"] - history[0]["_datetime"]).total_seconds()
+        result["trailing_rate"] = (
+            history[-1][total_field] - history[0][total_field]
+        ) / elapsed
+        result["trailing_window"] = {"seconds": elapsed, "samples": len(history)}
+    return result
+
+
+def build_streaming_level(
+    accumulators: dict[datetime, RollupAccumulator],
+    resolution_seconds: int,
+    resolution_label: str,
+    expected_tick_seconds: float,
+    window_start: datetime,
+    window_end: datetime,
+) -> dict[str, Any] | None:
+    if not accumulators:
+        return None
+    start = min(accumulators)
+    end = max(accumulators) + timedelta(seconds=resolution_seconds)
+    buckets = []
+    bucket_start = start
+    while bucket_start < end:
+        accumulator = accumulators.get(bucket_start)
+        buckets.append(
+            accumulator.payload(expected_tick_seconds, window_start, window_end)
+            if accumulator is not None
+            else None
+        )
+        bucket_start += timedelta(seconds=resolution_seconds)
+    return {
+        "resolution_seconds": resolution_seconds,
+        "resolution_label": resolution_label,
+        "start": utc_text(start),
+        "end": utc_text(end),
+        "buckets": buckets,
+    }
+
+
+def ledger_summary_from_state(
+    accepted_ticks: int,
+    genesis_index: int | None,
+    genesis_ts: str | None,
+    chained_ticks: int,
+    tip_tick_sha256: str | None,
+) -> dict[str, Any]:
+    if genesis_index is None:
+        return {
+            "version": 1,
+            "algorithm": "sha256",
+            "genesis_ts": None,
+            "unchained_prefix_ticks": accepted_ticks,
+            "chained_ticks": 0,
+            "tip_tick_sha256": None,
+            "externally_anchored": False,
+            "display": (
+                f"Hash chain not started · {format_int(accepted_ticks)} ticks remain "
+                "unchained and rest on operator trust"
+            ),
+            "anchor_display": LEDGER_ANCHOR_NOT_RECORDED,
+        }
+    return {
+        "version": 1,
+        "algorithm": "sha256",
+        "genesis_ts": genesis_ts,
+        "unchained_prefix_ticks": genesis_index,
+        "chained_ticks": chained_ticks,
+        "tip_tick_sha256": tip_tick_sha256,
+        "externally_anchored": False,
+        "display": (
+            f"SHA-256 chain from {genesis_ts} · "
+            f"{format_int(chained_ticks)} chained ticks · "
+            f"{format_int(genesis_index)} pre-genesis ticks remain unchained · "
+            "internal consistency only; no proof of collection time without "
+            "an external anchor"
+        ),
+        "anchor_display": LEDGER_ANCHOR_NOT_RECORDED,
+    }
+
+
+def empty_derivation(computed_at: str, rejected_ticks: int) -> dict[str, Any]:
+    return {
+        "schema": 6,
+        "collector_version": None,
+        "methodology_version": METHODOLOGY_VERSION,
+        "computed_at": computed_at,
+        "collection_started": None,
+        "collection_ended": None,
+        "collection_age_seconds": None,
+        "collection_stalled": False,
+        "collection_stall_threshold_seconds": STALL_THRESHOLD_SECONDS,
+        "collection_stall_banner": "",
+        "collection_phase": "Collecting since",
+        "status_display": {
+            "state_text": "COLLECTION NOT STARTED",
+            "age_text": "no observation recorded",
+            "schema_text": "schema 6",
+            "raw_window_text": "collector-tick raw · 24-hour retention",
+        },
+        "points": [],
+        "gaps": [],
+        "gap_count": 0,
+        "composition_display": composition_display([]),
+        "history": {
+            "raw_retention_seconds": RAW_RETENTION_SECONDS,
+            "raw_started_at": None,
+            "raw_resolution_label": "collector-tick raw · 24-hour retention",
+            "chart_resolution_label": (
+                "Chart: lifetime / 1-day / 1-hour rollups; "
+                "scrubber: collector-tick raw (24 hours)"
+            ),
+            "expected_tick_seconds": None,
+            "rollup_levels": [],
+        },
+        "ledger_chain": ledger_summary_from_state(0, None, None, 0, None),
+        "accepted_ticks": 0,
+        "rejected_ticks": rejected_ticks,
+        "methodology": methodology_definitions(),
+    }
+
+
+def derive_streaming_records(
     records: Iterable[dict[str, Any]],
+    newest: datetime | None,
+    state: DerivationState,
     rejected_ticks: int = 0,
     gap_seconds: float = 300.0,
-) -> dict[str, Any]:
+    gap_history_limit: int = 100,
+    computed_at: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if gap_seconds <= 0:
         raise ValueError("gap_seconds must be positive")
 
-    computed_at = utc_now()
-    ticks: list[dict[str, Any]] = []
-    previous_time: datetime | None = None
-    for record in records:
-        try:
-            tick = record if "_datetime" in record else validate_tick(record)
-            if previous_time is not None and tick["_datetime"] <= previous_time:
-                raise ValueError("tick timestamps are not strictly increasing")
-        except ValueError:
-            rejected_ticks += 1
-            continue
-        ticks.append(tick)
-        previous_time = tick["_datetime"]
-
+    computed_at = computed_at or utc_now()
     methodology = methodology_definitions()
-    if not ticks:
-        return {
-            "schema": 6,
-            "collector_version": None,
-            "methodology_version": METHODOLOGY_VERSION,
-            "computed_at": computed_at,
-            "collection_started": None,
-            "collection_ended": None,
-            "collection_age_seconds": None,
-            "collection_stalled": False,
-            "collection_stall_threshold_seconds": STALL_THRESHOLD_SECONDS,
-            "collection_stall_banner": "",
-            "collection_phase": "Collecting since",
-            "status_display": {
-                "state_text": "COLLECTION NOT STARTED",
-                "age_text": "no observation recorded",
-                "schema_text": "schema 6",
-                "raw_window_text": "collector-tick raw · 24-hour retention",
-            },
-            "points": [],
-            "gaps": [],
-            "gap_count": 0,
-            "composition_display": composition_display([]),
-            "history": {
-                "raw_retention_seconds": RAW_RETENTION_SECONDS,
-                "raw_started_at": None,
-                "raw_resolution_label": "collector-tick raw · 24-hour retention",
-                "chart_resolution_label": (
-                    "Chart: lifetime / 1-day / 1-hour rollups; "
-                    "scrubber: collector-tick raw (24 hours)"
-                ),
-                "expected_tick_seconds": None,
-                "rollup_levels": [],
-            },
-            "ledger_chain": ledger_chain_summary([]),
-            "accepted_ticks": 0,
-            "rejected_ticks": rejected_ticks,
-            "methodology": methodology,
-        }
-
-    for tick in reversed(ticks):
-        funnel = tick["signer_funnel"]
-        disclosure = funnel["tracking_disclosure"] if funnel is not None else None
-        if disclosure is not None:
-            methodology["signer_funnel"] += f" {disclosure['methodology']}"
-            break
-
-    points: list[dict[str, Any]] = []
-    gaps: list[dict[str, Any]] = []
-    first_event_seq = ticks[0]["events_last_seq"]
-    previous_identity: dict[str, Any] | None = None
-    coverage_by_frame: dict[tuple[Any, ...], dict[str, Any]] = {}
-    census_runs_by_walk: dict[str, dict[str, Any]] = {}
-    # The newest completed census known at each point, from measured
-    # identity_total ticks and from funnel-recorded census results alike.
+    raw_points: list[dict[str, Any]] = []
+    daily_accumulators: dict[datetime, RollupAccumulator] = {}
+    hourly_accumulators: dict[datetime, RollupAccumulator] = {}
+    archive_accumulator: RollupAccumulator | None = None
+    recent_gaps: list[dict[str, Any]] = []
+    collector_gaps: deque[dict[str, Any]] = deque(maxlen=gap_history_limit)
     latest_census: tuple[int, str | None, str] | None = None
-    # The most recent computed interval rate per headline tile, carried
-    # forward with its sample count, window and measurement time so a
-    # gap-suppressed interval still shows an honestly stamped value.
     carried_rates: dict[str, dict[str, Any]] = {}
+    capacity_histories = {"notes": deque(), "rooms": deque()}
+    previous_tick: dict[str, Any] | None = None
+    previous_identity: dict[str, Any] | None = None
+    first_event_seq: int | None = None
+    baseline: dict[str, Any] | None = None
+    collection_started: str | None = None
+    collection_ended: str | None = None
+    collector_version: str | None = None
+    latest_disclosure: dict[str, str] | None = None
+    accepted_ticks = 0
+    gap_count = 0
+    collector_gap_count = 0
+    genesis_index: int | None = None
+    genesis_ts: str | None = None
+    chained_ticks = 0
+    tip_tick_sha256: str | None = None
 
-    for index, tick in enumerate(ticks):
+    if newest is not None:
+        raw_cutoff = newest - timedelta(seconds=RAW_RETENTION_SECONDS)
+        hourly_cutoff = newest - timedelta(seconds=HOURLY_RETENTION_SECONDS)
+        daily_cutoff = newest - timedelta(seconds=DAILY_RETENTION_SECONDS)
+    else:
+        raw_cutoff = hourly_cutoff = daily_cutoff = None
+
+    for tick in records:
+        tick_time = tick["_datetime"]
+        if first_event_seq is None:
+            first_event_seq = tick["events_last_seq"]
+            collection_started = tick["ts"]
+
+        raw_funnel = tick["signer_funnel"]
+        if raw_funnel is not None:
+            disclosure = raw_funnel["tracking_disclosure"]
+            if disclosure is not None:
+                latest_disclosure = disclosure
+
+        chain = tick["ledger_chain"]
+        if (
+            genesis_index is None
+            and chain is not None
+            and chain["previous_sha256"] is None
+        ):
+            genesis_index = accepted_ticks
+            genesis_ts = tick["ts"]
+        if genesis_index is not None and chain is not None:
+            chained_ticks += 1
+            tip_tick_sha256 = chain["tick_sha256"]
+
         census_candidates: list[tuple[int, str | None, str]] = []
         if tick["identity_total"] is not None:
             census_candidates.append(
@@ -3645,7 +3647,6 @@ def derive_records(
                     tick["ts"],
                 )
             )
-        raw_funnel = tick["signer_funnel"]
         if raw_funnel is not None and raw_funnel["well_formed_did_notes"] is not None:
             census_candidates.append(
                 (
@@ -3666,10 +3667,10 @@ def derive_records(
             ):
                 latest_census = candidate
 
-        room_sampling = derived_room_sampling(tick["room_sampling"], coverage_by_frame)
+        room_sampling = derived_room_sampling(tick["room_sampling"], state)
         census_run = derived_identity_census_run(
             tick.get("identity_census_run"),
-            census_runs_by_walk,
+            state,
         )
         point = {
             "ts": tick["ts"],
@@ -3699,15 +3700,25 @@ def derive_records(
                 "identities_per_second": empty_rate(),
             },
             "capacity": {
-                "notes": measured_capacity(
-                    ticks, index, "notes_total", "note_cap", gap_seconds
+                "notes": streaming_capacity(
+                    capacity_histories["notes"],
+                    tick,
+                    previous_tick,
+                    "notes_total",
+                    "note_cap",
+                    gap_seconds,
                 ),
-                "rooms": measured_capacity(
-                    ticks, index, "rooms_total", "room_cap", gap_seconds
+                "rooms": streaming_capacity(
+                    capacity_histories["rooms"],
+                    tick,
+                    previous_tick,
+                    "rooms_total",
+                    "room_cap",
+                    gap_seconds,
                 ),
             },
             "signer_funnel": display_funnel(
-                tick["signer_funnel"],
+                raw_funnel,
                 len(tick["newest_rooms"]),
                 tick["rooms_total"],
                 room_sampling,
@@ -3744,29 +3755,43 @@ def derive_records(
         }
 
         interval_reason: str | None = None
-        if index:
-            previous = ticks[index - 1]
-            elapsed = (tick["_datetime"] - previous["_datetime"]).total_seconds()
+        cadence_gap: dict[str, Any] | None = None
+        if previous_tick is not None:
+            elapsed = (tick_time - previous_tick["_datetime"]).total_seconds()
             is_gap = elapsed > gap_seconds
+            if is_gap:
+                collector_gap_count += 1
+                collector_gaps.append(
+                    {
+                        "from": previous_tick["ts"],
+                        "to": tick["ts"],
+                        "seconds": elapsed,
+                    }
+                )
             deltas = {
                 "public_rooms_per_second": tick["events_last_seq"]
-                - previous["events_last_seq"],
+                - previous_tick["events_last_seq"],
                 "lobby_messages_per_second": tick["lobby_last_seq"]
-                - previous["lobby_last_seq"],
-                "rooms_total_per_second": tick["rooms_total"] - previous["rooms_total"],
-                "notes_per_second": tick["notes_total"] - previous["notes_total"],
+                - previous_tick["lobby_last_seq"],
+                "rooms_total_per_second": tick["rooms_total"]
+                - previous_tick["rooms_total"],
+                "notes_per_second": tick["notes_total"] - previous_tick["notes_total"],
             }
             negative = [name for name, delta in deltas.items() if delta < 0]
             if is_gap or negative:
-                gaps.append(
-                    {
-                        "from": previous["ts"],
-                        "to": tick["ts"],
-                        "seconds": elapsed,
-                        "reason": "counter_decreased" if negative else "polling_gap",
-                        "metrics": negative,
-                    }
-                )
+                gap = {
+                    "from": previous_tick["ts"],
+                    "to": tick["ts"],
+                    "seconds": elapsed,
+                    "reason": "counter_decreased" if negative else "polling_gap",
+                    "metrics": negative,
+                }
+                cadence = is_cadence_gap(gap, gap_seconds)
+                if tick_time >= raw_cutoff:
+                    recent_gaps.append({**gap, "cadence_gap": cadence})
+                if cadence:
+                    cadence_gap = gap
+                    gap_count += 1
                 interval_reason = interval_reason_text(negative, elapsed)
             else:
                 for name, delta in deltas.items():
@@ -3775,9 +3800,11 @@ def derive_records(
             new_events = [
                 event
                 for event in tick["events_window"]
-                if event["seq"] > previous["events_last_seq"]
+                if event["seq"] > previous_tick["events_last_seq"]
             ]
-            expected = max(0, tick["events_last_seq"] - previous["events_last_seq"])
+            expected = max(
+                0, tick["events_last_seq"] - previous_tick["events_last_seq"]
+            )
             counts = dict.fromkeys(CLASSES, 0)
             for event in new_events:
                 counts[event["primary_class"]] += 1
@@ -3811,17 +3838,16 @@ def derive_records(
                 "definition": "Newest listed rooms matching captured new events with seq <= 1.",
             }
 
-            if expected > len(new_events):
-                gaps.append(
-                    {
-                        "from": previous["ts"],
-                        "to": tick["ts"],
-                        "seconds": elapsed,
-                        "reason": "events_window_incomplete",
-                        "expected": expected,
-                        "captured": len(new_events),
-                    }
-                )
+            if expected > len(new_events) and tick_time >= raw_cutoff:
+                gap = {
+                    "from": previous_tick["ts"],
+                    "to": tick["ts"],
+                    "seconds": elapsed,
+                    "reason": "events_window_incomplete",
+                    "expected": expected,
+                    "captured": len(new_events),
+                }
+                recent_gaps.append({**gap, "cadence_gap": False})
 
         point["rate_display"] = {}
         for metric in ("public_rooms_per_second", "lobby_messages_per_second"):
@@ -3842,8 +3868,6 @@ def derive_records(
             for name in ("notes", "rooms")
         }
         point["stillborn_display"] = stillborn_display(point["stillborn_signal"])
-        # The funnel merges the manifest with the listing and room totals, so
-        # its coverage is the fuller record where a funnel exists.
         point["sampling_display"] = sampling_display(
             point["signer_funnel"]["coverage"]
             if point["signer_funnel"] is not None
@@ -3853,7 +3877,7 @@ def derive_records(
         if tick["identity_total"] is not None:
             if previous_identity is not None:
                 identity_elapsed = (
-                    tick["_datetime"] - previous_identity["_datetime"]
+                    tick_time - previous_identity["_datetime"]
                 ).total_seconds()
                 identity_delta = (
                     tick["identity_total"] - previous_identity["identity_total"]
@@ -3862,47 +3886,151 @@ def derive_records(
                     point["rates"]["identities_per_second"] = rate(
                         identity_delta, identity_elapsed
                     )
-                elif identity_delta < 0:
-                    gaps.append(
-                        {
-                            "from": previous_identity["ts"],
-                            "to": tick["ts"],
-                            "seconds": identity_elapsed,
-                            "reason": "identity_counter_decreased",
-                            "metrics": ["identities_per_second"],
-                        }
+                elif identity_delta < 0 and tick_time >= raw_cutoff:
+                    gap = {
+                        "from": previous_identity["ts"],
+                        "to": tick["ts"],
+                        "seconds": identity_elapsed,
+                        "reason": "identity_counter_decreased",
+                        "metrics": ["identities_per_second"],
+                    }
+                    recent_gaps.append({**gap, "cadence_gap": False})
+            previous_identity = {
+                "ts": tick["ts"],
+                "_datetime": tick_time,
+                "identity_total": tick["identity_total"],
+            }
+
+        if baseline is None:
+            baseline = {
+                "lobby_last_seq": point["lobby_last_seq"],
+                "notes_total": point["notes_total"],
+            }
+        if tick_time >= raw_cutoff:
+            raw_points.append(point)
+        elif tick_time >= hourly_cutoff:
+            bucket_start = aligned_floor(tick_time, HOURLY_ROLLUP_SECONDS)
+            accumulator = hourly_accumulators.get(bucket_start)
+            if accumulator is None:
+                hourly_accumulators[bucket_start] = RollupAccumulator(
+                    point, HOURLY_ROLLUP_SECONDS
+                )
+            else:
+                accumulator.add(point, HOURLY_ROLLUP_SECONDS)
+        elif tick_time >= daily_cutoff:
+            bucket_start = aligned_floor(tick_time, DAILY_ROLLUP_SECONDS)
+            accumulator = daily_accumulators.get(bucket_start)
+            if accumulator is None:
+                daily_accumulators[bucket_start] = RollupAccumulator(
+                    point, DAILY_ROLLUP_SECONDS
+                )
+            else:
+                accumulator.add(point, DAILY_ROLLUP_SECONDS)
+        elif archive_accumulator is None:
+            archive_accumulator = RollupAccumulator(point, DAILY_ROLLUP_SECONDS)
+        else:
+            archive_accumulator.add(point, DAILY_ROLLUP_SECONDS)
+
+        if cadence_gap is not None:
+            gap_start = parse_ts(cadence_gap["from"])
+            gap_end = parse_ts(cadence_gap["to"])
+            if archive_accumulator is not None:
+                archive_accumulator.mark_gap(gap_start, gap_end)
+            for accumulator in daily_accumulators.values():
+                accumulator.mark_gap(gap_start, gap_end)
+            for accumulator in hourly_accumulators.values():
+                accumulator.mark_gap(gap_start, gap_end)
+
+        previous_tick = {
+            "ts": tick["ts"],
+            "_datetime": tick_time,
+            "events_last_seq": tick["events_last_seq"],
+            "lobby_last_seq": tick["lobby_last_seq"],
+            "rooms_total": tick["rooms_total"],
+            "room_cap": tick["room_cap"],
+            "notes_total": tick["notes_total"],
+            "note_cap": tick["note_cap"],
+        }
+        collection_ended = tick["ts"]
+        collector_version = tick["collector_version"]
+        accepted_ticks += 1
+
+    if not accepted_ticks:
+        return empty_derivation(computed_at, rejected_ticks), {
+            "records_total": 0,
+            "latest_ts": None,
+            "latest_datetime": None,
+            "collector_gaps": [],
+            "collector_gap_count": 0,
+        }
+
+    if latest_disclosure is not None:
+        methodology["signer_funnel"] += f" {latest_disclosure['methodology']}"
+
+    expected_tick_seconds = state.expected_tick_seconds(gap_seconds)
+
+    levels: list[dict[str, Any]] = []
+    if archive_accumulator is not None:
+        levels.append(
+            {
+                "resolution_seconds": None,
+                "resolution_label": "lifetime archive rollup",
+                "start": utc_text(archive_accumulator.start),
+                "end": utc_text(archive_accumulator.end),
+                "buckets": [
+                    archive_accumulator.payload(
+                        expected_tick_seconds,
+                        parse_ts(collection_started),
+                        daily_cutoff,
                     )
-            previous_identity = tick
+                ],
+            }
+        )
+    for level in (
+        build_streaming_level(
+            daily_accumulators,
+            DAILY_ROLLUP_SECONDS,
+            "1-day rollup",
+            expected_tick_seconds,
+            max(daily_cutoff, parse_ts(collection_started)),
+            hourly_cutoff,
+        ),
+        build_streaming_level(
+            hourly_accumulators,
+            HOURLY_ROLLUP_SECONDS,
+            "1-hour rollup",
+            expected_tick_seconds,
+            max(hourly_cutoff, parse_ts(collection_started)),
+            raw_cutoff,
+        ),
+    ):
+        if level is not None:
+            levels.append(level)
 
-        points.append(point)
-
-    raw_points, history, recent_gaps = reduce_payload_history(
-        points,
-        gaps,
-        ticks[-1]["_datetime"],
-        gap_seconds,
-    )
-
-    # Stall detection: the rebuild cron runs independently of the collector,
-    # so the age of the newest accepted tick at rebuild time is the collector
-    # liveness signal. Clamped at zero in case computed_at precedes the tick.
+    history = {
+        "raw_retention_seconds": RAW_RETENTION_SECONDS,
+        "raw_started_at": raw_points[0]["ts"] if raw_points else None,
+        "raw_resolution_label": "collector-tick raw · 24-hour retention",
+        "chart_resolution_label": (
+            "Chart: lifetime / 1-day / 1-hour rollups; "
+            "scrubber: collector-tick raw (24 hours)"
+        ),
+        "expected_tick_seconds": expected_tick_seconds,
+        "rollup_levels": levels,
+    }
     age_seconds = max(
-        0.0, (parse_ts(computed_at) - ticks[-1]["_datetime"]).total_seconds()
+        0.0, (parse_ts(computed_at) - parse_ts(collection_ended)).total_seconds()
     )
     stalled = age_seconds > STALL_THRESHOLD_SECONDS
+    attach_series_display(raw_points, baseline)
 
-    # The chart baseline is the oldest accepted observation, which is also the
-    # first record of the oldest rollup level, so the scripted view and these
-    # strings measure the same distance from the collection boundary.
-    attach_series_display(raw_points, points[0])
-
-    return {
+    data = {
         "schema": 6,
-        "collector_version": ticks[-1]["collector_version"],
+        "collector_version": collector_version,
         "methodology_version": METHODOLOGY_VERSION,
         "computed_at": computed_at,
-        "collection_started": ticks[0]["ts"],
-        "collection_ended": ticks[-1]["ts"],
+        "collection_started": collection_started,
+        "collection_ended": collection_ended,
         "collection_age_seconds": age_seconds,
         "collection_stalled": stalled,
         "collection_stall_threshold_seconds": STALL_THRESHOLD_SECONDS,
@@ -3920,24 +4048,99 @@ def derive_records(
         },
         "points": raw_points,
         "gaps": recent_gaps,
-        # "Recorded gaps" counts collector cadence gaps as intervals, not
-        # records: one interval can carry a polling gap and an incomplete
-        # event window, and a counter decrease inside the polling threshold is
-        # not a missed observation.
-        "gap_count": len(
-            {
-                (gap["from"], gap["to"])
-                for gap in gaps
-                if is_cadence_gap(gap, gap_seconds)
-            }
-        ),
+        "gap_count": gap_count,
         "history": history,
         "composition_display": composition_display(raw_points),
-        "ledger_chain": ledger_chain_summary(ticks),
-        "accepted_ticks": len(points),
+        "ledger_chain": ledger_summary_from_state(
+            accepted_ticks,
+            genesis_index,
+            genesis_ts,
+            chained_ticks,
+            tip_tick_sha256,
+        ),
+        "accepted_ticks": accepted_ticks,
         "rejected_ticks": rejected_ticks,
         "methodology": methodology,
     }
+    return data, {
+        "records_total": accepted_ticks,
+        "latest_ts": collection_ended,
+        "latest_datetime": parse_ts(collection_ended),
+        "collector_gaps": list(collector_gaps),
+        "collector_gap_count": collector_gap_count,
+    }
+
+
+def file_fingerprint(path: Path) -> tuple[int, int, int, int]:
+    state = path.stat()
+    return state.st_dev, state.st_ino, state.st_size, state.st_mtime_ns
+
+
+def derive_jsonl(
+    path: str | Path,
+    gap_seconds: float = 300.0,
+    gap_history_limit: int = 100,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if gap_seconds <= 0:
+        raise ValueError("gap_seconds must be positive")
+
+    source_path = Path(path)
+    fingerprint = file_fingerprint(source_path)
+    with temporary_derivation_state() as state:
+        with source_path.open(encoding="utf-8") as source:
+            newest = state.scan(JsonlTicks(source), gap_seconds)
+        if file_fingerprint(source_path) != fingerprint:
+            raise ValueError("tick ledger changed during derivation")
+
+        with source_path.open(encoding="utf-8") as source:
+            streamed = JsonlTicks(source)
+            data, tick_summary = derive_streaming_records(
+                streamed,
+                newest,
+                state,
+                gap_seconds=gap_seconds,
+                gap_history_limit=gap_history_limit,
+            )
+        if file_fingerprint(source_path) != fingerprint:
+            raise ValueError("tick ledger changed during derivation")
+    data["rejected_ticks"] = streamed.rejected
+    return data, tick_summary
+
+
+def derive_records(
+    records: Iterable[dict[str, Any]],
+    rejected_ticks: int = 0,
+    gap_seconds: float = 300.0,
+) -> dict[str, Any]:
+    if gap_seconds <= 0:
+        raise ValueError("gap_seconds must be positive")
+
+    computed_at = utc_now()
+    ticks: list[dict[str, Any]] = []
+    previous_time: datetime | None = None
+    for record in records:
+        try:
+            tick = record if "_datetime" in record else validate_tick(record)
+            if previous_time is not None and tick["_datetime"] <= previous_time:
+                raise ValueError("tick timestamps are not strictly increasing")
+        except ValueError:
+            rejected_ticks += 1
+            continue
+        ticks.append(tick)
+        previous_time = tick["_datetime"]
+
+    with temporary_derivation_state() as state:
+        newest = state.scan(ticks, gap_seconds)
+        data, _ = derive_streaming_records(
+            ticks,
+            newest,
+            state,
+            rejected_ticks,
+            gap_seconds,
+            gap_history_limit=0,
+            computed_at=computed_at,
+        )
+    return data
 
 
 def format_int(value: Any) -> str:
@@ -4471,9 +4674,7 @@ def main() -> int:
     parser.add_argument("--gap-seconds", type=float, default=300.0)
     args = parser.parse_args()
 
-    with args.input.open(encoding="utf-8") as source:
-        ticks, rejected = read_jsonl(source)
-    data = derive_records(ticks, rejected, args.gap_seconds)
+    data, _ = derive_jsonl(args.input, args.gap_seconds)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

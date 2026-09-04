@@ -5,11 +5,13 @@ import stat
 import struct
 import sys
 import types
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 import build_site
+import derive
 import guards
 import snapshots
 from api_contract import CONTRACT_VERSION, MAX_RESPONSE_BYTES
@@ -573,20 +575,44 @@ def test_methodology_page_publishes_revision_history_and_residual_limit(
     assert "Repository-backed methodology history begins at 1.3.0" in methodology
 
 
-def test_build_release_reads_the_tick_ledger_once(tmp_path, monkeypatch):
+def test_build_release_retains_a_bounded_number_of_validated_ticks(
+    tmp_path, monkeypatch
+):
     ticks = tmp_path / "ticks.jsonl"
     telemetry = tmp_path / "telemetry.sqlite3"
-    write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
+    start = snapshots.parse_utc("2025-01-01T00:00:00Z")
+    write_ticks(
+        ticks,
+        *(
+            tick(
+                snapshots.format_utc(start + timedelta(days=index)),
+                event_seq=30_000 + index,
+                lobby=5_000 + index,
+                notes=1_000 + index,
+            )
+            for index in range(400)
+        ),
+    )
     telemetry_database(telemetry).close()
-    original = snapshots.load_ticks
-    calls = []
+    original_validate = derive.validate_tick
+    live_ticks = 0
+    peak_live_ticks = 0
 
-    def counting_load(path):
-        calls.append(Path(path))
-        return original(Path(path))
+    class TrackedTick(dict):
+        def __init__(self, value):
+            nonlocal live_ticks, peak_live_ticks
+            super().__init__(value)
+            live_ticks += 1
+            peak_live_ticks = max(peak_live_ticks, live_ticks)
 
-    monkeypatch.setattr(snapshots, "load_ticks", counting_load)
-    monkeypatch.setattr(build_site, "load_ticks", counting_load)
+        def __del__(self):
+            nonlocal live_ticks
+            live_ticks -= 1
+
+    def tracked_validate(value):
+        return TrackedTick(original_validate(value))
+
+    monkeypatch.setattr(derive, "validate_tick", tracked_validate)
     build_release(
         ticks,
         telemetry,
@@ -596,7 +622,46 @@ def test_build_release_reads_the_tick_ledger_once(tmp_path, monkeypatch):
         published_at="2026-08-30T00:01:00Z",
     )
 
-    assert calls == [ticks]
+    assert peak_live_ticks <= 3
+    assert live_ticks == 0
+
+
+def test_streamed_derivation_matches_in_memory_reject_and_order_semantics(
+    tmp_path, monkeypatch
+):
+    ticks_path = tmp_path / "ticks.jsonl"
+    records = [
+        tick("2026-08-30T00:00:00Z", event_seq=30_000),
+        tick("2026-08-30T00:10:00Z", event_seq=30_010),
+        tick("2026-08-30T00:05:00Z", event_seq=30_005),
+        tick("2026-08-30T00:20:00Z", event_seq=30_020),
+    ]
+    ticks_path.write_text(
+        "\n".join(
+            (
+                json.dumps(records[0]),
+                "{not json}",
+                json.dumps(records[1]),
+                json.dumps(records[2]),
+                "",
+                json.dumps(records[3]),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(derive, "utc_now", lambda: "2026-08-30T00:21:00Z")
+
+    with ticks_path.open(encoding="utf-8") as source:
+        accepted, rejected = derive.read_jsonl(source)
+    expected = derive.derive_records(accepted, rejected)
+    actual, tick_summary = derive.derive_jsonl(ticks_path)
+
+    assert actual == expected
+    assert actual["accepted_ticks"] == 3
+    assert actual["rejected_ticks"] == 2
+    assert tick_summary["records_total"] == 3
+    assert tick_summary["latest_ts"] == "2026-08-30T00:20:00Z"
 
 
 def test_build_release_samples_clock_after_the_telemetry_snapshot(

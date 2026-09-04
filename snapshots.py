@@ -481,14 +481,13 @@ def component_freshness(source: str | None, published_at: str) -> dict[str, Any]
 
 
 def status_resource(
-    ticks: Sequence[dict[str, Any]],
     derived: dict[str, Any],
     telemetry: dict[str, Any],
     published_at: str,
 ) -> tuple[dict[str, Any], str | None, dict[str, Any]]:
     attempts = telemetry["attempts"]
     latest_attempt_at = attempts[-1]["observed_at"] if attempts else None
-    latest_tick_at = ticks[-1]["ts"] if ticks else None
+    latest_tick_at = derived["collection_ended"]
     health_attempts = [
         attempt for attempt in attempts if attempt["route"] == "/healthz"
     ]
@@ -696,14 +695,46 @@ def endpoint_5xx_incidents(
 def collector_gap_incidents(
     ticks: Sequence[dict[str, Any]], gap_seconds: float, as_of: str
 ) -> tuple[list[dict[str, Any]], int]:
-    incidents: deque[dict[str, Any]] = deque(maxlen=MAX_INCIDENTS)
-    records_derived = 0
+    return collector_gap_incidents_from_summary(
+        summarize_ticks(ticks, gap_seconds),
+        gap_seconds,
+        as_of,
+    )
+
+
+def summarize_ticks(
+    ticks: Sequence[dict[str, Any]], gap_seconds: float
+) -> dict[str, Any]:
+    gaps: deque[dict[str, Any]] = deque(maxlen=MAX_INCIDENTS)
+    gap_count = 0
     for previous, current in zip(ticks, ticks[1:]):
         elapsed = (current["_datetime"] - previous["_datetime"]).total_seconds()
         if elapsed <= gap_seconds:
             continue
-        opened_at = format_utc(previous["_datetime"] + timedelta(seconds=gap_seconds))
-        records_derived += 1
+        gap_count += 1
+        gaps.append(
+            {
+                "from": previous["ts"],
+                "to": current["ts"],
+                "seconds": elapsed,
+            }
+        )
+    return {
+        "records_total": len(ticks),
+        "latest_ts": ticks[-1]["ts"] if ticks else None,
+        "latest_datetime": ticks[-1]["_datetime"] if ticks else None,
+        "collector_gaps": list(gaps),
+        "collector_gap_count": gap_count,
+    }
+
+
+def collector_gap_incidents_from_summary(
+    tick_summary: dict[str, Any], gap_seconds: float, as_of: str
+) -> tuple[list[dict[str, Any]], int]:
+    incidents: deque[dict[str, Any]] = deque(maxlen=MAX_INCIDENTS)
+    records_derived = tick_summary["collector_gap_count"]
+    for gap in tick_summary["collector_gaps"]:
+        opened_at = format_utc(parse_utc(gap["from"]) + timedelta(seconds=gap_seconds))
         incidents.append(
             {
                 "id": incident_id("collector_gap", None, opened_at),
@@ -716,19 +747,20 @@ def collector_gap_incidents(
                 "route": None,
                 "state": "resolved",
                 "opened_at": opened_at,
-                "last_observed_at": current["ts"],
-                "resolved_at": current["ts"],
+                "last_observed_at": gap["to"],
+                "resolved_at": gap["to"],
                 "attempts": 0,
                 "observed_failures": 0,
-                "window_seconds": round(elapsed, 3),
+                "window_seconds": round(gap["seconds"], 3),
                 "methodology_version": INCIDENT_RULES_VERSION,
             }
         )
-    if ticks:
-        latest = ticks[-1]
-        elapsed = (parse_utc(as_of) - latest["_datetime"]).total_seconds()
+    if tick_summary["latest_datetime"] is not None:
+        elapsed = (parse_utc(as_of) - tick_summary["latest_datetime"]).total_seconds()
         if elapsed > gap_seconds:
-            opened_at = format_utc(latest["_datetime"] + timedelta(seconds=gap_seconds))
+            opened_at = format_utc(
+                tick_summary["latest_datetime"] + timedelta(seconds=gap_seconds)
+            )
             records_derived += 1
             incidents.append(
                 {
@@ -761,6 +793,7 @@ def incident_resource(
     *,
     attempt_carry: dict[str, Any] | None = None,
     attempt_input: dict[str, Any] | None = None,
+    tick_summary: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
     carry = attempt_carry or {
         "health_probe_failed": None,
@@ -769,8 +802,9 @@ def incident_resource(
     incidents = health_incidents(attempts, carry["health_probe_failed"])
     incidents.extend(endpoint_5xx_incidents(attempts, carry["endpoint_5xx"]))
     attempt_incident_count = len(incidents)
-    gap_incidents, gap_incident_count = collector_gap_incidents(
-        ticks, gap_seconds, as_of
+    summary = tick_summary or summarize_ticks(ticks, gap_seconds)
+    gap_incidents, gap_incident_count = collector_gap_incidents_from_summary(
+        summary, gap_seconds, as_of
     )
     incidents.extend(gap_incidents)
     incidents.sort(
@@ -779,7 +813,7 @@ def incident_resource(
     bounded = incidents[:MAX_INCIDENTS]
     source_observed_at = latest_time(
         (
-            ticks[-1]["ts"] if ticks else None,
+            summary["latest_ts"],
             attempts[-1]["observed_at"] if attempts else None,
         )
     )
@@ -789,8 +823,8 @@ def incident_resource(
         "records_derived": attempt_incident_count + gap_incident_count,
         "truncated": attempt_incident_count + gap_incident_count > len(bounded),
         "tick_input": {
-            "records_total": len(ticks),
-            "records_loaded": len(ticks),
+            "records_total": summary["records_total"],
+            "records_loaded": summary["records_total"],
             "records_omitted_before_cutoff": 0,
             "cutoff_observed_at": None,
             "truncated": False,
@@ -1288,6 +1322,25 @@ def build_snapshots_from_records(
     gap_seconds: float = 300.0,
 ) -> dict[str, dict[str, Any]]:
     derived = derive.derive_records(ticks, rejected_ticks, gap_seconds)
+    return build_snapshots_from_derived(
+        derived,
+        summarize_ticks(ticks, gap_seconds),
+        telemetry_path,
+        derived_at=derived_at,
+        published_at=published_at,
+        gap_seconds=gap_seconds,
+    )
+
+
+def build_snapshots_from_derived(
+    derived: dict[str, Any],
+    tick_summary: dict[str, Any],
+    telemetry_path: str | Path,
+    *,
+    derived_at: str | None = None,
+    published_at: str | None = None,
+    gap_seconds: float = 300.0,
+) -> dict[str, dict[str, Any]]:
     telemetry = load_telemetry(Path(telemetry_path))
     derived_time = canonical_time(derived_at)
     published_time = canonical_time(published_at or derived_time)
@@ -1298,15 +1351,16 @@ def build_snapshots_from_records(
     ledger_chain_head = derived["ledger_chain"]["tip_tick_sha256"]
 
     status, status_source, status_coverage = status_resource(
-        ticks, derived, telemetry, published_time
+        derived, telemetry, published_time
     )
     incidents, incident_source, incident_coverage = incident_resource(
-        ticks,
+        (),
         telemetry["attempts"],
         gap_seconds,
         published_time,
         attempt_carry=telemetry["attempt_carry"],
         attempt_input=telemetry["attempt_input"],
+        tick_summary=tick_summary,
     )
     changes, changes_source, changes_coverage = change_resource(
         telemetry["discoveries"],
@@ -1394,10 +1448,14 @@ def build_snapshots(
     published_at: str | None = None,
     gap_seconds: float = 300.0,
 ) -> dict[str, dict[str, Any]]:
-    ticks, rejected_ticks = load_ticks(Path(ticks_path))
-    return build_snapshots_from_records(
-        tuple(ticks),
-        rejected_ticks,
+    derived, tick_summary = derive.derive_jsonl(
+        ticks_path,
+        gap_seconds,
+        MAX_INCIDENTS,
+    )
+    return build_snapshots_from_derived(
+        derived,
+        tick_summary,
         telemetry_path,
         derived_at=derived_at,
         published_at=published_at,
