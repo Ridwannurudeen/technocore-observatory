@@ -4,6 +4,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -37,6 +39,8 @@ DEPLOY_FILES = {
     SYSTEMD / "technocore-observatory-pulse.timer",
     SYSTEMD / "technocore-observatory-rebuild.service",
     SYSTEMD / "technocore-observatory-rebuild.timer",
+    SYSTEMD / "technocore-observatory-staleness.service",
+    SYSTEMD / "technocore-observatory-staleness.timer",
     *(
         FALLBACK / f"{stem}.{suffix}"
         for stem in API_FALLBACKS
@@ -46,6 +50,7 @@ DEPLOY_FILES = {
     FALLBACK / "query-unavailable.html",
     ROOT / "recover_publication.py",
     ROOT / "rebuild.sh",
+    ROOT / "check_staleness.py",
     ROOT / "DEMO.md",
 }
 
@@ -395,8 +400,10 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     pulse = read(SYSTEMD / "technocore-observatory-pulse.service")
     query = read(SYSTEMD / "technocore-observatory-query.service")
     rebuild = read(SYSTEMD / "technocore-observatory-rebuild.service")
+    staleness = read(SYSTEMD / "technocore-observatory-staleness.service")
     pulse_timer = read(SYSTEMD / "technocore-observatory-pulse.timer")
     rebuild_timer = read(SYSTEMD / "technocore-observatory-rebuild.timer")
+    staleness_timer = read(SYSTEMD / "technocore-observatory-staleness.timer")
 
     assert "User=technocore" in collector
     assert "Group=technocore" in collector
@@ -444,6 +451,124 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     assert "ExecStart=/home/technocore/observatory/rebuild.sh" in rebuild
     assert "ReadWritePaths=/opt/technocore-observatory" in rebuild
     assert "OnUnitActiveSec=10min" in rebuild_timer
+
+    assert "Type=oneshot" in staleness
+    assert "User=technocore" in staleness
+    assert "Group=technocore" in staleness
+    assert (
+        "ExecStart=/usr/bin/python3 /home/technocore/observatory/check_staleness.py "
+        "/opt/technocore-observatory/current" in staleness
+    )
+    assert "ProtectSystem=strict" in staleness
+    assert "ProtectHome=read-only" in staleness
+    assert (
+        "ReadOnlyPaths=/home/technocore/observatory /opt/technocore-observatory"
+        in staleness
+    )
+    assert "ReadWritePaths=" not in staleness
+    assert "technocore-observatory-rebuild.service" not in staleness
+    assert "OnUnitActiveSec=5min" in staleness_timer
+    assert "Unit=technocore-observatory-staleness.service" in staleness_timer
+    assert "technocore-observatory-rebuild.service" not in staleness_timer
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "mtime_age_seconds", "expected_returncode"),
+    ((60, 3600, 0), (3600, 60, 1)),
+)
+def test_staleness_check_uses_the_release_name_timestamp(
+    tmp_path,
+    age_seconds,
+    mtime_age_seconds,
+    expected_returncode,
+):
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    timestamp = datetime.fromtimestamp(
+        time.time() - age_seconds, timezone.utc
+    ).strftime("%Y%m%d%H%M%S")
+    release = releases / f"{timestamp}-0123456789ab"
+    release.mkdir()
+    os.utime(release, (time.time() - mtime_age_seconds,) * 2)
+    current = tmp_path / "current"
+    try:
+        current.symlink_to(release, target_is_directory=True)
+    except OSError:
+        current = release
+
+    before = (release.stat().st_mtime_ns, current.lstat().st_mtime_ns)
+    result = subprocess.run(
+        [sys.executable, ROOT / "check_staleness.py", current],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_returncode
+    assert (release.stat().st_mtime_ns, current.lstat().st_mtime_ns) == before
+    if expected_returncode:
+        match = re.search(r"age=([0-9.]+)s", result.stderr)
+        assert match is not None
+        assert float(match.group(1)) > 1800
+        assert f"release={release.resolve()}" in result.stderr
+    else:
+        assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("release_name", "age_seconds", "expected_returncode"),
+    (("not-a-release", 60, 0), ("20261301120000-deadbeef", 3600, 1)),
+)
+def test_staleness_check_falls_back_to_the_resolved_target_mtime(
+    tmp_path,
+    release_name,
+    age_seconds,
+    expected_returncode,
+):
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    release = releases / release_name
+    release.mkdir()
+    modified_at = time.time() - age_seconds
+    os.utime(release, (modified_at, modified_at))
+    current = tmp_path / "current"
+    try:
+        current.symlink_to(release, target_is_directory=True)
+    except OSError:
+        current = release
+
+    before = (release.stat().st_mtime_ns, current.lstat().st_mtime_ns)
+    result = subprocess.run(
+        [sys.executable, ROOT / "check_staleness.py", current],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_returncode
+    assert (release.stat().st_mtime_ns, current.lstat().st_mtime_ns) == before
+    if expected_returncode:
+        match = re.search(r"age=([0-9.]+)s", result.stderr)
+        assert match is not None
+        assert float(match.group(1)) > 1800
+        assert f"release={release.resolve()}" in result.stderr
+    else:
+        assert result.stderr == ""
+
+
+def test_staleness_check_fails_closed_when_current_cannot_be_resolved(tmp_path):
+    current = tmp_path / "missing-current"
+
+    result = subprocess.run(
+        [sys.executable, ROOT / "check_staleness.py", current],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert f"publication staleness check failed for {current}" in result.stderr
 
 
 def test_rebuild_orders_failure_prone_steps_before_the_atomic_flip():
@@ -1031,6 +1156,25 @@ def test_runbook_handles_the_first_versioned_release_from_the_flat_publication()
     assert "/opt/technocore-observatory/data.json" in source
     assert "record `current` as absent" in source
     assert "old vhost and flat files" in source
+
+
+def test_runbook_documents_the_independent_staleness_alarm():
+    source = read(ROOT / "DEPLOY.md")
+    memory_ceiling = source.index("### Rebuild memory ceiling")
+    alarm = source.index("### Publication staleness alarm")
+    next_section = source.index("### Deploy order at 2.15.0")
+    alarm_section = source[alarm:next_section]
+
+    assert memory_ceiling < alarm < next_section
+    assert "technocore-observatory-staleness.timer" in alarm_section
+    assert "technocore-observatory-staleness.service" in alarm_section
+    assert "30 minutes" in alarm_section
+    assert "mtime" in alarm_section
+    assert "read-only" in alarm_section
+    assert re.search(r"does not inspect the rebuild\s+service", alarm_section)
+    assert (
+        "systemctl enable --now technocore-observatory-staleness.timer" in alarm_section
+    )
 
 
 def test_query_identity_provisioning_is_idempotent():

@@ -39,8 +39,8 @@ the rollback evidence.
   rate-limit zone.
 - `deploy/nginx/technocore.gudman.xyz.conf` mirrors the working dual-stack redirect, ACME include,
   TLS certificate paths, static root, and loopback proxy routes.
-- `deploy/systemd/` contains the collector, query, pulse, and rebuild units and the pulse/rebuild
-  timers.
+- `deploy/systemd/` contains the collector, query, pulse, rebuild, and publication-staleness units
+  and the pulse, rebuild, and staleness timers.
 - `rebuild.sh` takes a non-blocking exclusive lock on the resolved publication root, recovers
   interrupted unpublished builds, copies the tick ledger once while holding the collector's
   `ticks.jsonl.lock` so the build and the guards read one untorn snapshot, creates a new versioned
@@ -112,6 +112,7 @@ test -f /home/technocore/observatory-candidate/collect.py
 test -f /home/technocore/observatory-candidate/recover_publication.py
 test -f /home/technocore/observatory-candidate/query_service.py
 test -f /home/technocore/observatory-candidate/rebuild.sh
+test -f /home/technocore/observatory-candidate/check_staleness.py
 test -f /home/technocore/observatory-candidate/deploy/nginx/technocore.gudman.xyz.conf
 ```
 
@@ -509,6 +510,25 @@ The ceiling is not a reservation. **This will recur**: the ledger grows roughly 
 ceiling buys time rather than fixing the shape of the problem — `derive.py` loads the ledger rather
 than streaming it. When a rebuild starts timing out again, check peak RSS against the ceiling
 before assuming the origin or the collector is at fault.
+
+### Publication staleness alarm
+
+`technocore-observatory-staleness.timer` starts one minute after boot and every five minutes after
+that. Its `Type=oneshot` `technocore-observatory-staleness.service` resolves
+`/opt/technocore-observatory/current`, reads the release time from the leading
+`YYYYmmddHHMMSS-<hex>` UTC release name, and falls back to the resolved release directory's mtime
+when the name does not parse. A release older than 30 minutes makes the service exit non-zero and
+write `age=<seconds>s release=<resolved-path>` to stderr and the journal.
+
+The check is read-only: the unit exposes the source tree and publication root through read-only
+mount boundaries, and the script opens no ledger or database. It does not inspect the rebuild
+service or its result, so any cause of a stale publication produces the same failure. After the
+unit files are installed and `systemctl daemon-reload` has succeeded, enable the independent
+timer:
+
+```bash
+systemctl enable --now technocore-observatory-staleness.timer
+```
 
 ### Deploy order at 2.15.0
 
