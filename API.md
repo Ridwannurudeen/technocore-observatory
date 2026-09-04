@@ -45,7 +45,8 @@ when none has been.
 
 - Request target: at most 2,048 bytes.
 - Query parameters: at most eight pairs; repeated singleton parameters are invalid.
-- Search query: at most 80 Unicode code points and 320 UTF-8 bytes; control characters are invalid.
+- Search query: at most 80 Unicode code points and 320 UTF-8 bytes; control, format,
+  line-separator and paragraph-separator characters are invalid.
 - Search limit: integer `1..20`, default `10`; no offset or pagination exists.
 - Response body: at most 65,536 bytes.
 - A SQLite progress handler aborts work that exceeds the service's request-time budget.

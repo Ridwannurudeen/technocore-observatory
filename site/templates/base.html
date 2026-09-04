@@ -19,6 +19,14 @@
   <link rel="canonical" href="%%CANONICAL_URL%%">
   <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48 64x64">
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" sizes="any">
+  <script>
+    // Read before first paint so a stored dark preference never flashes light.
+    try {
+      const stored = localStorage.getItem("observatory-theme");
+      if (stored === "light" || stored === "dark")
+        document.documentElement.dataset.theme = stored;
+    } catch {}
+  </script>
   <link rel="stylesheet" href="%%ASSET_PREFIX%%assets/styles.css">
   <script src="%%ASSET_PREFIX%%assets/site.js" defer></script>
 </head>
@@ -47,7 +55,7 @@
         <a href="/about/">ABOUT</a>
       </nav>
     </details>
-    <button class="theme-control" id="theme-toggle" type="button" aria-label="Theme: auto" data-theme-value="system">THEME AUTO</button>
+    <button class="theme-control" id="theme-toggle" type="button" data-theme-value="system" hidden>THEME AUTO</button>
   </header>
   <main id="main-content" class="page-shell" tabindex="-1">
 %%CONTENT%%

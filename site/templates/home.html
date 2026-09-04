@@ -24,7 +24,7 @@
       </form>
       <dl class="evidence-rail" aria-label="Search evidence boundary">
         <div><dt>Observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
-        <div><dt>Window</dt><dd>Valid until %%COLLECTOR_VALID_UNTIL%% · <span class="freshness-state">%%COLLECTOR_FRESHNESS%%</span></dd></div>
+        <div><dt>Window</dt><dd>Valid until <time id="collector-valid-until" datetime="%%COLLECTOR_VALID_UNTIL%%">%%COLLECTOR_VALID_UNTIL%%</time> · <span class="freshness-state" data-freshness-for="collector-valid-until">%%COLLECTOR_FRESHNESS%%</span></dd></div>
         <div><dt>Coverage</dt><dd>%%TICK_COVERAGE%% accepted ticks</dd></div>
         <div><dt>Method</dt><dd>Local room-name index</dd></div>
         <div><dt>Ceiling</dt><dd>Not observed is not absent</dd></div>
