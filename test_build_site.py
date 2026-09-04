@@ -852,6 +852,103 @@ def test_observatory_ssr_and_scripted_views_agree_value_for_value(built_release)
     assert without_script == with_script
 
 
+def test_chart_breaks_at_an_unmeasurable_value_and_not_at_an_on_cadence_decrease(
+    tmp_path,
+):
+    """The polyline must say what the readout says.
+
+    A cumulative below its baseline is unmeasurable, so the line breaks there
+    and draws no vertex; drawing it at zero put an affirmative zero on the axis
+    beside a hero readout of "—". A counter that fell between two ticks that
+    both arrived on cadence is not a missed observation and must not break the
+    line either, or the raw segment breaks where the rollup segment does not.
+    """
+    sync_api = pytest.importorskip("playwright.sync_api")
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(
+        ticks,
+        tick("2026-08-30T08:00:00Z", event_seq=30_000),
+        # Rooms fall inside the polling threshold: a recorded gap, not a break.
+        tick(
+            "2026-08-30T08:05:00Z",
+            event_seq=30_010,
+            rooms=90,
+            notes=1_010,
+            lobby=5_010,
+        ),
+        tick(
+            "2026-08-30T08:10:00Z",
+            event_seq=30_020,
+            rooms=95,
+            notes=1_020,
+            lobby=5_020,
+        ),
+        # The event sequence resets below the chart baseline: unmeasurable.
+        tick(
+            "2026-08-30T08:15:00Z",
+            event_seq=29_900,
+            rooms=96,
+            notes=900,
+            lobby=4_900,
+        ),
+    )
+    with telemetry_database(telemetry) as connection:
+        add_attempt(
+            connection,
+            attempt_id=1,
+            route="/healthz",
+            observed_at="2026-08-30T08:16:00Z",
+            outcome="success",
+            status=200,
+        )
+    release = build_release(
+        ticks,
+        telemetry,
+        tmp_path / "public",
+        Path("index.html"),
+        derived_at="2026-08-30T08:16:30Z",
+        published_at="2026-08-30T08:17:00Z",
+    )
+    page_uri = (release / "observatory/index.html").resolve().as_uri()
+    read = (
+        "() => ({"
+        " path: document.getElementById('series-path').getAttribute('d'),"
+        " marker: document.getElementById('point').style.display,"
+        " cursor: document.getElementById('cursor').style.display,"
+        " hero: document.getElementById('hero-value').textContent })"
+    )
+    with sync_api.sync_playwright() as playwright:
+        browser = None
+        for channel in ("chrome", "msedge", None):
+            try:
+                browser = (
+                    playwright.chromium.launch(channel=channel)
+                    if channel
+                    else playwright.chromium.launch()
+                )
+                break
+            except Exception:
+                continue
+        if browser is None:
+            pytest.skip("no Chromium browser is installed")
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            page.goto(page_uri)
+            page.wait_for_timeout(400)
+            drawn = page.evaluate(read)
+            page.close()
+        finally:
+            browser.close()
+
+    # Three measurable observations, one unbroken segment, no fourth vertex.
+    assert drawn["path"].count("M") == 1
+    assert drawn["path"].count("L") == 2
+    assert drawn["marker"] == "none"
+    assert drawn["cursor"] == ""
+    assert drawn["hero"] == "— observed"
+
+
 def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
     sync_api = pytest.importorskip("playwright.sync_api")
     release, _ = built_release

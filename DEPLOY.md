@@ -91,7 +91,7 @@ guards must already have passed on a browser-capable machine before the release 
 The Ruff invocation carries one explicit waiver for the pre-existing unused local in
 `derive.py:2808`; the roadmap release does not touch that dead-code finding.
 
-The current public contract is methodology 1.15.0. The query unit must pass that exact
+The current public contract is methodology 1.16.0. The query unit must pass that exact
 version so every dynamic response reports the same methodology as the generated snapshots.
 
 ## 2. Stage files without activating them
@@ -473,6 +473,21 @@ tick outbox before it collects, and that drain opens the signer database, so the
 the `room_lifecycle_totals` rebuild, and the revalidation all finish before `collect_tick` starts
 its clock. Expect no `deferred_due_to_deadline` spike on the first 2.14.0 tick; if one appears,
 it is an ordinary slow tick, not the migration.
+
+### Deploy order at 1.16.0
+
+No collector version moves: 1.16.0 is a deriver-only change to what the payload publishes.
+Recorded gaps now count collector cadence intervals rather than gap records, a rollup bucket is
+marked gapped only by a cadence gap, boundary buckets expect only the ticks their own retention
+level can hold, a legacy funnel tick reports its persistence stage as not recorded, and a
+cumulative series below its chart baseline publishes null instead of zero. Two published fields
+change meaning rather than merely appearing: `signer_funnel.coverage.sampled_rooms` now counts the
+sampled room reads that succeeded, with the manifest selection count moved to the new
+`coverage.selected_rooms`, and the rollup bucket `sum` key is gone. Anything reading either field
+must be updated in the same deploy; earlier payloads keep the old meaning. The query unit's
+`--methodology-version` pin must be moved to 1.16.0 in the same deploy, or the API advertises a
+methodology the snapshots beside it no longer use. Deploy the tree, restart the query unit, then
+rebuild.
 
 ### Reverting the collector from 2.14.0 to 2.13.0
 

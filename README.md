@@ -151,7 +151,7 @@ python .\guards.py `
 
 `query_service.py` refuses a relative database or snapshot path and refuses any bind address other
 than `127.0.0.1`. The signer database is `signers.sqlite3`, derived by the collector from the
-`--signer-state signers.json` metadata path. The current public contract is methodology 1.15.0;
+`--signer-state signers.json` metadata path. The current public contract is methodology 1.16.0;
 the deployed query unit must advertise that exact version.
 
 For a complete test run:

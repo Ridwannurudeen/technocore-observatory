@@ -1666,9 +1666,15 @@ try {
   data = null;
 }
 const points = dataValid ? data.points : [];
+// Only a collector cadence gap breaks the line, and the deriver publishes which
+// recorded gaps those are. Re-deriving the rule here let the raw segment break
+// on intervals the rollup segment drew straight through.
 const recentGapEnds = new Set(
   dataValid && Array.isArray(data.gaps)
-    ? data.gaps.map((gap) => gap && gap.to).filter(Boolean)
+    ? data.gaps
+        .filter((gap) => gap && gap.cadence_gap)
+        .map((gap) => gap.to)
+        .filter(Boolean)
     : [],
 );
 const partialWindows = [];
@@ -1768,20 +1774,27 @@ function addSvg(tag, attributes, parent) {
   parent.appendChild(node);
   return node;
 }
+// A sequence below the chart baseline makes the cumulative unmeasurable. Null
+// is that state; clamping it to zero drew an affirmative zero on the axis
+// beside a hero readout that says "—".
 function seriesValue(point) {
   if (selectedSeries === "lobby") {
     const first = seriesBaseline && seriesBaseline.lobby_last_seq;
-    return Number.isFinite(point.lobby_last_seq) && Number.isFinite(first)
-      ? Math.max(0, point.lobby_last_seq - first)
-      : 0;
+    if (!Number.isFinite(point.lobby_last_seq) || !Number.isFinite(first))
+      return null;
+    const delta = point.lobby_last_seq - first;
+    return delta >= 0 ? delta : null;
   }
   if (selectedSeries === "notes") {
     const first = seriesBaseline && seriesBaseline.notes_total;
-    return Number.isFinite(point.notes_total) && Number.isFinite(first)
-      ? Math.max(0, point.notes_total - first)
-      : 0;
+    if (!Number.isFinite(point.notes_total) || !Number.isFinite(first))
+      return null;
+    const delta = point.notes_total - first;
+    return delta >= 0 ? delta : null;
   }
-  return Number(point.observed_public_rooms) || 0;
+  return Number.isFinite(point.observed_public_rooms)
+    ? point.observed_public_rooms
+    : null;
 }
 function seriesCopy() {
   if (selectedSeries === "lobby")
@@ -1819,24 +1832,37 @@ function timeToX(value) {
   return PLOT.left + Math.max(0, Math.min(1, ratio)) * (PLOT.right - PLOT.left);
 }
 function chartMaximum() {
-  return Math.max(1, ...chartPoints.map(seriesValue));
+  return Math.max(1, ...chartPoints.map(seriesValue).filter(Number.isFinite));
 }
 function coordinates(limit) {
   const visible = [...historicalPoints, ...rawChartPoints.slice(0, limit + 1)];
   if (!visible.length) return [];
   const { minTime, maxTime } = chartSpan();
   const maxValue = chartMaximum();
-  return visible.map((point) => ({
-    x:
-      PLOT.left +
-      ((new Date(point.ts).valueOf() - minTime) / (maxTime - minTime)) *
-        (PLOT.right - PLOT.left),
-    y: PLOT.bottom - (seriesValue(point) / maxValue) * (PLOT.bottom - PLOT.top),
-    breakBefore: point["_break_before"],
-    // Bracket access: the break and partial markers are synthesised here, not
-    // published fields of an observation.
-    partial: point["_partial"],
-  }));
+  // An unmeasurable value is a recorded absence, like a null bucket: it draws
+  // no vertex and the line breaks across it rather than dropping to the axis.
+  let breakPending = false;
+  const plotted = [];
+  visible.forEach((point) => {
+    const value = seriesValue(point);
+    if (!Number.isFinite(value)) {
+      breakPending = true;
+      return;
+    }
+    plotted.push({
+      x:
+        PLOT.left +
+        ((new Date(point.ts).valueOf() - minTime) / (maxTime - minTime)) *
+          (PLOT.right - PLOT.left),
+      y: PLOT.bottom - (value / maxValue) * (PLOT.bottom - PLOT.top),
+      breakBefore: Boolean(point["_break_before"]) || breakPending,
+      // Bracket access: the break and partial markers are synthesised here, not
+      // published fields of an observation.
+      partial: point["_partial"],
+    });
+    breakPending = false;
+  });
+  return plotted;
 }
 function drawGrid() {
   const grid = byId("grid");
@@ -1928,17 +1954,27 @@ function drawChart(index) {
       marks,
     );
   });
-  const last = values.at(-1);
+  // The selected observation is the last plotted point only while its value is
+  // measurable. An unmeasurable one draws no marker, and the cursor still
+  // stands at the observation the reader selected.
+  const selected = rawChartPoints[index];
+  const cursorX = selected ? timeToX(selected.ts) : NaN;
+  const last = Number.isFinite(selected && seriesValue(selected))
+    ? values.at(-1)
+    : null;
+  if (Number.isFinite(cursorX)) {
+    byId("cursor").setAttribute("x1", cursorX);
+    byId("cursor").setAttribute("x2", cursorX);
+    byId("cursor").style.display = "";
+  } else {
+    byId("cursor").style.display = "none";
+  }
   if (last) {
     byId("point").setAttribute("cx", last.x);
     byId("point").setAttribute("cy", last.y);
-    byId("cursor").setAttribute("x1", last.x);
-    byId("cursor").setAttribute("x2", last.x);
     byId("point").style.display = "";
-    byId("cursor").style.display = "";
   } else {
     byId("point").style.display = "none";
-    byId("cursor").style.display = "none";
   }
 }
 function setRate(point, metric, valueId, contextId) {

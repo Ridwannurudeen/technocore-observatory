@@ -847,6 +847,7 @@ def test_methodology_discloses_current_room_name_policy_and_history_boundary():
     )
     history = methodology["change_history"]
     assert [entry["version"] for entry in history] == [
+        "1.16.0",
         "1.15.0",
         "1.14.0",
         "1.13.0",
@@ -868,28 +869,57 @@ def test_methodology_discloses_current_room_name_policy_and_history_boundary():
     # reader cannot see what the live methodology changed.
     assert history[0]["version"] == derive.METHODOLOGY_VERSION
     assert history[0] == {
-        "version": "1.15.0",
-        "published_on": "2026-09-01",
+        "version": "1.16.0",
+        "published_on": "2026-09-02",
         "changes": [
-            "Separated checks attempted after their eligibility window closed "
-            "into a distinct attempted_late state, and began finalizing "
-            "never-attempted aged-out checks as terminal records in bounded "
-            "per-tick batches, publishing the count finalized each tick and "
-            "the backlog still remaining."
+            "Counted recorded gaps as collector cadence intervals rather than "
+            "gap records, so an interval that also carried an incomplete event "
+            "window, and an interval whose counters only fell, are no longer "
+            "added to the total.",
+            "Marked a rollup bucket as gapped only where a collector cadence "
+            "gap overlaps it, and published a cadence_gap flag on each recorded "
+            "gap so the page breaks its chart on the same rule the rollups use.",
+            "Bounded each rollup bucket's expected tick count to the span its "
+            "own retention level covers and to the time since collection "
+            "started, so a boundary bucket no longer reports ticks as missing "
+            "that began before collection or that are published in the "
+            "neighbouring level.",
+            "Reported the collection-UTC-date persistence stage of a legacy "
+            "funnel tick as not recorded rather than as zero qualifying keys "
+            "over zero observed dates.",
+            "Published a cumulative series value as not recorded where the "
+            "service's sequence fell below the chart baseline, instead of "
+            "clamping the unmeasurable difference to zero; the chart now breaks "
+            "at such a point rather than drawing it on the axis.",
+            "Separated the two room-sampling denominators the signer funnel had "
+            "merged: coverage.sampled_rooms is the count of sampled room reads "
+            "that succeeded, and the new coverage.selected_rooms is the count "
+            "the sampling manifest selected for a read.",
+            "Stopped publishing the rollup bucket sum of the cumulative "
+            "counters; a total summed across a bucket carried neither a window "
+            "nor a denominator.",
+            "Released the retired signer-state insertion cap for every state "
+            "version from 3 onward rather than for versions 3 through 6 by "
+            "name, so the next state version is not rejected for exceeding a "
+            "cap that no longer gates insertion.",
         ],
         "limitations": [
-            "Ticks recorded before collector 2.13.0 include late attempts in "
-            "their aged_out_unselected counts and publish attempted_late as "
-            "not recorded; their historical meaning is not rewritten.",
-            "Finalization is terminal bookkeeping that writes no attempt "
-            "evidence; a check finalized as aged out stays aged out even if "
-            "supersession evidence for its window is observed later.",
-            "A recorded origin read now outranks supersession evidence, so "
-            "from collector 2.13.0 a late-read check whose name was recreated "
-            "before the check fell due is counted as an eligible late attempt "
-            "rather than as ineligible and superseded before due. This shifts "
-            "the split between those two counts at the version boundary; "
-            "earlier ticks keep their original split.",
+            "Gap counts, rollup completeness, funnel coverage counts and "
+            "cumulative series values published by earlier releases were "
+            "derived under the previous rules and are not rewritten; in "
+            "particular their coverage.sampled_rooms carried the manifest "
+            "selection count, not the successful-read count it names now.",
+            "Every recorded gap is still listed with its own reason and a "
+            "cadence_gap flag; a counter decrease or an incomplete event window "
+            "is recorded but no longer counted as a recorded gap or drawn as a "
+            "break.",
+            "Rollup buckets carry no event-window completeness field and the "
+            "published gap list keeps only the newest 24 hours, so an "
+            "incomplete event window older than that window is recorded in "
+            "neither surface.",
+            "A rollup bucket's expected count still uses the median gap-free "
+            "accepted interval, so it describes cadence and never asserts that "
+            "a specific missing tick existed.",
         ],
     }
 
