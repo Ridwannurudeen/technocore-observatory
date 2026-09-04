@@ -1608,7 +1608,8 @@ class QueryApplication:
             f"<title>{html.escape(title)} — Technocore Observatory</title>"
             '<script>try{const stored=localStorage.getItem("observatory-theme");'
             'if(stored==="light"||stored==="dark")'
-            "document.documentElement.dataset.theme=stored;}catch{}</script>"
+            "document.documentElement.dataset.theme=stored;}catch{"
+            'document.documentElement.dataset.themeStorage="unavailable";}</script>'
             '<link rel="stylesheet" href="/assets/styles.css">'
             '<script src="/assets/site.js" defer></script>'
             '</head><body data-page="evidence">'
@@ -1642,7 +1643,7 @@ class QueryApplication:
             '<footer class="site-footer">'
             "<p>Independent instrument. Public observations, bounded claims.</p>"
             '<p><a href="/api/v1/status.txt">STATUS AS TEXT</a> · '
-            '<a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.0.0</p></footer>'
+            '<a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.1.0</p></footer>'
             "</body></html>"
         ).encode("utf-8")
 

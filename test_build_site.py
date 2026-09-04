@@ -491,7 +491,7 @@ def test_changes_page_is_escaped_and_preserves_evidence_fields(built_release):
     assert "%%VALID_UNTIL%%" in changes
     assert "/config" in changes
     assert "2026-08-30T00:01:40Z" in changes
-    assert "Methodology 1.0.0" in changes
+    assert "Methodology 1.1.0" in changes
     assert 'href="/api/v1/changes"' in changes
 
 

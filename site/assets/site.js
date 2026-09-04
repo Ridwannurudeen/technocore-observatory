@@ -8,6 +8,7 @@
       const stored = localStorage.getItem("observatory-theme");
       return themes.includes(stored) ? stored : "system";
     } catch {
+      root.dataset.themeStorage = "unavailable";
       return "system";
     }
   }
@@ -46,7 +47,9 @@
 
       try {
         localStorage.setItem("observatory-theme", theme);
-      } catch {}
+      } catch {
+        root.dataset.themeStorage = "unavailable";
+      }
 
       applyTheme(theme);
     });

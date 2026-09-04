@@ -46,8 +46,8 @@ the rollback evidence.
   `ticks.jsonl.lock` so the build and the guards read one untorn snapshot, creates a new versioned
   release, runs every guard, atomically replaces only the `current` symlink, and then applies
   bounded release retention. The copy lives in the unit's private `/tmp` and is removed on every
-  exit path. If the lock file cannot be opened the copy is still taken, unlocked, with a warning
-  on stderr.
+  exit path. If the lock file is missing, is not a regular file, cannot be opened, or cannot be
+  locked, the rebuild fails closed before copying the ledger or invoking the builder.
 
 All nginx security and CORS headers are declared once at server scope with `always`. Locations do
 not add their own headers, so nginx cannot silently drop the inherited set on error responses. The

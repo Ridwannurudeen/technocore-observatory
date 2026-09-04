@@ -1,4 +1,4 @@
-contract_version: 1.0.0
+contract_version: 1.1.0
 freshness: not_observed
 error: bad_request
 message: request arguments are invalid

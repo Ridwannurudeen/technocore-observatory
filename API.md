@@ -18,9 +18,11 @@ metadata that never includes a room name, DID or search query.
 
 Successful responses share these fields:
 
-- `contract_version`: `1.0.0`.
+- `contract_version`: `1.1.0`.
 - `generated_at`: when this representation was created.
-- `source_observed_at`: the newest observation used, or `null` when none exists.
+- `source_observed_at`: the resource-specific observation clock, or `null` when none exists. For
+  status this is the older of the newest accepted collector tick and the newest recorded
+  `/healthz` attempt; attempts for other routes do not set the status envelope clock.
 - `valid_until`: the time after which a freshness-sensitive answer is stale, or `null` only for a
   definition that has no observation clock.
 - `freshness`: `fresh`, `stale`, `not_observed` or `not_applicable`, computed from
@@ -34,8 +36,8 @@ Successful responses share these fields:
 `source_observed_at`, derivation time and publication time remain separate. Rebuilding a frozen
 source cannot make it fresh. Status snapshots are valid for 15 minutes after their source
 observation, which is the oldest of the component observations present — the newest accepted
-collector tick and the newest recorded telemetry attempt — so one dead source is never masked by a
-live one. Each component row keeps its own observation time, validity and freshness. Changes
+collector tick and the newest recorded `/healthz` attempt — so one dead source is never masked by
+a live one. Each component row keeps its own observation time, validity and freshness. Changes
 snapshots take their source observation from the newest successful read of `/config` or
 `/.well-known/agent.json`, so a register re-confirmed unchanged is fresh rather than stale, and
 `coverage.last_change_observed_at` reports when the last stored change was observed, or `null`
@@ -141,6 +143,38 @@ no origin request.
 newest-first `change_history`. Each revision has `version`, `published_on`, `changes` and
 `limitations`; `history_boundary` states where repository-backed detail begins, without inventing
 missing version numbers.
+
+Methodology `1.16.0`, published 2026-09-02, makes these changes:
+
+- `gap_count` counts distinct collector-cadence intervals, not gap records. A polling gap counts;
+  a counter decrease counts only when its interval also exceeds the polling threshold. An
+  incomplete event window or an on-cadence counter decrease remains a recorded gap reason but
+  does not increase `gap_count`.
+- Each `gaps[]` record publishes `cadence_gap`, and a rollup bucket sets `has_gap` only when one of
+  those cadence gaps overlaps it. The page and the rollup therefore use the same chart-break rule.
+- A rollup bucket computes `expected_tick_count` only across the span covered by its own retention
+  level and the time since collection started. The opening retention boundary is inclusive; the
+  upper boundary is exclusive because its tick belongs to the next level. `missing_count` and
+  `complete` follow that bounded expectation.
+- A legacy funnel tick's collection-UTC-date persistence stage is published as not recorded,
+  rather than as zero qualifying keys over zero observed dates.
+- A cumulative series value is `null` when the service sequence is below the chart baseline; the
+  unmeasurable difference is not clamped to zero, and the chart breaks at that point.
+- `signer_funnel.coverage.sampled_rooms` counts sampled room reads that succeeded.
+  `signer_funnel.coverage.selected_rooms` separately counts the rooms the sampling manifest
+  selected for a read.
+- Rollup buckets no longer publish `sum` for cumulative counters because summing those snapshots
+  has no defined window or denominator.
+- Signer-state versions 3 and later are not gated by the retired insertion cap; the release is
+  version-open rather than naming only the then-known state versions.
+
+Earlier payloads are not rewritten: their gap counts, rollup completeness, funnel coverage and
+cumulative values keep the rules under which they were published, including the former
+`coverage.sampled_rooms` meaning. Every gap reason remains listed even when `cadence_gap` is false.
+Rollups do not carry event-window completeness, and the published gap list retains only the newest
+24 hours, so neither surface records an older incomplete event window. Expected tick counts use the
+median gap-free accepted interval to describe cadence; they do not prove that a particular missing
+tick existed.
 
 Methodology `1.15.0` separates checks attempted after their eligibility window closed into a
 distinct `attempted_late` state and finalizes never-attempted aged-out checks as terminal records

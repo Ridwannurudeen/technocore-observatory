@@ -22,7 +22,7 @@ from api_contract import (
     utc_now,
 )
 
-INCIDENT_RULES_VERSION = "1.0.0"
+INCIDENT_RULES_VERSION = "1.1.0"
 VALID_FOR = timedelta(minutes=15)
 STATUS_WINDOW = timedelta(hours=1)
 MAX_ATTEMPTS = 50_000
@@ -489,20 +489,20 @@ def status_resource(
     attempts = telemetry["attempts"]
     latest_attempt_at = attempts[-1]["observed_at"] if attempts else None
     latest_tick_at = ticks[-1]["ts"] if ticks else None
-    source_observed_at = earliest_time((latest_tick_at, latest_attempt_at))
-    endpoints, endpoint_coverage = endpoint_summaries(attempts, latest_attempt_at)
-
     health_attempts = [
         attempt for attempt in attempts if attempt["route"] == "/healthz"
     ]
     latest_health = health_attempts[-1] if health_attempts else None
+    origin_source = latest_health["observed_at"] if latest_health else None
+    source_observed_at = earliest_time((latest_tick_at, origin_source))
+    endpoints, endpoint_coverage = endpoint_summaries(attempts, latest_attempt_at)
+
     if latest_health is None:
         origin_state = "not_observed"
     elif is_success(latest_health):
         origin_state = "reachable"
     else:
         origin_state = "observed_failure"
-    origin_source = latest_health["observed_at"] if latest_health else None
     origin = {
         "state": origin_state,
         "latest_outcome": latest_health["outcome"] if latest_health else None,

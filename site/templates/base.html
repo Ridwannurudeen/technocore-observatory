@@ -25,7 +25,9 @@
       const stored = localStorage.getItem("observatory-theme");
       if (stored === "light" || stored === "dark")
         document.documentElement.dataset.theme = stored;
-    } catch {}
+    } catch {
+      document.documentElement.dataset.themeStorage = "unavailable";
+    }
   </script>
   <link rel="stylesheet" href="%%ASSET_PREFIX%%assets/styles.css">
   <script src="%%ASSET_PREFIX%%assets/site.js" defer></script>
@@ -62,7 +64,7 @@
   </main>
   <footer class="site-footer">
     <p>PUBLIC OBSERVATIONS. BOUNDED CLAIMS.</p>
-    <p><a href="/api/v1/status.txt">STATUS AS TEXT</a> · <a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.0.0</p>
+    <p><a href="/api/v1/status.txt">STATUS AS TEXT</a> · <a href="/llms.txt">AGENT GUIDE</a> · CONTRACT 1.1.0</p>
   </footer>
 </body>
 </html>

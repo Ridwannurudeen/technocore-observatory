@@ -35,7 +35,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from api_contract import text_bytes
+from api_contract import CONTRACT_VERSION, text_bytes
 from verify_ledger import verify_ledger
 
 # Elements that asked for a size and got nothing are reported with this much context.
@@ -542,7 +542,7 @@ def guard_static_release(root: Path) -> list[str]:
             continue
         if set(payload) != {"contract_version", "error", "message", "freshness"}:
             failures.append(f"`{stem}.json` has an unbounded error contract")
-        if payload.get("contract_version") != "1.0.0":
+        if payload.get("contract_version") != CONTRACT_VERSION:
             failures.append(f"`{stem}.json` has the wrong contract version")
         if payload.get("error") != error_name:
             failures.append(f"`{stem}.json` has the wrong error identifier")

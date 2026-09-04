@@ -260,14 +260,17 @@ release_maintenance recover "$releases_root" "$public_root/current"
 
 ledger_copy=$(mktemp)
 trap 'rm -f -- "$ledger_copy"' 0
-if [ -e "${ticks_path}.lock" ]; then
-    if ! flock -- "${ticks_path}.lock" cp -- "$ticks_path" "$ledger_copy"; then
-        echo "ledger lock unavailable; reading $ticks_path unlocked" >&2
-        cp -- "$ticks_path" "$ledger_copy"
-    fi
-else
-    cp -- "$ticks_path" "$ledger_copy"
+if [ ! -f "${ticks_path}.lock" ]; then
+    echo "ledger lock is unavailable: ${ticks_path}.lock" >&2
+    exit 1
 fi
+exec 8<"${ticks_path}.lock"
+if ! flock 8; then
+    echo "ledger lock is unavailable: ${ticks_path}.lock" >&2
+    exit 1
+fi
+cp -- "$ticks_path" "$ledger_copy"
+exec 8<&-
 
 release_path=$(
     "$python_bin" "$script_dir/build_site.py" \

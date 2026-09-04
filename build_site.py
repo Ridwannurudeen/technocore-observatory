@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import derive
-from api_contract import json_bytes
+from api_contract import CONTRACT_VERSION, json_bytes
 from snapshots import (
     build_snapshots_from_records,
     load_ticks,
@@ -633,7 +633,7 @@ def discovery_documents() -> tuple[dict[str, Any], dict[str, Any], str, str]:
         "openapi": "3.1.0",
         "info": {
             "title": "Technocore Observatory read-only API",
-            "version": "1.0.0",
+            "version": CONTRACT_VERSION,
             "description": (
                 "Bounded local observations. Unknown is not zero; observed failure "
                 "is not an outage-cause claim."

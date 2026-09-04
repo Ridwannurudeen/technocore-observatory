@@ -378,14 +378,22 @@ def test_rebuild_reads_one_locked_ledger_copy_for_the_build_and_the_guards():
 
     make_copy = source.index("ledger_copy=$(mktemp)")
     discard_copy = source.index("trap 'rm -f -- \"$ledger_copy\"' 0")
-    locked_copy = source.index(
-        'flock -- "${ticks_path}.lock" cp -- "$ticks_path" "$ledger_copy"'
-    )
+    lock_open = source.index('exec 8<"${ticks_path}.lock"')
+    lock_acquire = source.index("flock 8")
+    locked_copy = source.index('cp -- "$ticks_path" "$ledger_copy"')
     build = source.index("build_site.py")
     guards_call = source.index("guards.py")
 
-    assert make_copy < discard_copy < locked_copy < build < guards_call
-    assert 'cp -- "$ticks_path" "$ledger_copy"' in source
+    assert (
+        make_copy
+        < discard_copy
+        < lock_open
+        < lock_acquire
+        < locked_copy
+        < build
+        < guards_call
+    )
+    assert source.count('cp -- "$ticks_path" "$ledger_copy"') == 1
     assert '        "$ledger_copy" \\' in source
     assert '--ticks "$ledger_copy"' in source
     assert '--ticks "$ticks_path"' not in source
@@ -395,14 +403,20 @@ def test_rebuild_reads_one_locked_ledger_copy_for_the_build_and_the_guards():
     )
 
 
-def test_rebuild_stops_before_building_when_the_ledger_lock_is_missing(tmp_path):
+@pytest.mark.parametrize("lock_exists", (False, True), ids=("missing", "unusable"))
+def test_rebuild_stops_before_building_when_the_ledger_lock_is_unavailable(
+    tmp_path,
+    lock_exists,
+):
     if os.name == "nt":
         git_bash = Path("C:/Program Files/Git/bin/bash.exe")
         bash = str(git_bash) if git_bash.is_file() else None
     else:
         bash = shutil.which("bash")
     if bash is None:
-        pytest.skip("bash is unavailable; ledger locking received structural validation only")
+        pytest.skip(
+            "bash is unavailable; ledger locking received structural validation only"
+        )
 
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -418,6 +432,8 @@ def test_rebuild_stops_before_building_when_the_ledger_lock_is_missing(tmp_path)
     ticks = tmp_path / "ticks.jsonl"
     telemetry = tmp_path / "telemetry.sqlite3"
     ticks.write_text("", encoding="utf-8")
+    if lock_exists:
+        ticks.with_name(f"{ticks.name}.lock").write_bytes(b"")
     telemetry.write_bytes(b"")
     public = tmp_path / "public"
     public.mkdir()
@@ -672,6 +688,7 @@ def test_rebuild_removes_an_unpublished_release_when_guards_fail(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     telemetry = tmp_path / "telemetry.sqlite3"
     ticks.write_text("", encoding="utf-8")
+    ticks.with_name(f"{ticks.name}.lock").write_bytes(b"")
     telemetry.write_bytes(b"")
     public = tmp_path / "public"
     public.mkdir()

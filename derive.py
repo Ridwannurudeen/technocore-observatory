@@ -1717,15 +1717,24 @@ def aggregate_rollup_bucket(
     # A boundary bucket only holds the span its own retention level covers, and
     # nothing exists before collection started, so expected counts that span and
     # never the ticks published by the neighbouring level.
+    covered_start = max(start, window_start)
     covered_seconds = max(
         0.0,
-        (min(end, window_end) - max(start, window_start)).total_seconds(),
+        (min(end, window_end) - covered_start).total_seconds(),
     )
-    # The tick at a level's upper cutoff belongs to the next level, so a
-    # boundary bucket holds only the whole cadence intervals its span can carry.
+    # A level's lower cutoff is inclusive. Its opening bucket therefore counts
+    # a cadence observation at that boundary, including the fractional interval
+    # left before the bucket ends. The upper cutoff is exclusive and belongs to
+    # the next level, so every later boundary bucket keeps the whole-interval
+    # count.
+    expected_from_span = (
+        math.ceil(covered_seconds / expected_tick_seconds)
+        if start <= window_start < end
+        else int(covered_seconds // expected_tick_seconds)
+    )
     expected = max(
         len(points),
-        int(covered_seconds // expected_tick_seconds),
+        expected_from_span,
     )
     missing = max(0, expected - len(points))
     # Only a collector cadence gap breaks the line. An incomplete event window

@@ -3721,13 +3721,15 @@ def test_live_2_13_finalization_evidence_validates_and_derives_cleanly(
     assert "0 aged-out checks remained unfinalized" in coverage_text
 
 
-def test_2_14_collector_tick_passes_the_2_13_sampling_gates(tmp_path, monkeypatch):
-    # Collector 2.14.0 changes only how the coverage numbers are computed —
-    # terminal rows come from rollup counters instead of a per-tick rescan —
-    # not the published payload, so a 2.14.0 tick must satisfy every sampling
-    # gate introduced at or before 2.13.0 without any deriver change.
+def test_2_15_collector_tick_passes_the_existing_sampling_gates(
+    tmp_path,
+    monkeypatch,
+):
+    # Collector 2.15.0 changes other parts of the tick contract, while retaining
+    # the lifecycle-sampling payload introduced in 2.13.0. A current tick must
+    # therefore continue to satisfy every existing sampling gate.
     record = collector_finalization_tick(tmp_path, monkeypatch)
-    assert record["collector_version"] == "2.14.0"
+    assert record["collector_version"] == "2.15.0"
     assert derive.collector_version_at_least(
         record["collector_version"],
         derive.ROOM_AGED_OUT_FINALIZATION_COLLECTOR_VERSION,

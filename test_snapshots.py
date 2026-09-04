@@ -254,9 +254,7 @@ def test_status_envelope_uses_the_health_probe_not_a_newer_unrelated_attempt(tmp
 
     assert result["source_observed_at"] == "2026-08-30T00:00:00Z"
     assert result["freshness"] == "stale"
-    assert result["status"]["origin"]["source_observed_at"] == (
-        "2026-08-30T00:00:00Z"
-    )
+    assert result["status"]["origin"]["source_observed_at"] == ("2026-08-30T00:00:00Z")
 
 
 def test_snapshot_rejects_a_source_observation_after_derivation(tmp_path):
@@ -653,7 +651,7 @@ def test_discovery_changes_publish_allowlisted_old_and_new_values(tmp_path):
             "first_observed_at": "2026-08-30T01:01:00Z",
             "source_route": "/config",
             "interpretation_affected": True,
-            "methodology_version": "1.0.0",
+            "methodology_version": "1.1.0",
         }
     ]
 
