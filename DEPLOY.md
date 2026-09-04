@@ -495,6 +495,36 @@ must be updated in the same deploy; earlier payloads keep the old meaning. The q
 methodology the snapshots beside it no longer use. Deploy the tree, restart the query unit, then
 rebuild.
 
+### Deploy order at 2.15.0
+
+No store migration: 2.15.0 adds no table, column, trigger or schema version, so unlike 2.14.0 its
+first start does no one-time rebuild and its first tick is not slower. What moves is what a tick
+may contain. An origin event whose timestamp sits within `ORIGIN_CLOCK_TOLERANCE` (one second)
+after the tick observation is now accepted rather than rejecting the whole tick, so two honest
+clocks disagreeing by under a second no longer cost a tick's creation events. The published
+engagement object is projected onto the fields `derive.validate_engagement` actually reads, so an
+origin that adds a member no longer widens the payload. A response body that ends short of its
+declared `Content-Length` now raises rather than being accepted as a complete read, and a shard
+listing with no recognised rows and no budget footer is refused. `--census-pace` gains a floor at
+the published read budget.
+
+A deriver that has not been revised for 2.15.0 still accepts a 2.15.0 tick — the timing change is
+internal to collection and `validate_engagement` normalises a retained value rather than rejecting
+the tick that carries it. `test_2_15_collector_tick_passes_the_existing_sampling_gates` pins this;
+keep it, because an unrevised validator has now rejected a collector change three times and every
+one of those was caught by hand rather than by a test.
+
+Deploy the tree, restart the collector, then rebuild. This release also moves the methodology to
+1.16.0, so take the query-unit restart from that section in the same deploy.
+
+### Reverting the collector from 2.15.0 to 2.14.0
+
+A plain binary revert. 2.15.0 creates no trigger, column or table that a 2.14.0 collector would
+not understand, so none of the drops the 2.14.0-to-2.13.0 revert needs apply. Ticks already
+published under 2.15.0 stay valid and keep their own version stamp; the reverted collector simply
+resumes rejecting the sub-second-skew ticks 2.15.0 accepted, and publishing the unprojected
+engagement object.
+
 ### Reverting the collector from 2.14.0 to 2.13.0
 
 The trigger list is unchanged — the same eight room-revisit triggers under the same names — but
