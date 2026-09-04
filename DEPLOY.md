@@ -51,9 +51,11 @@ CSP permits same-origin CSS/JavaScript and the legacy inline observatory code, b
 `'self'`. Dynamic room/DID paths receive `X-Robots-Tag`; access logs use `$uri`, never raw query
 arguments or referrers. nginx-generated API 400, 405, 429, and 503 responses use bounded text/JSON
 artifacts selected by `format=json`, with text as the safe default. A 429 also carries
-`Retry-After: 60`; all four error statuses are `no-store`, while successful static status,
-incidents, changes, and methodology representations remain publicly cacheable. Every loopback
-proxy suppresses GET/HEAD request bodies and clears the forwarded `Content-Length`.
+`Retry-After: 60`; that 60 s is a deliberate over-backoff, not the replenishment interval, because
+the zone replenishes one request every 2 s with a burst of 10. All four error statuses are
+`no-store`, while successful static status, incidents, changes, and methodology representations
+remain publicly cacheable. Every loopback proxy suppresses GET/HEAD request bodies and clears the
+forwarded `Content-Length`.
 
 The signer and telemetry databases use SQLite DELETE journal mode. Consequently, the read-only
 query and rebuild services have no WAL/SHM sidecar dependency. An interrupted write can still
@@ -67,7 +69,7 @@ From the repository root, using a real local tick ledger and telemetry database:
 ```bash
 python -m pytest -q
 python -m py_compile ./*.py
-ruff check . --per-file-ignores "derive.py:F841"
+ruff check .
 
 python build_site.py \
   /absolute/path/ticks.jsonl \
@@ -88,8 +90,6 @@ python guards.py \
 
 Non-zero means stop. A `SKIP` for Playwright or a browser is not a render validation; both render
 guards must already have passed on a browser-capable machine before the release is eligible.
-The Ruff invocation carries one explicit waiver for the pre-existing unused local in
-`derive.py:2808`; the roadmap release does not touch that dead-code finding.
 
 The current public contract is methodology 1.15.0. The query unit must pass that exact
 version so every dynamic response reports the same methodology as the generated snapshots.
@@ -344,7 +344,7 @@ nginx -t
 Then establish data before consumers:
 
 1. Run `systemctl start technocore-observatory-pulse.service` once so telemetry schema/data exist.
-2. Start `technocore-observatory.service`, wait for one accepted tick, and verify collector 2.11.1,
+2. Start `technocore-observatory.service`, wait for one accepted tick, and verify collector 2.14.0,
    signer-state/SQLite schema 6, and telemetry schema 1 in local state. This upgrades an existing
    v3-v5 SQLite store before any schema-v6-only reader starts.
 3. Run `systemctl start technocore-observatory-rebuild.service`. It must create a new
@@ -395,7 +395,9 @@ must stay bounded `no-store` 400 responses and must never fall back to the stati
 
 Inspect headers on both 200 and error responses: CSP, HSTS, nosniff, referrer policy, permissions
 policy, frame denial, credential-free CORS, and the route-specific robot policy. Confirm a rate-limit
-response is 429 with `Retry-After`, and confirm the access log contains no raw `q`, `since`,
+response is 429 with `Retry-After`; on `/rooms/?q=...`, `/rooms/{16-hex}/` and `/keys/{did}/` its
+body is the styled `errors/query-rate-limited.html`, elsewhere the text/JSON artifact. Confirm the
+access log contains no raw `q`, `since`,
 `limit`, or `format` values. Confirm every intercepted 400, 405, 429, and 503 is `no-store`, while a
 successful static status, incidents, changes, or methodology response retains the documented
 public cache policy.
@@ -509,7 +511,9 @@ For a static/publication rollback, take the same exclusive publication-root lock
 `rebuild.sh`, then point `current` at a previously verified versioned release with the same atomic
 link pattern and run `nginx -t`. This changes no collector, telemetry, or signer state. The
 immediate predecessor is always retained for this purpose; older releases are subject to the
-documented count/byte bounds. Keep the rejected release for diagnosis.
+documented count/byte bounds. Keep the rejected release for diagnosis. A release built before
+`errors/query-rate-limited.html` existed serves nginx's built-in 429 body on the two human page
+routes, with the same status and headers, until a newer release is published.
 
 ```bash
 (
