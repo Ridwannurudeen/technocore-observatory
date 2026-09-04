@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Technocore Observatory publication freshness every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=5s
+Unit=technocore-observatory-staleness.service
+
+[Install]
+WantedBy=timers.target

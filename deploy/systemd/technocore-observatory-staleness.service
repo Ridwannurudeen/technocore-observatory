@@ -1,0 +1,27 @@
+[Unit]
+Description=Alarm when the Technocore Observatory publication is stale
+
+[Service]
+Type=oneshot
+User=technocore
+Group=technocore
+WorkingDirectory=/home/technocore/observatory
+UMask=0077
+ExecStart=/usr/bin/python3 /home/technocore/observatory/check_staleness.py /opt/technocore-observatory/current
+TimeoutStartSec=30s
+MemoryMax=64M
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/home/technocore/observatory /opt/technocore-observatory
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
