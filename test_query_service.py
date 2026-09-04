@@ -1198,12 +1198,17 @@ def test_head_and_disallowed_methods_have_exact_method_semantics(
     assert body
 
 
-def test_idle_connections_are_bounded_by_a_socket_timeout(running_server):
+def test_idle_connections_are_bounded_by_a_socket_timeout(running_server, monkeypatch):
+    assert query_service.ObservatoryRequestHandler.timeout == 10
+    monkeypatch.setattr(query_service.ObservatoryRequestHandler, "timeout", 1.0)
     client = socket.create_connection(
         ("127.0.0.1", running_server.server_address[1]), timeout=5
     )
-    client.settimeout(15)
     try:
+        client.settimeout(0.2)
+        with pytest.raises(TimeoutError):
+            client.recv(1)
+        client.settimeout(3)
         assert client.recv(1) == b""
     finally:
         client.close()
