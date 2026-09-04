@@ -29,6 +29,8 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 ReadOnlyPaths=/home/technocore/observatory /opt/technocore-observatory
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
 
 [Install]
 WantedBy=multi-user.target
