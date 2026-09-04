@@ -11,13 +11,13 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import derive
 from api_contract import CONTRACT_VERSION, json_bytes
 from snapshots import (
-    build_snapshots_from_records,
-    load_ticks,
+    MAX_INCIDENTS,
+    build_snapshots_from_derived,
     parse_utc,
     write_snapshot_artifacts,
 )
@@ -720,13 +720,11 @@ def write_discovery(root: Path) -> None:
 
 
 def derive_public_data(
-    ticks: Sequence[dict[str, Any]],
-    rejected_ticks: int,
+    derived: dict[str, Any],
     *,
     derived_at: str,
-    gap_seconds: float,
 ) -> dict[str, Any]:
-    data = derive.derive_records(ticks, rejected_ticks, gap_seconds)
+    data = dict(derived)
     data["computed_at"] = derived_at
     if data["collection_ended"] is not None:
         age = max(
@@ -774,11 +772,14 @@ def build_release(
     release_id: str | None = None,
     gap_seconds: float = 300.0,
 ) -> Path:
-    loaded_ticks, rejected_ticks = load_ticks(Path(ticks_path))
-    ticks = tuple(loaded_ticks)
-    snapshots = build_snapshots_from_records(
-        ticks,
-        rejected_ticks,
+    derived, tick_summary = derive.derive_jsonl(
+        ticks_path,
+        gap_seconds,
+        MAX_INCIDENTS,
+    )
+    snapshots = build_snapshots_from_derived(
+        derived,
+        tick_summary,
         telemetry_path,
         derived_at=derived_at,
         published_at=published_at,
@@ -816,10 +817,8 @@ def build_release(
         shutil.copy2(SITE_ROOT / "assets" / "og.png", temporary / "og.png")
 
         public_data = derive_public_data(
-            ticks,
-            rejected_ticks,
+            derived,
             derived_at=derived_time,
-            gap_seconds=gap_seconds,
         )
         (temporary / "data.json").write_bytes(json_bytes(public_data))
         observatory_source = Path(observatory_template).read_text(encoding="utf-8")

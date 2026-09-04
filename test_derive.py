@@ -1,8 +1,10 @@
 import ast
+import gc
 import inspect
 import json
 import re
 import textwrap
+import tracemalloc
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2711,6 +2713,89 @@ def test_raw_points_are_retained_only_inside_the_declared_window():
         level["resolution_label"] == "1-hour rollup"
         for level in result["history"]["rollup_levels"]
     )
+
+
+def test_streaming_auxiliary_memory_does_not_grow_with_ledger_lifetime(tmp_path):
+    start = datetime(2010, 1, 1, tzinfo=timezone.utc)
+    target_walk = start.isoformat().replace("+00:00", "Z")
+    room_ids = [f"{index:016x}" for index in range(20)]
+
+    def peak_bytes(count):
+        path = tmp_path / f"auxiliary-{count}.jsonl"
+        with path.open("w", encoding="utf-8") as destination:
+            for index in range(count):
+                timestamp = (
+                    (start + timedelta(days=index)).isoformat().replace("+00:00", "Z")
+                )
+                target_state = index in (0, count - 1)
+                walk_started_at = target_walk if target_state else timestamp
+                record = tick(
+                    timestamp,
+                    rooms=10_000 + index,
+                    notes=20_000 + index,
+                    lobby=40_000 + index,
+                    event_seq=30_000 + index,
+                    room_sampling=manifest(
+                        *room_ids,
+                        epoch=0 if target_state else index,
+                        frame_size=len(room_ids),
+                    ),
+                    identity=1_000,
+                    identity_census_started=walk_started_at,
+                    identity_census_run=census_run(walk_started_at=walk_started_at),
+                )
+                destination.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+        gc.collect()
+        tracemalloc.start()
+        data, _ = derive.derive_jsonl(path, gap_seconds=90_000)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        latest = data["points"][-1]
+        assert latest["room_sampling"]["cumulative_unique_rooms"] == 20
+        assert latest["room_sampling"]["repeat_count"] == 20
+        assert latest["identity_census_run"]["invocations"] == 2
+        assert latest["identity_census_run"]["shard_reads_attempted"] == 512
+        return peak, (
+            len(data["points"]),
+            sum(len(level["buckets"]) for level in data["history"]["rollup_levels"]),
+        )
+
+    short_peak, short_shape = peak_bytes(1_000)
+    long_peak, long_shape = peak_bytes(4_000)
+
+    assert short_shape == long_shape == (2, 1_009)
+    assert long_peak < short_peak * 1.5
+
+
+@pytest.mark.parametrize(
+    "intervals,expected",
+    (
+        ((0.125, 0.5, 1.25), 0.5),
+        ((0.125, 0.5, 1.25, 2.0), 0.875),
+    ),
+)
+def test_streamed_median_preserves_fractional_intervals(tmp_path, intervals, expected):
+    observed = datetime(2026, 8, 30, tzinfo=timezone.utc)
+    records = [tick(observed.isoformat().replace("+00:00", "Z"))]
+    for index, interval in enumerate(intervals, 1):
+        observed += timedelta(seconds=interval)
+        records.append(
+            tick(
+                observed.isoformat().replace("+00:00", "Z"),
+                event_seq=30_000 + index,
+                lobby=5_000 + index,
+            )
+        )
+    path = tmp_path / "fractional-intervals.jsonl"
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    data, _ = derive.derive_jsonl(path, gap_seconds=10)
+
+    assert data["history"]["expected_tick_seconds"].hex() == expected.hex()
 
 
 def test_rollup_ratio_uses_summed_primitives_not_averaged_rates():
