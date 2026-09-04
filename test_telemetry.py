@@ -946,6 +946,105 @@ def test_pulse_cadence_allowlist_and_zero_metered_reads(
     }
 
 
+def test_pulse_cycle_stamps_the_time_each_observation_finished(
+    telemetry_store,
+    monkeypatch,
+):
+    bodies = {
+        "/healthz": b"ok",
+        "/config": b'{"service":"technocore"}',
+        "/.well-known/agent.json": b'{"schema_version":"1.0"}',
+    }
+
+    def respond(request, timeout):
+        return Response(bodies[urllib.parse.urlsplit(request.full_url).path])
+
+    clock = iter(
+        (
+            "2026-08-30T10:00:01Z",
+            "2026-08-30T10:00:02Z",
+            "2026-08-30T10:00:03Z",
+        )
+    )
+    monkeypatch.setattr(collect, "open_origin", respond)
+    monkeypatch.setattr(pulse_probe, "utc_now", lambda: next(clock))
+
+    assert pulse_probe.run_probe_cycle(
+        telemetry_store,
+        "https://example.invalid",
+        1,
+        "2026-08-30T10:00:00Z",
+    )
+
+    assert telemetry_store.connection.execute(
+        "SELECT started_at, finished_at FROM cycles"
+    ).fetchone() == ("2026-08-30T10:00:00Z", "2026-08-30T10:00:03Z")
+    assert telemetry_store.connection.execute(
+        "SELECT route, observed_at FROM discovery_snapshots ORDER BY route"
+    ).fetchall() == [
+        ("/.well-known/agent.json", "2026-08-30T10:00:02Z"),
+        ("/config", "2026-08-30T10:00:01Z"),
+    ]
+
+
+def test_pulse_cycle_is_finished_as_failed_when_snapshot_storage_raises(
+    telemetry_store,
+    monkeypatch,
+):
+    def respond(request, timeout):
+        path = urllib.parse.urlsplit(request.full_url).path
+        return Response(b"ok" if path == "/healthz" else b'{"service":"technocore"}')
+
+    def refuse(*args, **kwargs):
+        raise ValueError("discovery snapshot does not match a successful attempt")
+
+    monkeypatch.setattr(collect, "open_origin", respond)
+    monkeypatch.setattr(telemetry_store, "record_discovery_snapshot", refuse)
+
+    with pytest.raises(ValueError):
+        pulse_probe.run_probe_cycle(
+            telemetry_store,
+            "https://example.invalid",
+            1,
+            "2026-08-30T10:00:00Z",
+        )
+
+    assert telemetry_store.connection.execute(
+        "SELECT outcome, error_outcome, finished_at IS NOT NULL FROM cycles"
+    ).fetchone() == ("failure", "storage_error", 1)
+
+
+def test_pulse_probe_failure_log_is_escaped_and_bounded(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    def hostile(*args, **kwargs):
+        raise OSError("\x1b[2J\rroot" + "u" * 2_000)
+
+    monkeypatch.setattr(pulse_probe, "run_probe_cycle", hostile)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pulse_probe.py",
+            "--base-url",
+            "https://example.invalid",
+            "--telemetry-database",
+            str(tmp_path / "telemetry.sqlite3"),
+            "--once",
+        ],
+    )
+
+    assert pulse_probe.main() == 1
+
+    reported = capsys.readouterr().err.split("pulse probe failed: ", 1)[1].strip()
+    assert "\x1b" not in reported
+    assert "\r" not in reported
+    assert reported.startswith("\\u001b[2J\\rroot")
+    assert len(reported) == 512
+
+
 def test_pulse_routes_continue_independently_without_retries(
     telemetry_store,
     monkeypatch,

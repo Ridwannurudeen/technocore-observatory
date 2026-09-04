@@ -126,6 +126,7 @@ RESOURCE_TAG = re.compile(
 )
 FORM = re.compile(r"<form\b([^>]*)>", re.I)
 SCRIPT = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.I | re.S)
+STYLE = re.compile(r"<style\b([^>]*)>(.*?)</style>", re.I | re.S)
 ATTRIBUTE = re.compile(r"\b([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*([\"\'])(.*?)\2", re.S)
 EXTERNAL_STYLE = re.compile(r"(?:@import\s+|url\(\s*)[\"\']?(?:https?:)?//", re.I)
 EXTERNAL_SCRIPT = re.compile(
@@ -405,6 +406,10 @@ def guard_no_js_state(html_path: Path, payload: dict) -> list[str]:
                 f"`{key}` renders {text!r} without JavaScript while the payload holds {value}"
             )
 
+    if not bars:
+        failures.append(
+            "no data-ssr-width anchors remain, so no bar width can be verified"
+        )
     for bar in bars:
         inline = bar["inline"]
         if not inline:
@@ -435,6 +440,14 @@ def guard_static_release(root: Path) -> list[str]:
     ]
     if failures:
         return failures
+
+    unexpected = {
+        path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()
+    } - STATIC_RELEASE_FILES
+    failures.extend(
+        f"static release contains an unexpected file `{relative}`"
+        for relative in sorted(unexpected)
+    )
 
     documents: dict[str, dict] = {}
     for relative in (
@@ -545,7 +558,9 @@ def guard_static_release(root: Path) -> list[str]:
 
     html_files = sorted(root.rglob("*.html"))
     forms = 0
+    rooms_forms = 0
     inline_scripts: list[tuple[str, str]] = []
+    inline_styles: list[tuple[str, str]] = []
     for path in html_files:
         relative = path.relative_to(root).as_posix()
         source = path.read_text(encoding="utf-8")
@@ -568,6 +583,8 @@ def guard_static_release(root: Path) -> list[str]:
             }
             if parsed.get("method", "get").lower() != "get":
                 failures.append(f"`{relative}` contains a non-GET form")
+            elif relative == "rooms/index.html":
+                rooms_forms += 1
             action = parsed.get("action")
             if action is None or not action.startswith("/") or action.startswith("//"):
                 failures.append(f"`{relative}` contains a non-local form action")
@@ -581,8 +598,14 @@ def guard_static_release(root: Path) -> list[str]:
                 "application/ld+json",
             }:
                 inline_scripts.append((relative, body))
+        for _, body in STYLE.findall(source):
+            inline_styles.append((relative, body))
     if forms == 0:
         failures.append("static release contains no progressive-enhancement GET form")
+    if rooms_forms == 0:
+        failures.append(
+            "`rooms/index.html` contains no progressive-enhancement GET form"
+        )
 
     rooms = (root / "rooms/index.html").read_text(encoding="utf-8")
     if '<meta name="robots" content="noindex,nofollow,noarchive">' not in rooms:
@@ -601,9 +624,13 @@ def guard_static_release(root: Path) -> list[str]:
         if path not in llms:
             failures.append(f"`llms.txt` does not discover `{path}`")
 
-    styles = (root / "assets/styles.css").read_text(encoding="utf-8")
-    if EXTERNAL_STYLE.search(styles):
-        failures.append("`assets/styles.css` loads an external resource")
+    style_sources = [
+        ("assets/styles.css", (root / "assets/styles.css").read_text(encoding="utf-8")),
+        *inline_styles,
+    ]
+    for relative, source in style_sources:
+        if EXTERNAL_STYLE.search(source):
+            failures.append(f"`{relative}` loads an external resource")
     script_sources = [
         ("assets/site.js", (root / "assets/site.js").read_text(encoding="utf-8")),
         *inline_scripts,
@@ -651,9 +678,9 @@ def main() -> int:
         checks = (
             ("tick ledger hash chain", guard_ledger_chain(args.ticks)),
             ("payload contract", guard_payload_contract(html, args.derive, args.ticks)),
+            ("static release", guard_static_release(args.site_root)),
             ("zero-width render", guard_zero_width_render(built)),
             ("no-JS honesty", guard_no_js_state(built, payload)),
-            ("static release", guard_static_release(args.site_root)),
         )
 
         failed = 0

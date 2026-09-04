@@ -3,6 +3,8 @@ import os
 import re
 import stat
 import struct
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -476,6 +478,54 @@ def test_changes_page_is_escaped_and_preserves_evidence_fields(built_release):
     assert 'href="/api/v1/changes"' in changes
 
 
+def test_incident_stamp_escapes_its_timestamps_and_never_prints_none_counts():
+    rows = build_site.incident_rows(
+        [
+            {
+                "title": "Observed health probe failures",
+                "rule": "health_probe_failed",
+                "state": "open",
+                "description": "Bounded observation record.",
+                "opened_at": "<script>alert(1)</script>",
+                "last_observed_at": "2026-08-30T00:01:00Z",
+                "resolved_at": None,
+                "attempts": None,
+                "observed_failures": None,
+                "methodology_version": "1.0.0",
+            }
+        ]
+    )
+
+    assert "<script>alert(1)</script>" not in rows
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in rows
+    assert "Opened &lt;script&gt;" in rows
+    assert "Resolved Still open" in rows
+    assert "None attempts" not in rows
+    assert "Not observed attempts · Not observed observed failures" in rows
+
+
+def test_endpoint_measure_never_prints_none_as_a_count():
+    rows = build_site.endpoint_rows(
+        [
+            {
+                "route": "/healthz",
+                "attempts": None,
+                "successes": None,
+                "server_errors": None,
+                "latency_ms": {"p95": None},
+                "first_observed_at": "2026-08-30T00:00:00Z",
+                "last_observed_at": "2026-08-30T00:01:00Z",
+            }
+        ]
+    )
+
+    assert "None attempts" not in rows
+    assert (
+        "Not observed attempts · Not observed successes · "
+        "Not observed observed 5xx" in rows
+    )
+
+
 def test_incident_and_change_machine_links_use_public_api_routes(built_release):
     release, _ = built_release
     incidents = (release / "incidents/index.html").read_text(encoding="utf-8")
@@ -574,7 +624,7 @@ def test_build_release_samples_clock_after_the_telemetry_snapshot(
     status = json.loads((release / "api/v1/status.json").read_bytes())
 
     assert release.name.startswith("20260830000003-")
-    assert status["source_observed_at"] == "2026-08-30T00:00:02Z"
+    assert status["status"]["origin"]["source_observed_at"] == "2026-08-30T00:00:02Z"
     assert status["derived_at"] == "2026-08-30T00:00:03Z"
     assert status["published_at"] == "2026-08-30T00:00:03Z"
     assert status["generated_at"] == "2026-08-30T00:00:03Z"
@@ -1074,6 +1124,56 @@ def test_reflow_themes_and_no_autoplay_in_real_browser(built_release):
                 page.close()
         finally:
             browser.close()
+
+
+def test_no_js_guard_fails_when_every_bar_anchor_disappears(monkeypatch):
+    class Page:
+        def goto(self, uri):
+            return None
+
+        def evaluate(self, script):
+            if "data-ssr-width" in script:
+                return []
+            return {"hero-value": "100", "status": "1"}
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+    class Browser:
+        def new_context(self, **options):
+            return Context()
+
+        def close(self):
+            return None
+
+    class Chromium:
+        def launch(self, **options):
+            return Browser()
+
+    class Playwright:
+        chromium = Chromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    sync_api = types.ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = Playwright
+    package = types.ModuleType("playwright")
+    package.sync_api = sync_api
+    monkeypatch.setitem(sys.modules, "playwright", package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    findings = guards.guard_no_js_state(
+        Path("index.html"), {"points": [{"observed_public_rooms": 100}]}
+    )
+
+    assert findings == [
+        "no data-ssr-width anchors remain, so no bar width can be verified"
+    ]
 
 
 def test_render_guards_hold_on_a_built_release(built_release):

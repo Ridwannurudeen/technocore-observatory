@@ -137,8 +137,9 @@ def endpoint_rows(endpoints: list[dict[str, Any]]) -> str:
     rows = []
     for index, endpoint in enumerate(endpoints, start=1):
         measure = (
-            f"{endpoint['attempts']} attempts · {endpoint['successes']} successes · "
-            f"{endpoint['server_errors']} observed 5xx"
+            f"{text(endpoint['attempts'])} attempts · "
+            f"{text(endpoint['successes'])} successes · "
+            f"{text(endpoint['server_errors'])} observed 5xx"
         )
         evidence = (
             f"{endpoint['first_observed_at']} to {endpoint['last_observed_at']} · "
@@ -165,14 +166,14 @@ def incident_rows(incidents: list[dict[str, Any]]) -> str:
     for index, incident in enumerate(incidents, start=1):
         resolved = incident["resolved_at"] or "Still open"
         stamp = (
-            f"Opened {incident['opened_at']}<br>"
-            f"Last observed {incident['last_observed_at']}<br>"
-            f"Resolved {resolved}"
+            f"Opened {escaped(incident['opened_at'])}<br>"
+            f"Last observed {escaped(incident['last_observed_at'])}<br>"
+            f"Resolved {escaped(resolved)}"
         )
         counts = (
-            f"{incident['attempts']} attempts · "
-            f"{incident['observed_failures']} observed failures · "
-            f"rule {incident['methodology_version']}"
+            f"{text(incident['attempts'])} attempts · "
+            f"{text(incident['observed_failures'])} observed failures · "
+            f"rule {text(incident['methodology_version'])}"
         )
         rows.append(
             '<article class="incident-row">'

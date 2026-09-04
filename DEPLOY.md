@@ -42,8 +42,12 @@ the rollback evidence.
 - `deploy/systemd/` contains the collector, query, pulse, and rebuild units and the pulse/rebuild
   timers.
 - `rebuild.sh` takes a non-blocking exclusive lock on the resolved publication root, recovers
-  interrupted unpublished builds, creates a new versioned release, runs every guard, atomically
-  replaces only the `current` symlink, and then applies bounded release retention.
+  interrupted unpublished builds, copies the tick ledger once while holding the collector's
+  `ticks.jsonl.lock` so the build and the guards read one untorn snapshot, creates a new versioned
+  release, runs every guard, atomically replaces only the `current` symlink, and then applies
+  bounded release retention. The copy lives in the unit's private `/tmp` and is removed on every
+  exit path. If the lock file cannot be opened the copy is still taken, unlocked, with a warning
+  on stderr.
 
 All nginx security and CORS headers are declared once at server scope with `always`. Locations do
 not add their own headers, so nginx cannot silently drop the inherited set on error responses. The
