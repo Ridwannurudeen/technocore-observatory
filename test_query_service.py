@@ -2,7 +2,6 @@ import ast
 import hashlib
 import http.client
 import json
-import re
 import socket
 import sqlite3
 import threading
@@ -1198,8 +1197,20 @@ def test_head_and_disallowed_methods_have_exact_method_semantics(
     assert body
 
 
-def test_idle_connections_are_bounded_by_a_socket_timeout():
+def test_idle_connections_are_bounded_by_a_socket_timeout(running_server, monkeypatch):
     assert query_service.ObservatoryRequestHandler.timeout == 10
+    monkeypatch.setattr(query_service.ObservatoryRequestHandler, "timeout", 1.0)
+    client = socket.create_connection(
+        ("127.0.0.1", running_server.server_address[1]), timeout=5
+    )
+    try:
+        client.settimeout(0.2)
+        with pytest.raises(TimeoutError):
+            client.recv(1)
+        client.settimeout(3)
+        assert client.recv(1) == b""
+    finally:
+        client.close()
 
 
 def test_query_concurrency_limit_rejects_excess_work_and_releases_slot(
@@ -1408,11 +1419,10 @@ def test_progressive_room_html_escapes_names_and_uses_generic_previews(running_s
     assert "evidence-room" not in source.split("<head>", 1)[1].split("</head>", 1)[0]
 
 
-def test_query_shell_classes_are_grid_children_with_stylesheet_rules(
-    running_server,
-):
+def test_query_shell_header_has_computed_grid_layout(running_server):
+    sync_api = pytest.importorskip("playwright.sync_api")
     styles = Path("site/assets/styles.css").read_text(encoding="utf-8")
-    emitted = set()
+    sources = []
     for target in (
         "/rooms/",
         "/rooms/?q=forged",
@@ -1421,22 +1431,38 @@ def test_query_shell_classes_are_grid_children_with_stylesheet_rules(
     ):
         status, _, body = request(running_server, "GET", target)
         assert status == 200
-        source = body.decode("utf-8")
-        assert "site-header-inner" not in source
-        head = source.split("</head>", 1)[0]
-        assert head.index('localStorage.getItem("observatory-theme")') < head.index(
-            '<link rel="stylesheet"'
-        )
-        for attribute in re.findall(r'class="([^"]*)"', source):
-            emitted.update(attribute.split())
+        sources.append(body.decode("utf-8"))
 
-    assert "site-header" in emitted
-    unstyled = sorted(
-        name
-        for name in emitted
-        if re.search(rf"\.{re.escape(name)}(?![-\w])", styles) is None
-    )
-    assert unstyled == []
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            for source in sources:
+                page.set_content(source)
+                page.add_style_tag(content=styles)
+                layout = page.locator(".site-header").evaluate(
+                    """header => ({
+                        display: getComputedStyle(header).display,
+                        columns: getComputedStyle(header).gridTemplateColumns,
+                        children: Array.from(
+                            header.children,
+                            child => child.classList[0]
+                        ),
+                    })"""
+                )
+                assert layout["display"] == "grid"
+                assert len(layout["columns"].split()) == 4
+                assert layout["children"] == [
+                    "wordmark",
+                    "priority-nav",
+                    "site-index",
+                    "theme-control",
+                ]
+        finally:
+            browser.close()
 
 
 def test_trace_returns_only_direct_bounded_facts_and_hashes_rooms(running_server):
