@@ -8,10 +8,13 @@ import html
 import json
 import math
 import re
+import sqlite3
+import tempfile
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 CLASSES = (
     "unlisted",
@@ -1699,9 +1702,114 @@ def read_jsonl(lines: Iterable[str]) -> tuple[list[dict[str, Any]], int]:
     return ticks, source.rejected
 
 
+class DerivationState:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.connection.executescript(
+            """
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
+            PRAGMA temp_store = FILE;
+            PRAGMA cache_size = -2048;
+            CREATE TABLE intervals (
+                id INTEGER PRIMARY KEY,
+                seconds REAL NOT NULL
+            );
+            CREATE INDEX intervals_by_seconds ON intervals(seconds);
+            CREATE TABLE sampled_rooms (
+                frame_slot INTEGER NOT NULL,
+                room_id TEXT NOT NULL,
+                PRIMARY KEY (frame_slot, room_id)
+            ) WITHOUT ROWID;
+            """
+        )
+        self.frame_slots: dict[tuple[Any, ...], int] = {}
+        self.walk_targets: set[str] = set()
+        self.coverage_by_frame: dict[tuple[Any, ...], dict[str, int]] = {}
+        self.census_runs_by_walk: dict[str, dict[str, Any]] = {}
+        self.interval_count = 0
+
+    def scan(
+        self,
+        records: Iterable[dict[str, Any]],
+        gap_seconds: float,
+    ) -> datetime | None:
+        recent_keys: deque[tuple[datetime, tuple[Any, ...] | None, str | None]] = (
+            deque()
+        )
+        previous_time: datetime | None = None
+        newest: datetime | None = None
+        for tick in records:
+            tick_time = tick["_datetime"]
+            if previous_time is not None:
+                elapsed = (tick_time - previous_time).total_seconds()
+                if elapsed <= gap_seconds:
+                    self.connection.execute(
+                        "INSERT INTO intervals(seconds) VALUES (?)",
+                        (elapsed,),
+                    )
+                    self.interval_count += 1
+
+            cutoff = tick_time - timedelta(seconds=RAW_RETENTION_SECONDS)
+            while recent_keys and recent_keys[0][0] < cutoff:
+                recent_keys.popleft()
+
+            manifest = tick["room_sampling"]
+            frame_key = (
+                (
+                    manifest["selector_version"],
+                    manifest["seed"],
+                    manifest["epoch"],
+                    manifest["frame_id"],
+                    manifest["frame_size"],
+                )
+                if manifest is not None
+                else None
+            )
+            run = tick["identity_census_run"]
+            walk_started_at = run["walk_started_at"] if run is not None else None
+            if frame_key is not None or walk_started_at is not None:
+                recent_keys.append((tick_time, frame_key, walk_started_at))
+
+            previous_time = tick_time
+            newest = tick_time
+
+        for _, frame_key, walk_started_at in recent_keys:
+            if frame_key is not None and frame_key not in self.frame_slots:
+                self.frame_slots[frame_key] = len(self.frame_slots)
+            if walk_started_at is not None:
+                self.walk_targets.add(walk_started_at)
+        self.connection.commit()
+        return newest
+
+    def expected_tick_seconds(self, default: float) -> float:
+        if not self.interval_count:
+            return default
+        middle = (self.interval_count - 1) // 2
+        limit = 1 if self.interval_count % 2 else 2
+        values = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT seconds FROM intervals ORDER BY seconds LIMIT ? OFFSET ?",
+                (limit, middle),
+            )
+        ]
+        return values[0] if limit == 1 else (values[0] + values[1]) / 2
+
+
+@contextmanager
+def temporary_derivation_state() -> Iterator[DerivationState]:
+    with tempfile.TemporaryDirectory(prefix="technocore-derive-") as directory:
+        connection = sqlite3.connect(Path(directory) / "state.sqlite3")
+        try:
+            yield DerivationState(connection)
+        finally:
+            connection.close()
+
+
 def derived_room_sampling(
     manifest: dict[str, Any] | None,
-    coverage_by_frame: dict[tuple[Any, ...], dict[str, Any]],
+    state: DerivationState,
 ) -> dict[str, Any] | None:
     if manifest is None:
         return None
@@ -1713,22 +1821,30 @@ def derived_room_sampling(
         manifest["frame_id"],
         manifest["frame_size"],
     )
-    state = coverage_by_frame.setdefault(
+    frame_slot = state.frame_slots.get(key)
+    if frame_slot is None:
+        return None
+    aggregate = state.coverage_by_frame.setdefault(
         key,
-        {"ids": set(), "attempts": 0, "failures": 0},
+        {"unique": 0, "attempts": 0, "failures": 0},
     )
     sampled = manifest["sampled"]
     failed_this_tick = sum(not entry["success"] for entry in sampled)
-    state["attempts"] += len(sampled)
-    state["failures"] += failed_this_tick
-    state["ids"].update(entry["id"] for entry in sampled)
+    aggregate["attempts"] += len(sampled)
+    aggregate["failures"] += failed_this_tick
+    changes = state.connection.total_changes
+    state.connection.executemany(
+        "INSERT OR IGNORE INTO sampled_rooms(frame_slot, room_id) VALUES (?, ?)",
+        ((frame_slot, entry["id"]) for entry in sampled),
+    )
+    aggregate["unique"] += state.connection.total_changes - changes
 
     return {
         **manifest,
         "sampled_rooms": len(sampled),
-        "cumulative_unique_rooms": len(state["ids"]),
-        "repeat_count": state["attempts"] - len(state["ids"]),
-        "failed_reads": state["failures"],
+        "cumulative_unique_rooms": aggregate["unique"],
+        "repeat_count": aggregate["attempts"] - aggregate["unique"],
+        "failed_reads": aggregate["failures"],
         "failed_reads_this_tick": failed_this_tick,
     }
 
@@ -2433,12 +2549,12 @@ def funnel_display(funnel: dict[str, Any]) -> dict[str, Any]:
 
 def derived_identity_census_run(
     run: dict[str, Any] | None,
-    runs_by_walk: dict[str, dict[str, Any]],
+    state: DerivationState,
 ) -> dict[str, Any] | None:
-    if run is None:
+    if run is None or run["walk_started_at"] not in state.walk_targets:
         return None
 
-    aggregate = runs_by_walk.setdefault(
+    aggregate = state.census_runs_by_walk.setdefault(
         run["walk_started_at"],
         {
             "invocations": 0,
@@ -3455,6 +3571,7 @@ def empty_derivation(computed_at: str, rejected_ticks: int) -> dict[str, Any]:
 def derive_streaming_records(
     records: Iterable[dict[str, Any]],
     newest: datetime | None,
+    state: DerivationState,
     rejected_ticks: int = 0,
     gap_seconds: float = 300.0,
     gap_history_limit: int = 100,
@@ -3471,9 +3588,6 @@ def derive_streaming_records(
     archive_accumulator: RollupAccumulator | None = None
     recent_gaps: list[dict[str, Any]] = []
     collector_gaps: deque[dict[str, Any]] = deque(maxlen=gap_history_limit)
-    intervals: list[float] = []
-    coverage_by_frame: dict[tuple[Any, ...], dict[str, Any]] = {}
-    census_runs_by_walk: dict[str, dict[str, Any]] = {}
     latest_census: tuple[int, str | None, str] | None = None
     carried_rates: dict[str, dict[str, Any]] = {}
     capacity_histories = {"notes": deque(), "rooms": deque()}
@@ -3553,10 +3667,10 @@ def derive_streaming_records(
             ):
                 latest_census = candidate
 
-        room_sampling = derived_room_sampling(tick["room_sampling"], coverage_by_frame)
+        room_sampling = derived_room_sampling(tick["room_sampling"], state)
         census_run = derived_identity_census_run(
             tick.get("identity_census_run"),
-            census_runs_by_walk,
+            state,
         )
         point = {
             "ts": tick["ts"],
@@ -3644,8 +3758,6 @@ def derive_streaming_records(
         cadence_gap: dict[str, Any] | None = None
         if previous_tick is not None:
             elapsed = (tick_time - previous_tick["_datetime"]).total_seconds()
-            if elapsed <= gap_seconds:
-                intervals.append(elapsed)
             is_gap = elapsed > gap_seconds
             if is_gap:
                 collector_gap_count += 1
@@ -3855,16 +3967,7 @@ def derive_streaming_records(
     if latest_disclosure is not None:
         methodology["signer_funnel"] += f" {latest_disclosure['methodology']}"
 
-    ordered_intervals = sorted(intervals)
-    if not ordered_intervals:
-        expected_tick_seconds = gap_seconds
-    else:
-        middle = len(ordered_intervals) // 2
-        expected_tick_seconds = (
-            ordered_intervals[middle]
-            if len(ordered_intervals) % 2
-            else (ordered_intervals[middle - 1] + ordered_intervals[middle]) / 2
-        )
+    expected_tick_seconds = state.expected_tick_seconds(gap_seconds)
 
     levels: list[dict[str, Any]] = []
     if archive_accumulator is not None:
@@ -3978,27 +4081,28 @@ def derive_jsonl(
     gap_seconds: float = 300.0,
     gap_history_limit: int = 100,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if gap_seconds <= 0:
+        raise ValueError("gap_seconds must be positive")
+
     source_path = Path(path)
     fingerprint = file_fingerprint(source_path)
-    newest: datetime | None = None
-    with source_path.open(encoding="utf-8") as source:
-        scan = JsonlTicks(source)
-        for tick in scan:
-            newest = tick["_datetime"]
-        tick = None
-    if file_fingerprint(source_path) != fingerprint:
-        raise ValueError("tick ledger changed during derivation")
+    with temporary_derivation_state() as state:
+        with source_path.open(encoding="utf-8") as source:
+            newest = state.scan(JsonlTicks(source), gap_seconds)
+        if file_fingerprint(source_path) != fingerprint:
+            raise ValueError("tick ledger changed during derivation")
 
-    with source_path.open(encoding="utf-8") as source:
-        streamed = JsonlTicks(source)
-        data, tick_summary = derive_streaming_records(
-            streamed,
-            newest,
-            gap_seconds=gap_seconds,
-            gap_history_limit=gap_history_limit,
-        )
-    if file_fingerprint(source_path) != fingerprint:
-        raise ValueError("tick ledger changed during derivation")
+        with source_path.open(encoding="utf-8") as source:
+            streamed = JsonlTicks(source)
+            data, tick_summary = derive_streaming_records(
+                streamed,
+                newest,
+                state,
+                gap_seconds=gap_seconds,
+                gap_history_limit=gap_history_limit,
+            )
+        if file_fingerprint(source_path) != fingerprint:
+            raise ValueError("tick ledger changed during derivation")
     data["rejected_ticks"] = streamed.rejected
     return data, tick_summary
 
@@ -4025,14 +4129,17 @@ def derive_records(
         ticks.append(tick)
         previous_time = tick["_datetime"]
 
-    data, _ = derive_streaming_records(
-        ticks,
-        ticks[-1]["_datetime"] if ticks else None,
-        rejected_ticks,
-        gap_seconds,
-        gap_history_limit=0,
-        computed_at=computed_at,
-    )
+    with temporary_derivation_state() as state:
+        newest = state.scan(ticks, gap_seconds)
+        data, _ = derive_streaming_records(
+            ticks,
+            newest,
+            state,
+            rejected_ticks,
+            gap_seconds,
+            gap_history_limit=0,
+            computed_at=computed_at,
+        )
     return data
 
 
