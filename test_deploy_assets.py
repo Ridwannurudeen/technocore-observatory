@@ -345,12 +345,14 @@ def test_rebuild_orders_failure_prone_steps_before_the_atomic_flip():
     lock_acquire = source.index("flock -n 9")
     recovery = source.index("release_maintenance recover")
     build = source.index("build_site.py")
+    trap_install = source.index("trap cleanup 0")
     unpublished_validation = source.index("release_maintenance validate-unpublished")
     fallbacks = source.index("deploy/fallback")
     guards_call = source.index("guards.py")
     link = source.index("ln -s")
     flip = source.index("mv -Tf")
     assert lock_open < lock_acquire < recovery < build
+    assert build < trap_install < unpublished_validation
     assert build < unpublished_validation < fallbacks < guards_call < link < flip
     assert "command -v flock" in source
     assert "--template" in source
@@ -369,6 +371,40 @@ def test_rebuild_orders_failure_prone_steps_before_the_atomic_flip():
     assert source.index("mv -Tf") < source.index("release_maintenance prune")
     assert "max_release_count=1008" in source
     assert "max_release_bytes=2147483648" in source
+
+
+def test_rebuild_reads_one_locked_ledger_copy_for_the_build_and_the_guards():
+    source = read(ROOT / "rebuild.sh")
+
+    make_copy = source.index("ledger_copy=$(mktemp)")
+    discard_copy = source.index("trap 'rm -f -- \"$ledger_copy\"' 0")
+    locked_copy = source.index(
+        'flock -- "${ticks_path}.lock" cp -- "$ticks_path" "$ledger_copy"'
+    )
+    build = source.index("build_site.py")
+    guards_call = source.index("guards.py")
+
+    assert make_copy < discard_copy < locked_copy < build < guards_call
+    assert 'cp -- "$ticks_path" "$ledger_copy"' in source
+    assert '        "$ledger_copy" \\' in source
+    assert '--ticks "$ledger_copy"' in source
+    assert '--ticks "$ticks_path"' not in source
+    assert 'rm -f -- "$ledger_copy" || :' in source
+    assert source.index('rm -f -- "$ledger_copy" || :') < source.index(
+        'rm -f -- "$next_link" || :'
+    )
+
+
+def test_guards_validate_the_static_release_before_rendering_it():
+    source = read(ROOT / "guards.py")
+
+    ledger = source.index('("tick ledger hash chain"')
+    payload = source.index('("payload contract"')
+    static = source.index('("static release"')
+    zero_width = source.index('("zero-width render"')
+    no_js = source.index('("no-JS honesty"')
+
+    assert ledger < payload < static < zero_width < no_js
 
 
 def release_maintenance_source():
@@ -1038,6 +1074,37 @@ def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
     findings = guards.guard_static_release(release)
     assert any("innerHTML" in finding for finding in findings)
     index_path.write_text(index_source, encoding="utf-8")
+
+    index_path.write_text(
+        index_source.replace(
+            "</body>",
+            "<style>@import url(https://example.invalid/fonts.css);</style></body>",
+        ),
+        encoding="utf-8",
+    )
+    findings = guards.guard_static_release(release)
+    assert findings == ["`index.html` loads an external resource"]
+    index_path.write_text(index_source, encoding="utf-8")
+
+    rooms_path = release / "rooms/index.html"
+    rooms_source = rooms_path.read_text(encoding="utf-8")
+    rooms_path.write_text(
+        re.sub(r"<form\b.*?</form>", "", rooms_source, flags=re.S),
+        encoding="utf-8",
+    )
+    findings = guards.guard_static_release(release)
+    assert findings == [
+        "`rooms/index.html` contains no progressive-enhancement GET form"
+    ]
+    rooms_path.write_text(rooms_source, encoding="utf-8")
+
+    stray = release / "assets/styles.css.map"
+    stray.write_text("stray", encoding="utf-8")
+    findings = guards.guard_static_release(release)
+    assert findings == [
+        "static release contains an unexpected file `assets/styles.css.map`"
+    ]
+    stray.unlink()
 
     openapi_path = release / "openapi.json"
     openapi = json.loads(openapi_path.read_text(encoding="utf-8"))

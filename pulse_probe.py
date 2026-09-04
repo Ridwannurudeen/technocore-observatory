@@ -12,6 +12,7 @@ import sys
 import time
 from typing import Any
 
+from api_contract import escape_plain_text
 from collect import Client, CollectionError, absolute_path, utc_now
 from telemetry import TelemetryStore
 
@@ -249,66 +250,77 @@ def run_probe_cycle(
 ) -> bool:
     observed_at = observed_at or utc_now()
     cycle_id = telemetry.start_cycle("pulse_probe", observed_at)
-    client = Client(
-        base_url,
-        timeout,
-        0,
-        telemetry=telemetry,
-        cycle_id=cycle_id,
-    )
     failures: list[str] = []
 
     try:
-        health = client.get("/healthz")
-        if health.strip() != "ok":
-            if client.last_attempt_id is not None:
-                telemetry.update_attempt_outcome(
-                    client.last_attempt_id,
-                    "invalid_response",
-                )
-            raise CollectionError(
-                "/healthz returned an unexpected body",
-                outcome="invalid_response",
-                path="/healthz",
-            )
-    except CollectionError as error:
-        failures.append(error.outcome)
+        client = Client(
+            base_url,
+            timeout,
+            0,
+            telemetry=telemetry,
+            cycle_id=cycle_id,
+        )
 
-    for route in ("/config", "/.well-known/agent.json"):
-        if not telemetry.route_due(route, observed_at, DISCOVERY_CADENCE_SECONDS):
-            continue
         try:
-            body = client.get(route)
-            fields = canonical_discovery_fields(route, body)
-            if client.last_attempt_id is None:
-                raise RuntimeError("successful discovery request lacks telemetry")
-            telemetry.record_discovery_snapshot(
-                client.last_attempt_id,
-                route,
-                observed_at,
-                discovery_digest(fields),
-                fields,
-            )
-        except CollectionError as error:
-            if (
-                error.outcome == "invalid_response"
-                and client.last_attempt_id is not None
-            ):
-                telemetry.update_attempt_outcome(
-                    client.last_attempt_id,
-                    "invalid_response",
+            health = client.get("/healthz")
+            if health.strip() != "ok":
+                if client.last_attempt_id is not None:
+                    telemetry.update_attempt_outcome(
+                        client.last_attempt_id,
+                        "invalid_response",
+                    )
+                raise CollectionError(
+                    "/healthz returned an unexpected body",
+                    outcome="invalid_response",
+                    path="/healthz",
                 )
+        except CollectionError as error:
             failures.append(error.outcome)
+
+        for route in ("/config", "/.well-known/agent.json"):
+            if not telemetry.route_due(route, observed_at, DISCOVERY_CADENCE_SECONDS):
+                continue
+            try:
+                body = client.get(route)
+                snapshot_at = utc_now()
+                fields = canonical_discovery_fields(route, body)
+                if client.last_attempt_id is None:
+                    raise RuntimeError("successful discovery request lacks telemetry")
+                telemetry.record_discovery_snapshot(
+                    client.last_attempt_id,
+                    route,
+                    snapshot_at,
+                    discovery_digest(fields),
+                    fields,
+                )
+            except CollectionError as error:
+                if (
+                    error.outcome == "invalid_response"
+                    and client.last_attempt_id is not None
+                ):
+                    telemetry.update_attempt_outcome(
+                        client.last_attempt_id,
+                        "invalid_response",
+                    )
+                failures.append(error.outcome)
+    except Exception:
+        telemetry.finish_cycle(
+            cycle_id,
+            "failure",
+            error_outcome="storage_error",
+            finished_at=utc_now(),
+        )
+        raise
 
     if failures:
         telemetry.finish_cycle(
             cycle_id,
             "failure",
             error_outcome=failures[0],
-            finished_at=observed_at,
+            finished_at=utc_now(),
         )
         return False
-    telemetry.finish_cycle(cycle_id, "success", finished_at=observed_at)
+    telemetry.finish_cycle(cycle_id, "success", finished_at=utc_now())
     return True
 
 
@@ -341,7 +353,11 @@ def main() -> int:
                     args.timeout,
                 )
             except (OSError, sqlite3.Error) as error:
-                print(f"{utc_now()} pulse probe failed: {error}", file=sys.stderr)
+                print(
+                    f"{utc_now()} pulse probe failed: "
+                    f"{escape_plain_text(str(error))[:512]}",
+                    file=sys.stderr,
+                )
                 success = False
             if args.once:
                 return 0 if success else 1

@@ -81,6 +81,11 @@ def latest_time(values: Iterable[str | None]) -> str | None:
     return max(present, key=parse_utc) if present else None
 
 
+def earliest_time(values: Iterable[str | None]) -> str | None:
+    present = [value for value in values if value is not None]
+    return min(present, key=parse_utc) if present else None
+
+
 def load_ticks(path: Path) -> tuple[list[dict[str, Any]], int]:
     with path.open(encoding="utf-8") as source:
         return derive.read_jsonl(source)
@@ -484,7 +489,7 @@ def status_resource(
     attempts = telemetry["attempts"]
     latest_attempt_at = attempts[-1]["observed_at"] if attempts else None
     latest_tick_at = ticks[-1]["ts"] if ticks else None
-    source_observed_at = latest_time((latest_tick_at, latest_attempt_at))
+    source_observed_at = earliest_time((latest_tick_at, latest_attempt_at))
     endpoints, endpoint_coverage = endpoint_summaries(attempts, latest_attempt_at)
 
     health_attempts = [
@@ -815,12 +820,12 @@ def affects_interpretation(route: str, field: str) -> bool:
     if route == "/config":
         return field.startswith(
             (
+                "settings.dupe_",
+                "settings.ephemeral_ttl_",
                 "settings.max_",
-                "settings.limit",
                 "settings.rate_",
                 "settings.static_cache_",
-                "limits.",
-                "cadence.",
+                "settings.wait_",
                 "service",
                 "version",
             )
@@ -836,7 +841,6 @@ def affects_interpretation(route: str, field: str) -> bool:
             "schema_version",
             "trust.",
             "version",
-            "url",
         )
     )
 
@@ -858,6 +862,7 @@ def parse_discovery_fields(value: Any, label: str) -> dict[str, Any]:
 def change_resource(
     discoveries: list[dict[str, Any]],
     *,
+    attempts: list[dict[str, Any]] | None = None,
     predecessors: dict[str, dict[str, Any]] | None = None,
     discovery_input: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
@@ -881,7 +886,9 @@ def change_resource(
                 old = previous.get(field, MISSING)
                 new = current.get(field, MISSING)
                 if old is new or (
-                    old is not MISSING and new is not MISSING and old == new
+                    old is not MISSING
+                    and new is not MISSING
+                    and json_bytes({"v": old}) == json_bytes({"v": new})
                 ):
                     continue
                 changes.append(
@@ -906,9 +913,19 @@ def change_resource(
         reverse=True,
     )
     bounded = changes[:MAX_CHANGES]
-    source_observed_at = discoveries[-1]["observed_at"] if discoveries else None
+    last_change_observed_at = discoveries[-1]["observed_at"] if discoveries else None
+    source_observed_at = (
+        latest_time(
+            attempt["observed_at"]
+            for attempt in attempts or ()
+            if attempt["route"] in ("/config", "/.well-known/agent.json")
+            and is_success(attempt)
+        )
+        or last_change_observed_at
+    )
     coverage = {
         "discovery_snapshots": accepted_snapshots,
+        "last_change_observed_at": last_change_observed_at,
         "records_returned": len(bounded),
         "records_derived": len(changes),
         "truncated": len(changes) > len(bounded),
@@ -1234,6 +1251,7 @@ def build_snapshots_from_records(
     )
     changes, changes_source, changes_coverage = change_resource(
         telemetry["discoveries"],
+        attempts=telemetry["attempts"],
         predecessors=telemetry["discovery_predecessors"],
         discovery_input=telemetry["discovery_input"],
     )

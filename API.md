@@ -32,8 +32,14 @@ Successful responses share these fields:
 - `ledger_chain_head`: present only where a published tick-ledger head applies.
 
 `source_observed_at`, derivation time and publication time remain separate. Rebuilding a frozen
-source cannot make it fresh. Status snapshots are valid for 15 minutes after their newest source
-observation.
+source cannot make it fresh. Status snapshots are valid for 15 minutes after their source
+observation, which is the oldest of the component observations present — the newest accepted
+collector tick and the newest recorded telemetry attempt — so one dead source is never masked by a
+live one. Each component row keeps its own observation time, validity and freshness. Changes
+snapshots take their source observation from the newest successful read of `/config` or
+`/.well-known/agent.json`, so a register re-confirmed unchanged is fresh rather than stale, and
+`coverage.last_change_observed_at` reports when the last stored change was observed, or `null`
+when none has been.
 
 ## Request limits
 

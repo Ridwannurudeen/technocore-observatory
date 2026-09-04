@@ -180,6 +180,49 @@ def test_status_counts_503_attempts_instead_of_reporting_zero_activity(tmp_path)
     assert endpoints["/rooms"]["observed_failures"] == 1
 
 
+@pytest.mark.parametrize(
+    ("tick_at", "attempt_at"),
+    (
+        pytest.param(
+            "2026-08-30T06:00:00Z", "2026-08-30T00:00:00Z", id="dead-pulse-probe"
+        ),
+        pytest.param(
+            "2026-08-30T00:00:00Z", "2026-08-30T06:00:00Z", id="dead-collector"
+        ),
+    ),
+)
+def test_status_envelope_freshness_follows_the_oldest_component(
+    tmp_path,
+    tick_at,
+    attempt_at,
+):
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(ticks, tick(tick_at))
+    with telemetry_database(telemetry) as connection:
+        add_attempt(
+            connection,
+            attempt_id=1,
+            route="/healthz",
+            observed_at=attempt_at,
+            outcome="success",
+            status=200,
+        )
+
+    result = build_snapshots(
+        ticks,
+        telemetry,
+        derived_at="2026-08-30T06:00:10Z",
+        published_at="2026-08-30T06:00:30Z",
+    )["status"]
+
+    assert result["source_observed_at"] == "2026-08-30T00:00:00Z"
+    assert result["valid_until"] == "2026-08-30T00:15:00Z"
+    assert result["freshness"] == "stale"
+    assert result["status"]["origin"]["source_observed_at"] == attempt_at
+    assert result["status"]["collector"]["source_observed_at"] == tick_at
+
+
 def test_snapshot_rejects_a_source_observation_after_derivation(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     telemetry = tmp_path / "telemetry.sqlite3"
@@ -579,6 +622,52 @@ def test_discovery_changes_publish_allowlisted_old_and_new_values(tmp_path):
     ]
 
 
+def test_config_route_limits_are_interpretation_affected():
+    changes, _, _ = change_resource(
+        [
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T00:00:00Z",
+                "fields_json": json.dumps(
+                    {
+                        "settings": {
+                            "dupe_filter_seconds": 60,
+                            "ephemeral_ttl_seconds": 300,
+                            "wait_poll": 1,
+                        }
+                    }
+                ),
+            },
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T01:00:00Z",
+                "fields_json": json.dumps(
+                    {
+                        "settings": {
+                            "dupe_filter_seconds": 90,
+                            "ephemeral_ttl_seconds": 600,
+                            "wait_poll": 2,
+                        }
+                    }
+                ),
+            },
+        ]
+    )
+
+    assert {item["field"]: item["interpretation_affected"] for item in changes} == {
+        "settings.dupe_filter_seconds": True,
+        "settings.ephemeral_ttl_seconds": True,
+        "settings.wait_poll": True,
+    }
+
+
+def test_interpretation_allowlist_carries_no_uncollectable_prefix():
+    assert not snapshots.affects_interpretation("/config", "settings.limit_rooms")
+    assert not snapshots.affects_interpretation("/config", "limits.rooms")
+    assert not snapshots.affects_interpretation("/config", "cadence.seconds")
+    assert not snapshots.affects_interpretation("/.well-known/agent.json", "url")
+
+
 def test_discovery_cap_loads_route_predecessor_and_discloses_cutoff(
     tmp_path,
     monkeypatch,
@@ -662,6 +751,32 @@ def test_discovery_changes_distinguish_explicit_null_from_field_absence():
     assert [(item["old"], item["new"]) for item in reversed(changes)] == [
         (None, {"state": "field_absent"}),
         ({"state": "field_absent"}, None),
+    ]
+
+
+def test_discovery_changes_publish_a_recorded_value_type_flip():
+    changes, _, _ = change_resource(
+        [
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T00:00:00Z",
+                "fields_json": json.dumps(
+                    {"settings": {"fsync": True, "max_rooms": 10}}
+                ),
+            },
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T01:00:00Z",
+                "fields_json": json.dumps(
+                    {"settings": {"fsync": 1, "max_rooms": 10.0}}
+                ),
+            },
+        ]
+    )
+
+    assert [(item["field"], item["old"], item["new"]) for item in changes] == [
+        ("settings.max_rooms", 10, 10.0),
+        ("settings.fsync", True, 1),
     ]
 
 
@@ -962,6 +1077,76 @@ def test_frozen_input_valid_until_never_slides_forward_on_rebuild(tmp_path):
     assert first["freshness"] == second["freshness"] == "stale"
     assert first["derived_at"] != second["derived_at"]
     assert first["published_at"] != second["published_at"]
+
+
+def test_changes_envelope_tracks_the_newest_re_confirmed_discovery_read(tmp_path):
+    ticks = tmp_path / "ticks.jsonl"
+    telemetry = tmp_path / "telemetry.sqlite3"
+    write_ticks(ticks, tick("2026-09-02T19:00:00Z"))
+    with telemetry_database(telemetry) as connection:
+        add_attempt(
+            connection,
+            attempt_id=1,
+            route="/config",
+            observed_at="2026-08-30T19:00:00Z",
+            outcome="success",
+            status=200,
+        )
+        connection.execute(
+            "INSERT INTO discovery_snapshots VALUES (1, 1, '/config', ?, ?, ?)",
+            (
+                "2026-08-30T19:00:00Z",
+                f"{1:064x}",
+                json.dumps({"settings": {"max_rooms": 40_960}}),
+            ),
+        )
+        add_attempt(
+            connection,
+            attempt_id=2,
+            route="/config",
+            observed_at="2026-09-02T18:59:00Z",
+            outcome="success",
+            status=200,
+        )
+
+    result = build_snapshots(
+        ticks,
+        telemetry,
+        derived_at="2026-09-02T19:00:00Z",
+        published_at="2026-09-02T19:00:00Z",
+    )["changes"]
+
+    assert result["source_observed_at"] == "2026-09-02T18:59:00Z"
+    assert result["valid_until"] == "2026-09-02T19:14:00Z"
+    assert result["freshness"] == "fresh"
+    assert result["coverage"]["last_change_observed_at"] == "2026-08-30T19:00:00Z"
+
+
+def test_changes_envelope_falls_back_to_the_last_stored_snapshot_time():
+    _, source_observed_at, coverage = change_resource(
+        [
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T00:00:00Z",
+                "fields_json": json.dumps({"service": "technocore"}),
+            }
+        ],
+        attempts=[
+            {
+                "route": "/config",
+                "observed_at": "2026-08-30T02:00:00Z",
+                "outcome": "http_error",
+            },
+            {
+                "route": "/healthz",
+                "observed_at": "2026-08-30T03:00:00Z",
+                "outcome": "success",
+            },
+        ],
+    )
+
+    assert source_observed_at == "2026-08-30T00:00:00Z"
+    assert coverage["last_change_observed_at"] == "2026-08-30T00:00:00Z"
 
 
 def test_unfinished_cycle_is_unknown_and_never_an_incident(tmp_path):
