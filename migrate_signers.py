@@ -348,6 +348,7 @@ def migrate_signers(
 
         metadata["version"] = SIGNER_STATE_VERSION
         metadata["latest_room_listing_observed_at"] = None
+        metadata.setdefault("revisit_allocation_rotation", 0)
         if cap_hit:
             release = released_at or utc_now()
             try:

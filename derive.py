@@ -281,8 +281,9 @@ def validate_room_sampling(value: Any) -> dict[str, Any] | None:
 def validate_engagement(value: Any) -> dict[str, Any] | None:
     """Validate the service-published engagement object, field by field.
 
-    The collector stores the /rooms `engagement` object verbatim, so its
-    contents are the service's choice, not the collector's. Rejecting the
+    The collector projects the /rooms `engagement` object down to the fields
+    read here, keeping only bool, int, float and null values, so those
+    values are the service's choice, not the collector's. Rejecting the
     whole tick over a malformed field would hand the service a lever to
     invalidate forward-collected history, so this validator never raises:
     a field that is absent or ill-typed becomes None and is published as

@@ -552,3 +552,143 @@ def test_main_collects_then_drains_when_startup_outbox_is_empty(
 
     assert collect.main() == 0
     assert events == ["drain", "collect", "drain"]
+
+
+def test_main_reports_a_committed_tick_whose_publication_is_deferred(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    output = tmp_path / "ticks.jsonl"
+    signer_state_path = tmp_path / "signers.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect.py",
+            "--base-url",
+            "https://example.invalid",
+            "--output",
+            str(output),
+            "--signer-state",
+            str(signer_state_path),
+            "--once",
+        ],
+    )
+    drains = []
+
+    def drain(*args, **kwargs):
+        drains.append("drain")
+        if len(drains) == 1:
+            return False
+        raise OSError("injected failure while publishing the committed tick")
+
+    monkeypatch.setattr(collect, "drain_tick_outbox", drain)
+    monkeypatch.setattr(
+        collect,
+        "collect_tick",
+        lambda *args, **kwargs: {"ignored": "the outbox is authoritative"},
+    )
+
+    assert collect.main() == 1
+
+    reported = capsys.readouterr().err
+    assert "no tick written" not in reported
+    assert "collection committed; publication deferred" in reported
+
+
+def test_main_escapes_and_bounds_an_origin_supplied_error_message(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    output = tmp_path / "ticks.jsonl"
+    signer_state_path = tmp_path / "signers.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect.py",
+            "--base-url",
+            "https://example.invalid",
+            "--output",
+            str(output),
+            "--signer-state",
+            str(signer_state_path),
+            "--once",
+        ],
+    )
+
+    def refuse_to_collect(*args, **kwargs):
+        raise collect.CollectionError("GET /rooms failed: \x1b[2J\rroot" + "A" * 600)
+
+    monkeypatch.setattr(collect, "drain_tick_outbox", lambda *args, **kwargs: False)
+    monkeypatch.setattr(collect, "collect_tick", refuse_to_collect)
+
+    assert collect.main() == 1
+
+    reported = capsys.readouterr().err
+    assert reported.count("\n") == 1
+    assert "\x1b" not in reported
+    assert "\r" not in reported
+    message = reported.split("no tick written: ", 1)[1].removesuffix("\n")
+    assert message.startswith("GET /rooms failed: \\u001b[2J\\rroot")
+    assert len(message) == 512
+
+
+def test_main_walks_the_census_after_draining_a_startup_outbox(tmp_path, monkeypatch):
+    output = tmp_path / "ticks.jsonl"
+    signer_state_path = tmp_path / "signers.json"
+    census_state_path = tmp_path / "census.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect.py",
+            "--base-url",
+            "https://example.invalid",
+            "--output",
+            str(output),
+            "--signer-state",
+            str(signer_state_path),
+            "--census-state",
+            str(census_state_path),
+            "--census",
+        ],
+    )
+    events = []
+
+    def drain(*args, **kwargs):
+        events.append("drain")
+        return True
+
+    def census(client, state_path, pace):
+        events.append("census")
+        return (
+            256,
+            CENSUS_STARTED_AT,
+            {
+                "walk_started_at": CENSUS_STARTED_AT,
+                "shards_outstanding_at_start": 256,
+                "shards_collected": 256,
+                "shards_outstanding": 0,
+                "passes_attempted": 1,
+                "maximum_passes": collect.CENSUS_MAX_PASSES,
+                "deadline_seconds": collect.CENSUS_DEADLINE_SECONDS,
+                "shard_reads_attempted": 256,
+                "shard_read_failures": 0,
+                "failure_causes": {},
+                "stop_reason": "complete",
+            },
+        )
+
+    def collect_once(*args, **kwargs):
+        events.append("collect")
+        return {"ignored": "the outbox is authoritative"}
+
+    monkeypatch.setattr(collect, "drain_tick_outbox", drain)
+    monkeypatch.setattr(collect, "run_census", census)
+    monkeypatch.setattr(collect, "collect_tick", collect_once)
+
+    assert collect.main() == 0
+    assert events == ["drain", "census", "collect", "drain"]
