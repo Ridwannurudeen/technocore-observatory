@@ -1198,8 +1198,15 @@ def test_head_and_disallowed_methods_have_exact_method_semantics(
     assert body
 
 
-def test_idle_connections_are_bounded_by_a_socket_timeout():
-    assert query_service.ObservatoryRequestHandler.timeout == 10
+def test_idle_connections_are_bounded_by_a_socket_timeout(running_server):
+    client = socket.create_connection(
+        ("127.0.0.1", running_server.server_address[1]), timeout=5
+    )
+    client.settimeout(15)
+    try:
+        assert client.recv(1) == b""
+    finally:
+        client.close()
 
 
 def test_query_concurrency_limit_rejects_excess_work_and_releases_slot(
