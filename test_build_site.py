@@ -1,10 +1,13 @@
+import http.server
 import json
 import os
 import re
 import stat
 import struct
 import sys
+import threading
 import types
+import urllib.parse
 from datetime import timedelta
 from pathlib import Path
 
@@ -47,8 +50,11 @@ EXPECTED_FILES = {
     "favicon.ico",
     "og.png",
     "assets/favicon.svg",
+    "assets/home-motion.js",
     "assets/styles.css",
     "assets/site.js",
+    "assets/vendor/MOTION-LICENSE.txt",
+    "assets/vendor/motion-13.1.1.min.js",
     "data.json",
 }
 
@@ -109,6 +115,95 @@ def built_release(tmp_path):
     return release, hostile_name
 
 
+@pytest.fixture
+def served_release(built_release):
+    release, _ = built_release
+    requested_paths = []
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(release), **kwargs)
+
+        def do_GET(self):
+            requested_paths.append(self.path)
+            super().do_GET()
+
+        def log_message(self, format, *args):
+            return None
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", requested_paths
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+HOME_MOTION_NARRATIVE_SELECTOR = ", ".join(
+    (
+        ".home-retention > div:first-child",
+        ".home-section-heading",
+        ".home-history-links > a",
+        ".home-api > div:first-child",
+        ".home-api-example",
+        ".home-boundary",
+    )
+)
+HOME_MOTION_FACT_SELECTOR = ", ".join(
+    (".room-search", ".home-reading", ".home-readings", ".evidence-rail")
+)
+
+
+def record_home_animations(page, *, pause=False):
+    pause_animation = "animation.pause();" if pause else ""
+    page.add_init_script(
+        "(() => {"
+        " const nativeAnimate = Element.prototype.animate;"
+        " window.__homeMotionCalls = [];"
+        " Element.prototype.animate = function (keyframes, options) {"
+        "   const animation = nativeAnimate.call(this, keyframes, options);"
+        "   const record = {"
+        "     element: this, animation, finished: false, rejected: false"
+        "   };"
+        "   animation.finished.then("
+        "     () => { record.finished = true; },"
+        "     () => { record.rejected = true; }"
+        "   );"
+        f"   {pause_animation}"
+        "   window.__homeMotionCalls.push(record);"
+        "   return animation;"
+        " };"
+        "})();"
+    )
+
+
+def assert_home_elements_visible_and_untransformed(page, selector):
+    states = page.locator(selector).evaluate_all(
+        "elements => elements.map(element => {"
+        " const style = getComputedStyle(element);"
+        " return {"
+        "   opacity: style.opacity,"
+        "   visibility: style.visibility,"
+        "   display: style.display,"
+        "   transformIdentity: style.transform === 'none'"
+        "     || new DOMMatrixReadOnly(style.transform).isIdentity"
+        " };"
+        "})"
+    )
+    assert states
+    for state in states:
+        assert state == {
+            "opacity": "1",
+            "visibility": "visible",
+            "display": state["display"],
+            "transformIdentity": True,
+        }
+        assert state["display"] != "none"
+
+
 def test_static_build_is_complete_versioned_and_contains_no_room_names(built_release):
     release, hostile_name = built_release
     files = {
@@ -119,6 +214,15 @@ def test_static_build_is_complete_versioned_and_contains_no_room_names(built_rel
 
     assert release.parent.name == "releases"
     assert EXPECTED_FILES <= files
+    for relative in (
+        "home-motion.js",
+        "vendor/MOTION-LICENSE.txt",
+        "vendor/motion-13.1.1.min.js",
+    ):
+        assert (release / "assets" / relative).read_bytes() == (
+            Path("site/assets") / relative
+        ).read_bytes()
+    assert not (release / "assets/vendor/README.md").exists()
     for resource in ("status", "incidents", "changes", "methodology"):
         plain = (release / "api/v1" / resource).read_bytes()
         assert plain == (release / "api/v1" / f"{resource}.txt").read_bytes()
@@ -243,6 +347,17 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     assert "zero origin reads" in rooms.lower()
     assert "untrusted labels" in rooms.lower()
     assert "not observed is not absent" in (home + rooms).lower()
+    assert '<link rel="stylesheet" href="assets/styles.css?v=home-motion-1">' in home
+    assert (
+        '<link rel="stylesheet" href="../assets/styles.css?v=home-motion-1">' in rooms
+    )
+    vendor_script = '<script src="assets/vendor/motion-13.1.1.min.js" defer></script>'
+    motion_script = '<script src="assets/home-motion.js?v=1" defer></script>'
+    assert vendor_script in home
+    assert motion_script in home
+    assert home.index(vendor_script) < home.index(motion_script)
+    assert "motion-13.1.1.min.js" not in rooms
+    assert "home-motion.js" not in rooms
     assert 'class="evidence-rail"' in home
     assert "<dt>Observed</dt>" in home
     assert "Collector tick observed" not in home
@@ -281,6 +396,544 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     assert ".textContent" in script
     assert "\u00e2" not in home + rooms + script
     assert "\u00c2" not in home + rooms + script
+
+
+def test_homepage_endpoint_preview_names_its_counted_telemetry_window(
+    built_release,
+):
+    release, _ = built_release
+    home = (release / "index.html").read_text(encoding="utf-8")
+    status = json.loads((release / "api/v1/status.json").read_text(encoding="utf-8"))
+    coverage = status["coverage"]["telemetry"]
+    endpoint_row = re.search(r"<div>\s*<dt>Endpoint evidence\b.*?</div>", home, re.S)
+
+    assert endpoint_row is not None
+    assert coverage["from"] in endpoint_row.group(0)
+    assert coverage["to"] in endpoint_row.group(0)
+
+
+def test_homepage_room_search_submits_a_native_local_encoded_get(served_release):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, requested_paths = served_release
+    base = urllib.parse.urlsplit(base_url)
+    query = '"><script>& room'
+    expected_target = "/rooms/?" + urllib.parse.urlencode({"q": query})
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            for java_script_enabled in (False, True):
+                context = browser.new_context(
+                    java_script_enabled=java_script_enabled,
+                    viewport={"width": 1440, "height": 900},
+                )
+                page = context.new_page()
+                request_urls = []
+                navigation_urls = []
+
+                def record_request(request):
+                    request_urls.append(request.url)
+                    if request.is_navigation_request():
+                        navigation_urls.append(request.url)
+
+                page.on("request", record_request)
+                page.goto(f"{base_url}/")
+                navigation_urls.clear()
+
+                assert (
+                    page.get_by_role(
+                        "heading",
+                        name="Find the rooms. Read the evidence.",
+                        exact=True,
+                    ).count()
+                    == 1
+                )
+                search = page.locator(".room-search")
+                query_input = search.locator("#room-query")
+                submit = page.get_by_role("button", name="Search rooms", exact=True)
+                assert search.locator("#search-feedback").count() == 1
+                assert page.locator(".evidence-rail").count() == 1
+
+                submit.click()
+                assert query_input.evaluate("input => input.validity.valueMissing")
+                assert page.url == f"{base_url}/"
+                assert navigation_urls == []
+
+                query_input.fill(query)
+                with page.expect_navigation(wait_until="load"):
+                    submit.click()
+
+                target = urllib.parse.urlsplit(page.url)
+                assert target.path == "/rooms/"
+                assert urllib.parse.parse_qs(target.query, strict_parsing=True) == {
+                    "q": [query]
+                }
+                assert navigation_urls == [f"{base_url}{expected_target}"]
+                assert expected_target in requested_paths
+                assert request_urls
+                for request_url in request_urls:
+                    requested = urllib.parse.urlsplit(request_url)
+                    assert (
+                        requested.scheme,
+                        requested.hostname,
+                        requested.port,
+                    ) == (base.scheme, base.hostname, base.port)
+                context.close()
+        finally:
+            browser.close()
+
+
+def test_homepage_search_action_stays_above_the_fold(served_release):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, _ = served_release
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            for label, width, height in (
+                ("desktop", 1440, 900),
+                ("small mobile", 375, 667),
+                ("mobile", 375, 812),
+            ):
+                page = browser.new_page(viewport={"width": width, "height": height})
+                page.goto(f"{base_url}/")
+                submit = page.locator(".room-search button[type=submit]")
+                box = submit.bounding_box()
+
+                assert box is not None, label
+                assert box["x"] >= 0, label
+                assert box["x"] + box["width"] <= width, label
+                assert box["y"] >= 0, label
+                assert box["y"] + box["height"] <= height, label
+                assert submit.evaluate(
+                    "button => {"
+                    " const box = button.getBoundingClientRect();"
+                    " const hit = document.elementFromPoint("
+                    "   box.left + box.width / 2, box.top + box.height / 2"
+                    " );"
+                    " return hit === button || button.contains(hit);"
+                    "}"
+                ), label
+                if label == "desktop":
+                    assert box["y"] < height * 0.7
+                page.close()
+        finally:
+            browser.close()
+
+
+def test_homepage_stylesheet_bypasses_a_cached_bare_asset_url(served_release):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, _ = served_release
+    expected_url = f"{base_url}/assets/styles.css?v=home-motion-1"
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            intercepted_urls = []
+            stylesheet_responses = []
+
+            def is_bare_stylesheet(url):
+                target = urllib.parse.urlsplit(url)
+                return target.path == "/assets/styles.css" and not target.query
+
+            def serve_stale_stylesheet(route):
+                intercepted_urls.append(route.request.url)
+                route.fulfill(
+                    status=200,
+                    content_type="text/css",
+                    body=".home-hero { display: block; }",
+                )
+
+            def record_stylesheet_response(response):
+                if urllib.parse.urlsplit(response.url).path == "/assets/styles.css":
+                    stylesheet_responses.append((response.url, response.status))
+
+            page.route(is_bare_stylesheet, serve_stale_stylesheet)
+            page.on("response", record_stylesheet_response)
+            page.goto(f"{base_url}/")
+
+            assert (
+                page.locator(".home-hero").evaluate(
+                    "hero => getComputedStyle(hero).display"
+                )
+                == "grid"
+            )
+            assert intercepted_urls == []
+            assert stylesheet_responses == [(expected_url, 200)]
+            page.close()
+        finally:
+            browser.close()
+
+
+def test_home_motion_does_not_reposition_static_narrative_when_loaded_late(
+    served_release,
+):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, _ = served_release
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            motion_requests = 0
+
+            def replace_initial_motion_script(route):
+                nonlocal motion_requests
+                motion_requests += 1
+                if motion_requests == 1:
+                    route.fulfill(
+                        status=200,
+                        content_type="application/javascript",
+                        body="",
+                    )
+                else:
+                    route.continue_()
+
+            page.route(
+                lambda url: urllib.parse.urlsplit(url).path == "/assets/home-motion.js",
+                replace_initial_motion_script,
+            )
+            record_home_animations(page, pause=True)
+            page.goto(f"{base_url}/")
+            narrative = page.locator(".home-retention > div:first-child")
+            narrative.scroll_into_view_if_needed()
+            before = narrative.bounding_box()
+            assert before is not None
+            assert_home_elements_visible_and_untransformed(
+                page, ".home-retention > div:first-child"
+            )
+
+            page.add_script_tag(url=f"{base_url}/assets/home-motion.js?v=late")
+            page.wait_for_timeout(100)
+            after = narrative.bounding_box()
+            assert after is not None
+            calls = page.evaluate(
+                "element => window.__homeMotionCalls.filter("
+                " call => call.element === element"
+                ").length",
+                narrative.element_handle(),
+            )
+
+            assert motion_requests == 2
+            assert calls == 0
+            assert after["x"] == pytest.approx(before["x"])
+            assert after["y"] == pytest.approx(before["y"])
+            page.close()
+        finally:
+            browser.close()
+
+
+def test_home_motion_runs_once_finishes_and_never_targets_facts(served_release):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, _ = served_release
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            asset_responses = []
+            page_errors = []
+            page.on(
+                "response",
+                lambda response: (
+                    asset_responses.append(
+                        (urllib.parse.urlsplit(response.url).path, response.status)
+                    )
+                    if urllib.parse.urlsplit(response.url).path
+                    in (
+                        "/assets/home-motion.js",
+                        "/assets/vendor/motion-13.1.1.min.js",
+                    )
+                    else None
+                ),
+            )
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            record_home_animations(page)
+            page.goto(f"{base_url}/")
+
+            assert sorted(asset_responses) == [
+                ("/assets/home-motion.js", 200),
+                ("/assets/vendor/motion-13.1.1.min.js", 200),
+            ]
+            assert page_errors == []
+            edges = page.locator(".home-frame-edge")
+            assert edges.count() == 4
+            page.wait_for_function(
+                "() => window.__homeMotionCalls.filter("
+                " call => call.element.matches('.home-frame-edge')"
+                ").length === 4"
+            )
+            narrative = page.locator(HOME_MOTION_NARRATIVE_SELECTOR)
+            assert narrative.count() == 7
+            for index in range(narrative.count()):
+                narrative.nth(index).scroll_into_view_if_needed()
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame("
+                " () => requestAnimationFrame(resolve)"
+                "))"
+            )
+
+            boundary = page.locator(".home-boundary")
+            calls_before_reentry = page.evaluate("window.__homeMotionCalls.length")
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_function(
+                "element => element.getBoundingClientRect().top > innerHeight",
+                arg=boundary.element_handle(),
+            )
+            boundary.scroll_into_view_if_needed()
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame("
+                " () => requestAnimationFrame(resolve)"
+                "))"
+            )
+            assert (
+                page.evaluate("window.__homeMotionCalls.length") == calls_before_reentry
+            )
+            page.wait_for_function(
+                "() => window.__homeMotionCalls.every(call => call.finished)"
+            )
+            page.wait_for_function(
+                "() => getComputedStyle(document.querySelector("
+                " '.home-reading-frame'"
+                ")).opacity === '0'"
+            )
+            audit = page.evaluate(
+                "({ narrativeSelector, factSelector }) => {"
+                " const calls = window.__homeMotionCalls;"
+                " const edges = Array.from(document.querySelectorAll("
+                "   '.home-frame-edge'"
+                " ));"
+                " const narrative = Array.from(document.querySelectorAll("
+                "   narrativeSelector"
+                " ));"
+                " const facts = Array.from(document.querySelectorAll(factSelector));"
+                " const countFor = element => calls.filter("
+                "   call => call.element === element"
+                " ).length;"
+                " const durationsFor = element => calls.filter("
+                "   call => call.element === element"
+                " ).map(call => call.animation.effect.getComputedTiming().duration);"
+                " const ignoredKeys = new Set(["
+                "   'offset', 'computedOffset', 'easing', 'composite'"
+                " ]);"
+                " const propertiesFor = element => Array.from(new Set("
+                "   calls.filter(call => call.element === element).flatMap("
+                "     call => call.animation.effect.getKeyframes().flatMap("
+                "       frame => Object.keys(frame).filter("
+                "         key => !ignoredKeys.has(key)"
+                "       )"
+                "     )"
+                "   )"
+                " )).sort();"
+                " return {"
+                "   edgeCounts: edges.map(countFor),"
+                "   narrativeCounts: narrative.map(countFor),"
+                "   edgeProperties: edges.map(propertiesFor),"
+                "   narrativeProperties: narrative.map(propertiesFor),"
+                "   edgeDurations: edges.flatMap(durationsFor),"
+                "   narrativeDurations: narrative.flatMap(durationsFor),"
+                "   rejected: calls.filter(call => call.rejected).length,"
+                "   unexpectedTargets: calls.filter(call => "
+                "     !edges.includes(call.element)"
+                "     && !narrative.includes(call.element)"
+                "   ).length,"
+                "   factTargets: calls.filter(call => facts.some("
+                "     fact => call.element === fact || call.element.contains(fact)"
+                "   )).length"
+                " };"
+                "}",
+                {
+                    "narrativeSelector": HOME_MOTION_NARRATIVE_SELECTOR,
+                    "factSelector": HOME_MOTION_FACT_SELECTOR,
+                },
+            )
+            assert audit["edgeCounts"] == [1, 1, 1, 1]
+            assert audit["narrativeCounts"] == [0] * narrative.count()
+            assert audit["edgeProperties"] == [["transform"]] * edges.count()
+            assert audit["narrativeProperties"] == [[]] * narrative.count()
+            assert audit["rejected"] == 0
+            assert audit["unexpectedTargets"] == 0
+            assert audit["factTargets"] == 0
+            assert all(0 < duration <= 1200 for duration in audit["edgeDurations"])
+            assert audit["narrativeDurations"] == []
+            assert_home_elements_visible_and_untransformed(
+                page, HOME_MOTION_FACT_SELECTOR
+            )
+            page.close()
+        finally:
+            browser.close()
+
+
+def test_home_motion_falls_back_to_static_content_without_script_or_vendor(
+    served_release,
+):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, _ = served_release
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            context = browser.new_context(
+                java_script_enabled=False,
+                viewport={"width": 1440, "height": 900},
+            )
+            page = context.new_page()
+            page.goto(f"{base_url}/")
+            assert page.locator('script[src*="home-motion.js"]').count() == 1
+            assert page.locator(".home-frame-edge").count() == 4
+            assert_home_elements_visible_and_untransformed(
+                page, HOME_MOTION_NARRATIVE_SELECTOR
+            )
+            assert_home_elements_visible_and_untransformed(
+                page, HOME_MOTION_FACT_SELECTOR
+            )
+            form = page.locator(".room-search")
+            assert form.get_attribute("method") == "get"
+            assert form.get_attribute("action") == "/rooms/"
+            assert form.locator("#room-query").get_attribute("required") is not None
+            context.close()
+
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            page = context.new_page()
+            aborted_vendor_urls = []
+            page_errors = []
+
+            def is_local_script(url):
+                target = urllib.parse.urlsplit(url)
+                return target.path.startswith("/assets/") and target.path.endswith(
+                    ".js"
+                )
+
+            def abort_vendor(route):
+                path = urllib.parse.urlsplit(route.request.url).path
+                if path.endswith(("/site.js", "/home-motion.js")):
+                    route.continue_()
+                    return
+                aborted_vendor_urls.append(route.request.url)
+                route.abort()
+
+            page.route(is_local_script, abort_vendor)
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
+            page.goto(f"{base_url}/")
+            assert len(aborted_vendor_urls) == 1
+            assert page_errors == []
+            assert_home_elements_visible_and_untransformed(
+                page, HOME_MOTION_NARRATIVE_SELECTOR
+            )
+            assert_home_elements_visible_and_untransformed(
+                page, HOME_MOTION_FACT_SELECTOR
+            )
+            context.close()
+        finally:
+            browser.close()
+
+
+def test_home_motion_honors_initial_and_runtime_reduced_motion(served_release):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, _ = served_release
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            context = browser.new_context(
+                reduced_motion="reduce",
+                viewport={"width": 1440, "height": 900},
+            )
+            page = context.new_page()
+            record_home_animations(page)
+            page.goto(f"{base_url}/")
+            assert page.locator('script[src*="home-motion.js"]').count() == 1
+            narrative = page.locator(HOME_MOTION_NARRATIVE_SELECTOR)
+            assert narrative.count() == 7
+            for index in range(narrative.count()):
+                narrative.nth(index).scroll_into_view_if_needed()
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame("
+                " () => requestAnimationFrame(resolve)"
+                "))"
+            )
+            assert page.evaluate("window.__homeMotionCalls.length") == 0
+            assert_home_elements_visible_and_untransformed(
+                page, HOME_MOTION_NARRATIVE_SELECTOR
+            )
+            assert_home_elements_visible_and_untransformed(
+                page, HOME_MOTION_FACT_SELECTOR
+            )
+            context.close()
+
+            context = browser.new_context(
+                reduced_motion="no-preference",
+                viewport={"width": 1440, "height": 900},
+            )
+            page = context.new_page()
+            record_home_animations(page, pause=True)
+            page.goto(f"{base_url}/")
+            page.wait_for_function("window.__homeMotionCalls.length === 4")
+            narrative = page.locator(HOME_MOTION_NARRATIVE_SELECTOR)
+            started = page.evaluate("window.__homeMotionCalls.length")
+            assert page.evaluate(
+                "selector => Array.from(document.querySelectorAll(selector)).some("
+                " element => !window.__homeMotionCalls.some("
+                "   call => call.element === element"
+                " )"
+                ")",
+                HOME_MOTION_NARRATIVE_SELECTOR,
+            )
+
+            page.emulate_media(reduced_motion="reduce")
+            page.wait_for_function(
+                "window.__homeMotionCalls.every(call => "
+                " ['finished', 'idle'].includes(call.animation.playState))"
+            )
+            for index in range(narrative.count()):
+                narrative.nth(index).scroll_into_view_if_needed()
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame("
+                " () => requestAnimationFrame(resolve)"
+                "))"
+            )
+            assert page.evaluate("window.__homeMotionCalls.length") == started
+            assert_home_elements_visible_and_untransformed(
+                page, HOME_MOTION_NARRATIVE_SELECTOR
+            )
+            assert_home_elements_visible_and_untransformed(
+                page, HOME_MOTION_FACT_SELECTOR
+            )
+
+            page.emulate_media(reduced_motion="no-preference")
+            for index in range(narrative.count()):
+                narrative.nth(index).scroll_into_view_if_needed()
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame("
+                " () => requestAnimationFrame(resolve)"
+                "))"
+            )
+            assert page.evaluate("window.__homeMotionCalls.length") == started
+            context.close()
+        finally:
+            browser.close()
 
 
 def test_pages_publish_canonical_icon_and_generic_social_cards(built_release):
