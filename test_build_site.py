@@ -273,6 +273,8 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     assert "zero origin reads" in rooms.lower()
     assert "untrusted labels" in rooms.lower()
     assert "not observed is not absent" in (home + rooms).lower()
+    assert '<link rel="stylesheet" href="assets/styles.css?v=2358166">' in home
+    assert '<link rel="stylesheet" href="../assets/styles.css?v=2358166">' in rooms
     assert 'class="evidence-rail"' in home
     assert "<dt>Observed</dt>" in home
     assert "Collector tick observed" not in home
@@ -424,6 +426,54 @@ def test_homepage_search_action_stays_above_the_fold(served_release):
                 if label == "desktop":
                     assert box["y"] < height * 0.7
                 page.close()
+        finally:
+            browser.close()
+
+
+def test_homepage_stylesheet_bypasses_a_cached_bare_asset_url(served_release):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, _ = served_release
+    expected_url = f"{base_url}/assets/styles.css?v=2358166"
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            intercepted_urls = []
+            stylesheet_responses = []
+
+            def is_bare_stylesheet(url):
+                target = urllib.parse.urlsplit(url)
+                return target.path == "/assets/styles.css" and not target.query
+
+            def serve_stale_stylesheet(route):
+                intercepted_urls.append(route.request.url)
+                route.fulfill(
+                    status=200,
+                    content_type="text/css",
+                    body=".home-hero { display: block; }",
+                )
+
+            def record_stylesheet_response(response):
+                if urllib.parse.urlsplit(response.url).path == "/assets/styles.css":
+                    stylesheet_responses.append((response.url, response.status))
+
+            page.route(is_bare_stylesheet, serve_stale_stylesheet)
+            page.on("response", record_stylesheet_response)
+            page.goto(f"{base_url}/")
+
+            assert (
+                page.locator(".home-hero").evaluate(
+                    "hero => getComputedStyle(hero).display"
+                )
+                == "grid"
+            )
+            assert intercepted_urls == []
+            assert stylesheet_responses == [(expected_url, 200)]
+            page.close()
         finally:
             browser.close()
 
