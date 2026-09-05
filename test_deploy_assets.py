@@ -1423,7 +1423,7 @@ def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
         "api/v1/status`" in finding and "text_bytes" in finding for finding in findings
     )
     status_extensionless.write_bytes(original_status_extensionless)
-    script_path = release / "assets/site.js"
+    script_path = release / "assets/vendor/motion-13.1.1.min.js"
     script = script_path.read_text(encoding="utf-8")
     script_path.write_text(
         script + "\ndocument.body.innerHTML = location.search;\n", encoding="utf-8"

@@ -86,8 +86,11 @@ STATIC_RELEASE_FILES = frozenset(
         "api/v1/status.json",
         "api/v1/status.txt",
         "assets/favicon.svg",
+        "assets/home-motion.js",
         "assets/site.js",
         "assets/styles.css",
+        "assets/vendor/MOTION-LICENSE.txt",
+        "assets/vendor/motion-13.1.1.min.js",
         "changes/index.html",
         "data.json",
         "favicon.ico",
@@ -634,9 +637,13 @@ def guard_static_release(root: Path) -> list[str]:
         if EXTERNAL_STYLE.search(source):
             failures.append(f"`{relative}` loads an external resource")
     script_sources = [
-        ("assets/site.js", (root / "assets/site.js").read_text(encoding="utf-8")),
-        *inline_scripts,
+        (
+            script.relative_to(root).as_posix(),
+            script.read_text(encoding="utf-8"),
+        )
+        for script in sorted((root / "assets").rglob("*.js"))
     ]
+    script_sources.extend(inline_scripts)
     for relative, source in script_sources:
         if EXTERNAL_SCRIPT.search(source):
             failures.append(f"`{relative}` calls an external origin")

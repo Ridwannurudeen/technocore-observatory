@@ -812,7 +812,18 @@ def build_release(
         assets.mkdir()
         shutil.copy2(SITE_ROOT / "assets" / "styles.css", assets / "styles.css")
         shutil.copy2(SITE_ROOT / "assets" / "site.js", assets / "site.js")
+        shutil.copy2(SITE_ROOT / "assets" / "home-motion.js", assets / "home-motion.js")
         shutil.copy2(SITE_ROOT / "assets" / "favicon.svg", assets / "favicon.svg")
+        vendor = assets / "vendor"
+        vendor.mkdir()
+        shutil.copy2(
+            SITE_ROOT / "assets" / "vendor" / "motion-13.1.1.min.js",
+            vendor / "motion-13.1.1.min.js",
+        )
+        shutil.copy2(
+            SITE_ROOT / "assets" / "vendor" / "MOTION-LICENSE.txt",
+            vendor / "MOTION-LICENSE.txt",
+        )
         shutil.copy2(SITE_ROOT / "assets" / "favicon.ico", temporary / "favicon.ico")
         shutil.copy2(SITE_ROOT / "assets" / "og.png", temporary / "og.png")
 

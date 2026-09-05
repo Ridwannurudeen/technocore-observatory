@@ -1055,6 +1055,7 @@ body[data-page="home"] {
 
 .home-intro .search-line button {
   padding-inline: var(--space-2);
+  transition: background-color 160ms ease, color 160ms ease;
 }
 
 .home-intro .search-line input {
@@ -1067,6 +1068,27 @@ body[data-page="home"] {
   gap: var(--space-2);
   align-items: center;
   font-weight: 600;
+}
+
+.home-text-link > span,
+.home-link-label > span,
+.home-api-links a > span {
+  display: inline-block;
+  transition: transform 160ms ease;
+}
+
+.home-text-link:focus-visible > span,
+.home-history-links > a:focus-visible .home-link-label > span,
+.home-api-links a:focus-visible > span {
+  transform: translate(3px, -3px);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .home-text-link:hover > span,
+  .home-history-links > a:hover .home-link-label > span,
+  .home-api-links a:hover > span {
+    transform: translate(3px, -3px);
+  }
 }
 
 .home-affiliation {
@@ -1085,9 +1107,57 @@ body[data-page="home"] {
   --danger: #F27D73;
   --missing: #B7AA99;
   --line: #606C63;
+  position: relative;
   border: 1px solid var(--line);
   background: #171B18;
   color: var(--text);
+}
+
+.home-reading-frame {
+  position: absolute;
+  inset: -1px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
+
+.home-frame-edge {
+  position: absolute;
+  background: var(--accent);
+}
+
+.home-frame-top,
+.home-frame-bottom {
+  left: 0;
+  width: 100%;
+  height: 1px;
+}
+
+.home-frame-top {
+  top: 0;
+  transform-origin: left;
+}
+
+.home-frame-bottom {
+  bottom: 0;
+  transform-origin: right;
+}
+
+.home-frame-right,
+.home-frame-left {
+  top: 0;
+  width: 1px;
+  height: 100%;
+}
+
+.home-frame-right {
+  right: 0;
+  transform-origin: top;
+}
+
+.home-frame-left {
+  left: 0;
+  transform-origin: bottom;
 }
 
 .home-reading-heading,
@@ -1220,6 +1290,7 @@ body[data-page="home"] {
   border: 1px solid var(--line);
   color: var(--text);
   text-decoration: none;
+  transition: background-color 160ms ease;
 }
 
 .home-history-links > a + a {
@@ -1546,6 +1617,16 @@ body[data-page="home"] {
     scroll-behavior: auto;
   }
 
+  .home-reading-frame {
+    display: none;
+  }
+
+  .home-text-link > span,
+  .home-link-label > span,
+  .home-api-links a > span {
+    transform: none !important;
+  }
+
   *,
   *::before,
   *::after {
@@ -1587,7 +1668,8 @@ body[data-page="home"] {
   .site-header,
   .room-search,
   .search-feedback,
-  .machine-links {
+  .machine-links,
+  .home-reading-frame {
     display: none;
   }
 
