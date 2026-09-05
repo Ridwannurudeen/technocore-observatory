@@ -603,6 +603,108 @@ def embedded_data(source):
     return json.loads(match.group(1))
 
 
+def test_embedded_rich_fixture_points_are_bounded_rendering_data(tmp_path):
+    record = tick(
+        "2026-08-31T12:00:00Z",
+        collector_version="2.12.0",
+        room_lifecycle=lifecycle_2_12(),
+        room_lifecycle_sampling=lifecycle_sampling(),
+        room_sampling=manifest(
+            *(f"{index:016x}" for index in range(80)),
+            frame_size=200,
+            read_budget=80,
+        ),
+        signer_funnel=funnel(),
+    )
+    record["engagement"] = engagement()
+    ledger = tmp_path / "ticks.jsonl"
+    ledger.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    data, _ = derive.derive_jsonl(ledger)
+    original = deepcopy(data)
+    path = tmp_path / "index.html"
+    path.write_text(html_template(), encoding="utf-8")
+
+    inject_html(path, data)
+
+    embedded = embedded_data(path.read_text(encoding="utf-8"))
+    point = embedded["points"][0]
+    point_bytes = len(
+        json.dumps(point, ensure_ascii=False, separators=(",", ":")).encode()
+    )
+    assert point_bytes <= 12_000
+    assert set(embedded) == set(derive.EMBEDDED_DATA_FIELDS)
+    assert set(point) == set(derive.EMBEDDED_POINT_FIELDS)
+    assert set(point["rates"]) == set(derive.EMBEDDED_RATE_METRICS)
+    assert set(point["rate_display"]) <= set(derive.EMBEDDED_RATE_METRICS)
+    assert set(point["composition"]) == {"counts", "samples", "complete"}
+    assert set(point["composition"]["counts"]) == set(derive.CLASSES)
+    assert set(point["census_display"]) == {"value_text", "context"}
+    assert set(point["signer_funnel"]) == {"display"}
+    funnel_display = point["signer_funnel"]["display"]
+    assert set(funnel_display) == {
+        "census",
+        "stages",
+        "warning",
+        "coverage_text",
+        "tracked_text",
+    }
+    assert set(funnel_display["census"]) == {"value_text", "context"}
+    assert all(
+        set(stage) == {"key", "value_text", "context", "width_percent"}
+        for stage in funnel_display["stages"]
+    )
+    assert "room_lifecycle" not in point
+    assert "room_sampling" not in point
+    assert "room_lifecycle_sampling" not in point
+    assert derive.EMBEDDED_HISTORY_CLAIM in data["methodology"]["history"]
+    assert derive.EMBEDDED_HISTORY_DISCLOSURE in embedded["methodology"]["history"]
+    assert data == original
+    assert len(data["points"][0]["room_lifecycle"]["revisits"]) == 40
+
+
+def test_embedded_history_keeps_only_fields_consumed_by_the_chart(tmp_path):
+    data = derive_records(
+        [
+            tick("2026-08-01T08:00:00Z"),
+            tick(
+                "2026-08-03T08:00:00Z",
+                event_seq=30_001,
+                lobby=5_001,
+                notes=1_001,
+            ),
+        ]
+    )
+    full_bucket = next(
+        bucket
+        for level in data["history"]["rollup_levels"]
+        for bucket in level["buckets"]
+        if bucket is not None
+    )
+    path = tmp_path / "index.html"
+    path.write_text(html_template(), encoding="utf-8")
+
+    inject_html(path, data)
+
+    embedded = embedded_data(path.read_text(encoding="utf-8"))
+    history = embedded["history"]
+    bucket = next(
+        item
+        for level in history["rollup_levels"]
+        for item in level["buckets"]
+        if item is not None
+    )
+    assert set(history) == set(derive.EMBEDDED_HISTORY_FIELDS)
+    assert all(
+        set(level) == set(derive.EMBEDDED_ROLLUP_LEVEL_FIELDS)
+        for level in history["rollup_levels"]
+    )
+    assert set(bucket) == set(derive.EMBEDDED_ROLLUP_BUCKET_FIELDS)
+    assert set(bucket["first"]) == {"ts", *derive.ROLLUP_VALUE_FIELDS}
+    assert set(bucket["last"]) == {"ts", *derive.ROLLUP_VALUE_FIELDS}
+    assert {"min", "max", "ratios", "observation_count"} <= set(full_bucket)
+    assert {"min", "max", "ratios", "observation_count"}.isdisjoint(bucket)
+
+
 def test_methodology_version_is_bumped_for_lifecycle_sampling_evidence():
     result = derive_records([])
     assert derive.METHODOLOGY_VERSION == "1.16.0"
@@ -873,7 +975,7 @@ def test_failed_lifecycle_revisit_cannot_claim_absent_activity():
     assert display["failures"]["value_text"] == "1"
 
 
-def test_room_generation_and_superseded_outcome_survive_static_evidence(tmp_path):
+def test_room_generation_evidence_stays_in_data_but_not_the_rendering_copy(tmp_path):
     value = lifecycle(failed=0, successful=1, second=1)
     stable_id = value["revisits"][0]["id"]
     value["due_this_tick"] = 2
@@ -918,10 +1020,13 @@ def test_room_generation_and_superseded_outcome_survive_static_evidence(tmp_path
     path = tmp_path / "index.html"
     path.write_text(html_template(), encoding="utf-8")
     inject_html(path, result)
-    embedded_revisits = embedded_data(path.read_text(encoding="utf-8"))["points"][0][
-        "room_lifecycle"
-    ]["revisits"]
-    assert embedded_revisits == revisits
+    embedded_point = embedded_data(path.read_text(encoding="utf-8"))["points"][0]
+    assert "room_lifecycle" not in embedded_point
+    assert (
+        embedded_point["room_lifecycle_display"]
+        == (result["points"][0]["room_lifecycle_display"])
+    )
+    assert result["points"][0]["room_lifecycle"]["revisits"] == revisits
     assert (
         "1 older creation cohort finalized as superseded without an origin read"
         in (result["points"][0]["room_lifecycle_display"]["coverage_text"])
@@ -2509,12 +2614,16 @@ def test_server_rendered_values_match_embedded_newest_observation(tmp_path):
     assert rendered_ssr(source, "hero-value") == (
         f"{newest['observed_public_rooms']:,} observed"
     )
-    assert rendered_ssr(source, "identity-total") == f"{newest['identity_total']:,}"
-    assert rendered_ssr(source, "notes-cap-count") == (
-        f"{newest['capacity']['notes']['total']:,} / {newest['capacity']['notes']['cap']:,}"
+    assert (
+        rendered_ssr(source, "identity-total") == newest["census_display"]["value_text"]
     )
-    assert rendered_ssr(source, "rooms-cap-count") == (
-        f"{newest['capacity']['rooms']['total']:,} / {newest['capacity']['rooms']['cap']:,}"
+    assert (
+        rendered_ssr(source, "notes-cap-count")
+        == newest["capacity_display"]["notes"]["count_text"]
+    )
+    assert (
+        rendered_ssr(source, "rooms-cap-count")
+        == newest["capacity_display"]["rooms"]["count_text"]
     )
     assert rendered_ssr(source, "funnel-observed") == "21,104"
     assert rendered_ssr(source, "funnel-sustained") == "1,270"

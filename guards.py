@@ -195,17 +195,40 @@ def guard_zero_width_render(html_path: Path) -> list[str]:
 
 
 def read_paths(html: str) -> set[str]:
-    """Payload paths the page's JavaScript reads, as `data.x` / `point.x.y`."""
+    """Payload paths the page's JavaScript reads, as `data.x` / `point.x.y`.
+
+    Raw observations also travel through the `record` table callback and the
+    chart's `seriesBaseline` alias. Canonicalising those roots keeps the guard
+    about the payload contract rather than the page's local variable names.
+    """
     scripts = re.findall(
         r"<script(?![^>]*application/json)[^>]*>(.*?)</script>", html, re.S | re.I
     )
     paths: set[str] = set()
     for script in scripts:
-        for root in ("data", "point"):
+        script = re.sub(
+            r"\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]",
+            r".\1",
+            script,
+        )
+        for root, payload_root in (
+            ("data", "data"),
+            ("point", "point"),
+            ("record", "point"),
+            ("seriesBaseline", "point"),
+        ):
             for match in re.finditer(
                 rf"\b{root}((?:\.[A-Za-z_][A-Za-z0-9_]*)+)", script
             ):
-                paths.add(root + match.group(1))
+                paths.add(payload_root + match.group(1))
+            for match in re.finditer(
+                rf"\b(?:const|let|var)\s*\{{([^{{}}]*)\}}\s*=\s*{root}\b",
+                script,
+            ):
+                for entry in match.group(1).split(","):
+                    field = entry.split(":", 1)[0].split("=", 1)[0].strip()
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", field):
+                        paths.add(f"{payload_root}.{field}")
     return paths
 
 
@@ -251,7 +274,7 @@ def guard_ledger_chain(ticks: Path) -> list[str]:
 
 
 def guard_payload_contract(html: str, derive: Path, ticks: Path) -> list[str]:
-    """Every field the page reads must exist in what the deriver actually emits."""
+    """Every page read must exist in both the data artifact and rendering copy."""
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "data.json"
         result = subprocess.run(
@@ -266,14 +289,39 @@ def guard_payload_contract(html: str, derive: Path, ticks: Path) -> list[str]:
             ]
         payload = json.loads(out.read_text(encoding="utf-8"))
 
+    embedded_matches = re.findall(
+        r'<script\s+id="observatory-data"\s+type="application/json">(.*?)</script>',
+        html,
+        re.S | re.I,
+    )
+    if len(embedded_matches) != 1:
+        return ["the page has no unique embedded rendering payload"]
+    try:
+        embedded = json.loads(embedded_matches[0])
+    except json.JSONDecodeError as error:
+        return [f"the embedded rendering payload is not valid JSON: {error}"]
+    if not isinstance(embedded, dict):
+        return ["the embedded rendering payload is not a JSON object"]
+
     points = payload.get("points", [])
     if not points:
         return ["the deriver produced no points; run this guard against real ticks"]
+    embedded_points = embedded.get("points", [])
+    if not isinstance(embedded_points, list) or not embedded_points:
+        return ["the embedded rendering payload has no points"]
 
     # Paths the page synthesises itself rather than reading from the payload.
     # `coordinates()` builds {x, y, breakBefore} objects and iterates them as
     # `point`, so those three names never come from a tick.
-    local = {"data.json", "point.x", "point.y", "point.breakBefore"}
+    local = {
+        "data.json",
+        "point.x",
+        "point.y",
+        "point.breakBefore",
+        "point._break_before",
+        "point._partial",
+        "point.partial",
+    }
 
     # A payload array is legitimately used as an array. Calling one of these on
     # it does not mean the deriver owes us a field by that name.
@@ -302,19 +350,31 @@ def guard_payload_contract(html: str, derive: Path, ticks: Path) -> list[str]:
         "toString",
     }
 
-    def satisfied(path: str) -> bool:
-        if payload_has(payload, points, path) or payload_declares_optional_prefix(
-            payload, points, path
-        ):
+    def satisfied(candidate: dict, candidate_points: list, path: str) -> bool:
+        if payload_has(
+            candidate, candidate_points, path
+        ) or payload_declares_optional_prefix(candidate, candidate_points, path):
             return True
         root, _, member = path.rpartition(".")
-        return bool(root) and member in builtins and payload_has(payload, points, root)
+        return (
+            bool(root)
+            and member in builtins
+            and payload_has(candidate, candidate_points, root)
+        )
 
-    return [
-        f"the page reads `{path}` but the deriver never emits it (producer/consumer drift)"
-        for path in sorted(read_paths(html) - local)
-        if not satisfied(path)
-    ]
+    failures = []
+    for path in sorted(read_paths(html) - local):
+        if not satisfied(payload, points, path):
+            failures.append(
+                f"the page reads `{path}` but the deriver never emits it "
+                "(producer/consumer drift)"
+            )
+        elif not satisfied(embedded, embedded_points, path):
+            failures.append(
+                f"the page reads `{path}` but the embedded rendering projection "
+                "drops it (producer/consumer drift)"
+            )
+    return failures
 
 
 def guard_no_js_state(html_path: Path, payload: dict) -> list[str]:
@@ -680,9 +740,9 @@ def main() -> int:
     parser.add_argument("--site-root", type=Path, required=True)
     args = parser.parse_args()
 
-    html = args.html.read_text(encoding="utf-8")
     with tempfile.TemporaryDirectory() as tmp:
         built = build_page(args.html, args.derive, args.ticks, Path(tmp))
+        html = built.read_text(encoding="utf-8")
         payload = json.loads((Path(tmp) / "data.json").read_text(encoding="utf-8"))
         checks = (
             ("tick ledger hash chain", guard_ledger_chain(args.ticks)),
