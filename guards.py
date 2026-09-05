@@ -66,6 +66,7 @@ PROBE = """
 FALLBACK_ERROR_CONTRACTS = {
     "errors/api-bad-request": "bad_request",
     "errors/api-method-not-allowed": "method_not_allowed",
+    "errors/api-not-found": "not_found",
     "errors/api-rate-limited": "rate_limited",
     "errors/query-unavailable": "local_query_unavailable",
 }
