@@ -5068,11 +5068,11 @@ def timestamp_text(value: datetime) -> str:
     )
 
 
-def record_created_rooms(
+def plan_created_rooms(
     connection: sqlite3.Connection,
     events: list[dict[str, Any]],
     observed_at: str,
-) -> int:
+) -> list[dict[str, Any]]:
     try:
         observation = parse_timestamp(observed_at)
     except (TypeError, ValueError) as error:
@@ -5080,7 +5080,7 @@ def record_created_rooms(
             "room-creation observation has an invalid timestamp"
         ) from error
     observed_at_text = timestamp_text(observation)
-    inserted = 0
+    planned: list[dict[str, Any]] = []
     for event in events:
         try:
             created_at = parse_timestamp(event["ts"])
@@ -5101,6 +5101,59 @@ def record_created_rooms(
             raise CollectionError(
                 "room-creation event has an invalid timestamp"
             ) from error
+        existing = connection.execute(
+            """
+            SELECT created_seq, name, room_id, room_sha256, created_at
+            FROM room_ledger
+            WHERE created_seq = ?
+            """,
+            (event["seq"],),
+        ).fetchall()
+        expected_ledger_row = (
+            event["seq"],
+            event["name"],
+            room_identifier(event["name"]),
+            room_digest(event["name"]),
+            created_at_text,
+        )
+        persisted_schedule = connection.execute(
+            """
+            SELECT stage_seconds, due_at
+            FROM room_revisits
+            WHERE room_created_seq = ?
+            ORDER BY stage_seconds
+            """,
+            (event["seq"],),
+        ).fetchall()
+        expected_schedule = sorted(
+            (stage_seconds, due_at) for _, stage_seconds, due_at in schedule
+        )
+        if existing:
+            if (
+                existing == [expected_ledger_row]
+                and persisted_schedule == expected_schedule
+            ):
+                continue
+            raise CollectionError("conflicting room-creation event")
+        planned.append(
+            {
+                "created_seq": event["seq"],
+                "name": event["name"],
+                "room_id": room_identifier(event["name"]),
+                "room_sha256": room_digest(event["name"]),
+                "created_at": created_at_text,
+                "first_observed_at": observed_at_text,
+                "schedule": schedule,
+            }
+        )
+    return planned
+
+
+def apply_created_rooms(
+    connection: sqlite3.Connection,
+    planned: list[dict[str, Any]],
+) -> int:
+    for room in planned:
         try:
             connection.execute(
                 """
@@ -5115,49 +5168,16 @@ def record_created_rooms(
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    event["seq"],
-                    event["name"],
-                    room_identifier(event["name"]),
-                    room_digest(event["name"]),
-                    created_at_text,
-                    observed_at_text,
+                    room["created_seq"],
+                    room["name"],
+                    room["room_id"],
+                    room["room_sha256"],
+                    room["created_at"],
+                    room["first_observed_at"],
                 ),
             )
         except sqlite3.IntegrityError as error:
-            existing = connection.execute(
-                """
-                SELECT created_seq, name, room_id, room_sha256, created_at
-                FROM room_ledger
-                WHERE created_seq = ?
-                """,
-                (event["seq"],),
-            ).fetchall()
-            expected_ledger_row = (
-                event["seq"],
-                event["name"],
-                room_identifier(event["name"]),
-                room_digest(event["name"]),
-                created_at_text,
-            )
-            persisted_schedule = connection.execute(
-                """
-                SELECT stage_seconds, due_at
-                FROM room_revisits
-                WHERE room_created_seq = ?
-                ORDER BY stage_seconds
-                """,
-                (event["seq"],),
-            ).fetchall()
-            expected_schedule = sorted(
-                (stage_seconds, due_at) for _, stage_seconds, due_at in schedule
-            )
-            if (
-                existing == [expected_ledger_row]
-                and persisted_schedule == expected_schedule
-            ):
-                continue
             raise CollectionError("conflicting room-creation event") from error
-        inserted += 1
         try:
             connection.executemany(
                 """
@@ -5168,19 +5188,32 @@ def record_created_rooms(
                 )
                 VALUES (?, ?, ?)
                 """,
-                schedule,
+                room["schedule"],
             )
         except sqlite3.IntegrityError as error:
             raise CollectionError("conflicting room-revisit schedule") from error
-    return inserted
+    return len(planned)
 
 
-def record_listed_rooms(
+def record_created_rooms(
+    connection: sqlite3.Connection,
+    events: list[dict[str, Any]],
+    observed_at: str,
+) -> int:
+    return apply_created_rooms(
+        connection,
+        plan_created_rooms(connection, events, observed_at),
+    )
+
+
+def plan_listed_rooms(
     connection: sqlite3.Connection,
     newest_rooms: list[dict[str, Any]],
     observed_at: str,
     state: dict[str, Any],
-) -> None:
+    *,
+    created_rooms: list[dict[str, Any]] | None = None,
+) -> list[tuple[str, int]]:
     try:
         observation = parse_timestamp(observed_at)
     except (TypeError, ValueError) as error:
@@ -5200,20 +5233,30 @@ def record_listed_rooms(
             raise CollectionError("room listing observation predates its checkpoint")
 
     names = [room["name"] for room in newest_rooms]
+    generations: dict[str, list[tuple[int, str, str | None]]] = {}
     if names:
         placeholders = ",".join("?" for _ in names)
-        for name, last_listed_at in connection.execute(
-            "SELECT room_ledger.name, room_ledger.last_listed_at "
-            "FROM room_ledger "
-            "JOIN ("
-            "SELECT name, MAX(created_seq) AS created_seq "
-            f"FROM room_ledger WHERE name IN ({placeholders}) "
-            "AND created_at <= ? GROUP BY name"
-            ") AS newest ON newest.created_seq = room_ledger.created_seq",
+        for created_seq, name, created_at, last_listed_at in connection.execute(
+            "SELECT created_seq, name, created_at, last_listed_at "
+            f"FROM room_ledger WHERE name IN ({placeholders}) AND created_at <= ?",
             [*names, normalized_observation],
         ):
-            if last_listed_at is None:
-                continue
+            generations.setdefault(name, []).append(
+                (created_seq, created_at, last_listed_at)
+            )
+    for room in created_rooms or []:
+        if room["name"] in names and room["created_at"] <= normalized_observation:
+            generations.setdefault(room["name"], []).append(
+                (room["created_seq"], room["created_at"], None)
+            )
+
+    updates = []
+    for name in names:
+        candidates = generations.get(name, [])
+        if not candidates:
+            continue
+        created_seq, _, last_listed_at = max(candidates, key=lambda row: row[0])
+        if last_listed_at is not None:
             try:
                 last_listing = parse_timestamp(last_listed_at)
             except (TypeError, ValueError) as error:
@@ -5224,15 +5267,31 @@ def record_listed_rooms(
                 raise CollectionError(
                     f"room listing observation would rewind checkpoint for {name}"
                 )
-    connection.executemany(
-        "UPDATE room_ledger SET last_listed_at = ? "
-        "WHERE created_seq = ("
-        "SELECT MAX(created_seq) FROM room_ledger "
-        "WHERE name = ? AND created_at <= ?"
-        ")",
-        ((observed_at, room["name"], normalized_observation) for room in newest_rooms),
-    )
+        updates.append((observed_at, created_seq))
     state["latest_room_listing_observed_at"] = observed_at
+    return updates
+
+
+def apply_listed_rooms(
+    connection: sqlite3.Connection,
+    planned: list[tuple[str, int]],
+) -> None:
+    connection.executemany(
+        "UPDATE room_ledger SET last_listed_at = ? WHERE created_seq = ?",
+        planned,
+    )
+
+
+def record_listed_rooms(
+    connection: sqlite3.Connection,
+    newest_rooms: list[dict[str, Any]],
+    observed_at: str,
+    state: dict[str, Any],
+) -> None:
+    apply_listed_rooms(
+        connection,
+        plan_listed_rooms(connection, newest_rooms, observed_at, state),
+    )
 
 
 def room_revisit_rank(
@@ -5265,6 +5324,7 @@ def select_due_room_revisits(
     selector_seed: str,
     allocation_rotation: int,
     limit: int = ROOM_REVISIT_READ_BUDGET,
+    created_rooms: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if (
         isinstance(limit, bool)
@@ -5363,6 +5423,85 @@ def select_due_room_revisits(
         """,
         (normalized_now, normalized_now),
     ).fetchall()
+
+    planned_rooms = created_rooms or []
+    if planned_rooms:
+        planned_generations: dict[str, list[tuple[int, str]]] = {}
+        for room in planned_rooms:
+            planned_generations.setdefault(room["name"], []).append(
+                (room["created_seq"], room["created_at"])
+            )
+
+        augmented_rows = []
+        for row in rows:
+            (
+                created_seq,
+                name,
+                stage_seconds,
+                due_at,
+                created_at,
+                superseded_at,
+            ) = row
+            planned_superseding = [
+                newer_created_at
+                for newer_seq, newer_created_at in planned_generations.get(name, [])
+                if newer_seq > created_seq and newer_created_at <= normalized_now
+            ]
+            if planned_superseding:
+                superseded_at = min(
+                    [*planned_superseding]
+                    + ([superseded_at] if superseded_at is not None else [])
+                )
+            augmented_rows.append(
+                (
+                    created_seq,
+                    name,
+                    stage_seconds,
+                    due_at,
+                    created_at,
+                    superseded_at,
+                )
+            )
+        rows = augmented_rows
+
+        names = sorted(planned_generations)
+        placeholders = ",".join("?" for _ in names)
+        persisted_generations: dict[str, list[tuple[int, str]]] = {}
+        for name, created_seq, created_at in connection.execute(
+            "SELECT name, created_seq, created_at FROM room_ledger "
+            f"WHERE name IN ({placeholders}) AND created_at <= ?",
+            [*names, normalized_now],
+        ):
+            persisted_generations.setdefault(name, []).append((created_seq, created_at))
+
+        for room in planned_rooms:
+            generations = [
+                *persisted_generations.get(room["name"], []),
+                *planned_generations[room["name"]],
+            ]
+            superseding = [
+                created_at
+                for created_seq, created_at in generations
+                if created_seq > room["created_seq"] and created_at <= normalized_now
+            ]
+            superseded_at = min(superseding) if superseding else None
+            for _, stage_seconds, due_at in room["schedule"]:
+                if due_at <= normalized_now:
+                    rows.append(
+                        (
+                            room["created_seq"],
+                            room["name"],
+                            stage_seconds,
+                            due_at,
+                            room["created_at"],
+                            superseded_at,
+                        )
+                    )
+        # The pending due-time index supplies the existing query in due-time
+        # order. Stable sorting inserts newly planned rows into that same order;
+        # persisted rows retain precedence when due times are equal because
+        # their rowids predate this tick's inserts.
+        rows.sort(key=lambda row: row[3])
 
     active: dict[int, list[tuple[bytes, int, dict[str, Any]]]] = {
         stage_seconds: [] for stage_seconds in ROOM_REVISIT_STAGES_SECONDS
@@ -5832,8 +5971,7 @@ def room_lifecycle_summary(
     }
 
 
-def collect_room_revisits(
-    client: Client,
+def plan_room_revisits(
     connection: sqlite3.Connection,
     tick_ts: str,
     *,
@@ -5841,7 +5979,7 @@ def collect_room_revisits(
     selector_version: int,
     selector_seed: str,
     allocation_rotation: int,
-    deadline: float,
+    created_rooms: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     selected = select_due_room_revisits(
         connection,
@@ -5849,14 +5987,25 @@ def collect_room_revisits(
         selector_version=selector_version,
         selector_seed=selector_seed,
         allocation_rotation=allocation_rotation,
+        created_rooms=created_rooms,
     )
-    selected_reads = selected["selected"]
 
     # Enforce the maximum selected work before the first revisit read. The
     # final summary is recomputed from the reads that were actually issued.
-    read_budget_summary(sampled_room_reads, len(selected_reads))
+    read_budget_summary(sampled_room_reads, len(selected["selected"]))
+    return selected
+
+
+def fetch_room_revisits(
+    client: Client,
+    selected: dict[str, Any],
+    *,
+    deadline: float,
+) -> dict[str, Any]:
+    selected_reads = selected["selected"]
 
     published: list[dict[str, Any]] = []
+    updates: list[tuple[Any, ...]] = []
     for revisit in selected_reads:
         if time.monotonic() >= deadline:
             continue
@@ -5896,19 +6045,17 @@ def collect_room_revisits(
             )
         except CollectionError as error:
             outcome = "absent_at_last_check" if error.status == 404 else "check_failed"
-            connection.execute(
-                """
-                UPDATE room_revisits
-                SET
-                    attempted_at = ?,
-                    success = 0,
-                    outcome = ?,
-                    message_count = NULL,
-                    has_second_message = NULL,
-                    second_sender_class = NULL
-                WHERE room_created_seq = ? AND stage_seconds = ?
-                """,
-                (attempted_at, outcome, created_seq, stage_seconds),
+            updates.append(
+                (
+                    attempted_at,
+                    0,
+                    outcome,
+                    None,
+                    None,
+                    None,
+                    created_seq,
+                    stage_seconds,
+                )
             )
             public_result["outcome"] = outcome
             published.append(public_result)
@@ -5924,20 +6071,11 @@ def collect_room_revisits(
             if exact_second is not None
             else ("not_observed" if has_second_message else None)
         )
-        connection.execute(
-            """
-            UPDATE room_revisits
-            SET
-                attempted_at = ?,
-                success = 1,
-                outcome = 'present_at_last_check',
-                message_count = ?,
-                has_second_message = ?,
-                second_sender_class = ?
-            WHERE room_created_seq = ? AND stage_seconds = ?
-            """,
+        updates.append(
             (
                 attempted_at,
+                1,
+                "present_at_last_check",
                 len(messages),
                 int(has_second_message),
                 second_sender_class,
@@ -5963,19 +6101,17 @@ def collect_room_revisits(
         created_seq = revisit["created_seq"]
         stage_seconds = revisit["stage_seconds"]
         attempted_at = utc_now()
-        connection.execute(
-            """
-            UPDATE room_revisits
-            SET
-                attempted_at = ?,
-                success = 0,
-                outcome = 'superseded_before_check',
-                message_count = NULL,
-                has_second_message = NULL,
-                second_sender_class = NULL
-            WHERE room_created_seq = ? AND stage_seconds = ?
-            """,
-            (attempted_at, created_seq, stage_seconds),
+        updates.append(
+            (
+                attempted_at,
+                0,
+                "superseded_before_check",
+                None,
+                None,
+                None,
+                created_seq,
+                stage_seconds,
+            )
         )
         published.append(
             {
@@ -5997,8 +6133,42 @@ def collect_room_revisits(
     # backlog can never stall the tick; the remainder is published, not
     # hidden. No attempt evidence is fabricated: only aged_out_at is set.
     finalizable = selected["aged_out_finalizable"]
+    finalized_at = utc_now() if finalizable else None
+    return {
+        "selected": selected,
+        "published": published,
+        "updates": updates,
+        "finalizable": finalizable,
+        "finalized_at": finalized_at,
+    }
+
+
+def apply_room_revisits(
+    connection: sqlite3.Connection,
+    tick_ts: str,
+    fetched: dict[str, Any],
+) -> dict[str, Any]:
+    selected = fetched["selected"]
+    selected_reads = selected["selected"]
+    published = fetched["published"]
+    for update in fetched["updates"]:
+        connection.execute(
+            """
+            UPDATE room_revisits
+            SET
+                attempted_at = ?,
+                success = ?,
+                outcome = ?,
+                message_count = ?,
+                has_second_message = ?,
+                second_sender_class = ?
+            WHERE room_created_seq = ? AND stage_seconds = ?
+            """,
+            update,
+        )
+
+    finalizable = fetched["finalizable"]
     if finalizable:
-        finalized_at = utc_now()
         cursor = connection.executemany(
             """
             UPDATE room_revisits
@@ -6010,7 +6180,7 @@ def collect_room_revisits(
                 AND aged_out_at IS NULL
             """,
             [
-                (finalized_at, created_seq, stage_seconds)
+                (fetched["finalized_at"], created_seq, stage_seconds)
                 for created_seq, stage_seconds in finalizable
             ],
         )
@@ -6041,6 +6211,33 @@ def collect_room_revisits(
         "coverage_by_stage": coverage_by_stage,
     }
     return summary
+
+
+def collect_room_revisits(
+    client: Client,
+    connection: sqlite3.Connection,
+    tick_ts: str,
+    *,
+    sampled_room_reads: int,
+    selector_version: int,
+    selector_seed: str,
+    allocation_rotation: int,
+    deadline: float,
+) -> dict[str, Any]:
+    selected = plan_room_revisits(
+        connection,
+        tick_ts,
+        sampled_room_reads=sampled_room_reads,
+        selector_version=selector_version,
+        selector_seed=selector_seed,
+        allocation_rotation=allocation_rotation,
+    )
+    fetched = fetch_room_revisits(
+        client,
+        selected,
+        deadline=deadline,
+    )
+    return apply_room_revisits(connection, tick_ts, fetched)
 
 
 def selector_frame_id(state: dict[str, Any]) -> str:
@@ -6517,6 +6714,9 @@ def collect_tick(
                 "signer metadata exists without its SQLite store; run migrate_signers.py"
             )
 
+        # Phase 1a: load the durable signer state and advance the room-sample
+        # selector. The existing metadata transaction remains intentionally
+        # separate from the tick transaction and performs no origin I/O.
         connection = connect_signer_database(database_path)
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -6528,93 +6728,146 @@ def collect_tick(
             write_signer_metadata(connection, state)
             connection.commit()
             save_atomic_json(signer_state_path, state)
-
-            connection.execute("BEGIN IMMEDIATE")
             names, room_sampling = room_sample_names(rooms["newest_rooms"], state)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
-            events_path = "/r/events?format=json&limit=200"
-            events_last_seq, events, class_counts, primary_counts = (
-                parse_collected_response(
-                    client,
-                    events_path,
-                    parse_events,
-                    client.get(events_path),
-                )
+        # Phase 2a: fetch the event window without an open signer-database
+        # connection. The tick timestamp deliberately remains immediately
+        # after this response, preserving the published observation time.
+        events_path = "/r/events?format=json&limit=200"
+        events_last_seq, events, class_counts, primary_counts = (
+            parse_collected_response(
+                client,
+                events_path,
+                parse_events,
+                client.get(events_path),
             )
-            tick_ts = utc_now()
-            created_this_tick = record_created_rooms(
-                connection,
+        )
+        tick_ts = utc_now()
+
+        # Phase 1b: finish the read-only plan now that the event window and
+        # tick timestamp are known. Newly observed room generations are
+        # overlaid in memory so their schedules affect this tick exactly as
+        # they did when inserted before selection. Close the read connection
+        # before any remaining origin request.
+        planning_connection = sqlite3.connect(
+            database_path.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        try:
+            planning_connection.execute("PRAGMA query_only = ON")
+            planned_created_rooms = plan_created_rooms(
+                planning_connection,
                 events,
                 tick_ts,
             )
-            record_listed_rooms(
-                connection,
+            planned_listed_rooms = plan_listed_rooms(
+                planning_connection,
                 rooms["newest_rooms"],
                 rooms_observed_at,
                 state,
+                created_rooms=planned_created_rooms,
             )
-            room_lifecycle = collect_room_revisits(
-                client,
-                connection,
+            revisit_plan = plan_room_revisits(
+                planning_connection,
                 tick_ts,
                 sampled_room_reads=len(names),
                 selector_version=state["selector_version"],
                 selector_seed=state["selector_seed"],
                 allocation_rotation=state["revisit_allocation_rotation"],
-                deadline=tick_started + TICK_REVISIT_DEADLINE_SECONDS,
+                created_rooms=planned_created_rooms,
             )
-            state["revisit_allocation_rotation"] = (
-                state["revisit_allocation_rotation"] + 1
-            ) % len(ROOM_REVISIT_STAGES_SECONDS)
-            room_lifecycle_sampling = room_lifecycle.pop("sampling")
-            room_lifecycle["created_rooms_observed_this_tick"] = created_this_tick
-            room_lifecycle["read_budget"] = read_budget_summary(
-                len(names),
-                room_lifecycle["attempted_this_tick"],
-            )
+        finally:
+            planning_connection.close()
 
-            sampled: list[tuple[str, list[dict[str, Any]]]] = []
-            lobby_body: str | None = None
-            lobby_last_seq: int | None = None
-            for name in names:
-                sample_result = {"id": room_identifier(name), "success": False}
-                room_sampling["sampled"].append(sample_result)
-                path = f"/r/{urllib.parse.quote(name, safe='')}?format=json&limit=200"
-                try:
-                    body = client.get(path)
-                    messages = parse_collected_response(
+        # Phase 2b: complete every origin read from the immutable plan. No
+        # signer-database connection is open during this network work.
+        fetched_revisits = fetch_room_revisits(
+            client,
+            revisit_plan,
+            deadline=tick_started + TICK_REVISIT_DEADLINE_SECONDS,
+        )
+        state["revisit_allocation_rotation"] = (
+            state["revisit_allocation_rotation"] + 1
+        ) % len(ROOM_REVISIT_STAGES_SECONDS)
+        attempted_revisits = sum(
+            revisit["outcome"] != "superseded_before_check"
+            for revisit in fetched_revisits["published"]
+        )
+        room_lifecycle_read_budget = read_budget_summary(
+            len(names),
+            attempted_revisits,
+        )
+
+        sampled: list[tuple[str, list[dict[str, Any]]]] = []
+        lobby_body: str | None = None
+        lobby_last_seq: int | None = None
+        for name in names:
+            sample_result = {"id": room_identifier(name), "success": False}
+            room_sampling["sampled"].append(sample_result)
+            path = f"/r/{urllib.parse.quote(name, safe='')}?format=json&limit=200"
+            try:
+                body = client.get(path)
+                messages = parse_collected_response(
+                    client,
+                    path,
+                    parse_room_messages,
+                    body,
+                    path,
+                )
+                if name == "lobby":
+                    lobby_last_seq = parse_collected_response(
                         client,
                         path,
-                        parse_room_messages,
+                        extract_last_seq,
                         body,
                         path,
                     )
-                    if name == "lobby":
-                        lobby_last_seq = parse_collected_response(
-                            client,
-                            path,
-                            extract_last_seq,
-                            body,
-                            path,
-                        )
-                except CollectionError:
-                    if name == "lobby":
-                        raise
-                    continue
-                sample_result["success"] = True
-                sampled.append((name, messages))
+            except CollectionError:
                 if name == "lobby":
-                    lobby_body = body
+                    raise
+                continue
+            sample_result["success"] = True
+            sampled.append((name, messages))
+            if name == "lobby":
+                lobby_body = body
 
-            if lobby_body is None or lobby_last_seq is None:
-                raise CollectionError("lobby was not sampled")
+        if lobby_body is None or lobby_last_seq is None:
+            raise CollectionError("lobby was not sampled")
 
-            if identity_total is not None:
-                state["census"] = {
-                    "total": identity_total,
-                    "completed_at": tick_ts,
-                    "started_at": census_started,
-                }
+        if identity_total is not None:
+            state["census"] = {
+                "total": identity_total,
+                "completed_at": tick_ts,
+                "started_at": census_started,
+            }
+
+        # Phase 3: apply the complete tick under one short write transaction.
+        # Only local validation, writes and published-summary reads occur here.
+        connection = connect_signer_database(database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            created_this_tick = apply_created_rooms(
+                connection,
+                planned_created_rooms,
+            )
+            apply_listed_rooms(
+                connection,
+                planned_listed_rooms,
+            )
+            room_lifecycle = apply_room_revisits(
+                connection,
+                tick_ts,
+                fetched_revisits,
+            )
+            room_lifecycle_sampling = room_lifecycle.pop("sampling")
+            room_lifecycle["created_rooms_observed_this_tick"] = created_this_tick
+            room_lifecycle["read_budget"] = room_lifecycle_read_budget
 
             update_signer_state(connection, state, sampled, tick_ts)
             funnel = aggregate_funnel(
