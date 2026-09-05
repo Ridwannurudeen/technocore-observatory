@@ -26,6 +26,7 @@ FALLBACK = ROOT / "deploy/fallback"
 API_FALLBACKS = {
     "api-bad-request": "bad_request",
     "api-method-not-allowed": "method_not_allowed",
+    "api-not-found": "not_found",
     "api-rate-limited": "rate_limited",
     "query-unavailable": "local_query_unavailable",
 }
@@ -46,6 +47,7 @@ DEPLOY_FILES = {
         for stem in API_FALLBACKS
         for suffix in ("json", "txt")
     ),
+    FALLBACK / "query-not-found.html",
     FALLBACK / "query-rate-limited.html",
     FALLBACK / "query-unavailable.html",
     ROOT / "recover_publication.py",
@@ -144,6 +146,7 @@ def test_nginx_http_context_is_query_private_and_supplies_shared_maps():
         ("404:0:/api/v1/rooms/search", "no-store"),
         ("400:0:/errors/api-bad-request.txt", "no-store"),
         ("400:1:/errors/api-bad-request.txt", "no-store"),
+        ("404:1:/errors/api-not-found.txt", "no-store"),
         ("429:0:/errors/api-rate-limited.txt", "no-store"),
         ("429:0:/errors/query-rate-limited.html", "no-store"),
         ("200:0:/rooms/", "no-store"),
@@ -230,6 +233,13 @@ def test_nginx_vhost_mirrors_tls_and_keeps_headers_out_of_locations():
     assert "location = /api/v1/incidents" in source
     assert "location = /api/v1/changes" in source
     assert 'location ~ "^/(?:rooms/[0-9a-f]{16}|keys/[^/]+)/$" {' in source
+    # A ^~ prefix would suppress the real regex API locations before they can win.
+    api_not_found = re.search(r"(?ms)^\s*location /api/v1/ \{(.*?)^\s{4}\}", source)
+    assert api_not_found is not None
+    assert (
+        "error_page 404 =404 /errors/api-not-found$observatory_error_suffix;"
+    ) in api_not_found.group(1)
+    assert "return 404;" in api_not_found.group(1)
     assert "try_files /api/v1/status$observatory_format_suffix" in source
     assert source.count("if ($request_method !~ ^(GET|HEAD)$)") == 2
     assert source.count("if ($observatory_static_request_valid = 0)") == 2
@@ -244,6 +254,7 @@ def test_nginx_vhost_mirrors_tls_and_keeps_headers_out_of_locations():
     )
     for status, stem in (
         (400, "api-bad-request"),
+        (404, "api-not-found"),
         (405, "api-method-not-allowed"),
         (429, "api-rate-limited"),
         (503, "query-unavailable"),
@@ -319,7 +330,7 @@ def test_nginx_errors_are_no_store_while_static_api_successes_are_cacheable():
         "$observatory_cache_control {" in context
     )
     cache_map = context.split("$observatory_cache_control {", 1)[1].split("}", 1)[0]
-    assert '~^(?:400|405|429|503): "no-store";' in cache_map
+    assert '~^(?:400|404|405|429|503): "no-store";' in cache_map
     assert (
         "~^(?:200|206|304):1:/api/v1/(?:status|incidents|changes|methodology)$ "
         '"public, max-age=60, stale-if-error=300";' in cache_map
@@ -391,7 +402,12 @@ def test_rooms_index_is_static_without_args_and_search_requests_are_proxied():
         vhost,
     )
     assert did_match is not None
-    assert "error_page 429 =429 @html_rate_limited;" in did_match.group(1)
+    did_location = did_match.group(1)
+    assert "error_page 404 =404 @html_not_found;" in did_location
+    assert "error_page 429 =429 @html_rate_limited;" in did_location
+    assert "location @html_not_found {" in vhost
+    assert "try_files /errors/query-not-found.html =404;" in vhost
+    assert "errors/query-not-found.html" in guards.STATIC_RELEASE_FILES
     assert "errors/query-rate-limited.html" in guards.STATIC_RELEASE_FILES
 
 
@@ -1316,6 +1332,10 @@ def test_docs_state_the_unwaived_lint_command_and_failure_metadata_boundary():
     assert "every generated directory mode `0755`" in deploy
     assert "every ordinary generated file mode" in deploy
     assert "same exclusive publication-root lock" in deploy
+    assert "before `errors/query-not-found.html` existed" in deploy
+    assert re.search(
+        r"400, 404, 405, 429, and 503 responses use bounded\s+text/JSON", deploy
+    )
     assert re.search(
         r"TRACE must return the bounded `no-store` 405 method\s+artifact",
         deploy,
@@ -1327,12 +1347,15 @@ def test_fallback_contracts_are_bounded_credential_free_and_non_indexable():
     for name, claim in (
         ("query-unavailable", "local query service is unavailable"),
         ("query-rate-limited", "exceeded the local query rate"),
+        ("query-not-found", "outside the stored record"),
     ):
         html = read(FALLBACK / f"{name}.html")
         assert '<meta name="robots" content="noindex,nofollow,noarchive">' in html
         assert claim in html.lower()
         assert "<script" not in html.lower()
         assert 'id="theme-toggle"' not in html
+    not_found = read(FALLBACK / "query-not-found.html").lower()
+    assert "not observed is not absent" in not_found
     for stem, error in API_FALLBACKS.items():
         payload = json.loads(read(FALLBACK / f"{stem}.json"))
         plain = (FALLBACK / f"{stem}.txt").read_bytes()
@@ -1579,6 +1602,21 @@ def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
         for finding in findings
     )
     rate_limited_path.write_text(rate_limited, encoding="utf-8")
+
+    not_found_path = release / "errors/query-not-found.html"
+    not_found = not_found_path.read_text(encoding="utf-8")
+    not_found_path.write_text(
+        not_found.replace(
+            '<meta name="robots" content="noindex,nofollow,noarchive">', ""
+        ),
+        encoding="utf-8",
+    )
+    findings = guards.guard_static_release(release)
+    assert any(
+        "query-not-found.html" in finding and "noindex" in finding
+        for finding in findings
+    )
+    not_found_path.write_text(not_found, encoding="utf-8")
 
     openapi_path.unlink()
     findings = guards.guard_static_release(release)

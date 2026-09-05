@@ -1,0 +1,4 @@
+contract_version: 1.1.0
+freshness: not_observed
+error: not_found
+message: requested API route is not available

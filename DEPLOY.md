@@ -53,10 +53,10 @@ All nginx security and CORS headers are declared once at server scope with `alwa
 not add their own headers, so nginx cannot silently drop the inherited set on error responses. The
 CSP permits same-origin CSS/JavaScript and the legacy inline observatory code, but limits forms to
 `'self'`. Dynamic room/DID paths receive `X-Robots-Tag`; access logs use `$uri`, never raw query
-arguments or referrers. nginx-generated API 400, 405, 429, and 503 responses use bounded text/JSON
-artifacts selected by `format=json`, with text as the safe default. A 429 also carries
+arguments or referrers. nginx-generated API 400, 404, 405, 429, and 503 responses use bounded
+text/JSON artifacts selected by `format=json`, with text as the safe default. A 429 also carries
 `Retry-After: 60`; that 60 s is a deliberate over-backoff, not the replenishment interval, because
-the zone replenishes one request every 2 s with a burst of 10. All four error statuses are
+the zone replenishes one request every 2 s with a burst of 10. All five error statuses are
 `no-store`, while successful static status, incidents, changes, and methodology representations
 remain publicly cacheable. Every loopback proxy suppresses GET/HEAD request bodies and clears the
 forwarded `Content-Length`.
@@ -403,7 +403,7 @@ policy, frame denial, credential-free CORS, and the route-specific robot policy.
 response is 429 with `Retry-After`; on `/rooms/?q=...`, `/rooms/{16-hex}/` and `/keys/{did}/` its
 body is the styled `errors/query-rate-limited.html`, elsewhere the text/JSON artifact. Confirm the
 access log contains no raw `q`, `since`,
-`limit`, or `format` values. Confirm every intercepted 400, 405, 429, and 503 is `no-store`, while a
+`limit`, or `format` values. Confirm every bounded 400, 404, 405, 429, and 503 is `no-store`, while a
 successful static status, incidents, changes, or methodology response retains the documented
 public cache policy.
 
@@ -598,7 +598,9 @@ link pattern and run `nginx -t`. This changes no collector, telemetry, or signer
 immediate predecessor is always retained for this purpose; older releases are subject to the
 documented count/byte bounds. Keep the rejected release for diagnosis. A release built before
 `errors/query-rate-limited.html` existed serves nginx's built-in 429 body on the two human page
-routes, with the same status and headers, until a newer release is published.
+routes, with the same status and headers, until a newer release is published. A release built
+before `errors/query-not-found.html` existed likewise serves nginx's built-in 404 body on the
+room/key human detail routes until a newer release is published.
 
 ```bash
 (
