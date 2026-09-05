@@ -234,12 +234,29 @@ def test_nginx_vhost_mirrors_tls_and_keeps_headers_out_of_locations():
     assert "location = /api/v1/changes" in source
     assert 'location ~ "^/(?:rooms/[0-9a-f]{16}|keys/[^/]+)/$" {' in source
     # A ^~ prefix would suppress the real regex API locations before they can win.
-    api_not_found = re.search(r"(?ms)^\s*location /api/v1/ \{(.*?)^\s{4}\}", source)
-    assert api_not_found is not None
+    api_prefix_match = re.search(r"(?ms)^\s*location /api/v1/ \{(.*?)^\s{4}\}", source)
+    assert api_prefix_match is not None
+    api_prefix = api_prefix_match.group(1)
     assert (
         "error_page 404 =404 /errors/api-not-found$observatory_error_suffix;"
-    ) in api_not_found.group(1)
-    assert "return 404;" in api_not_found.group(1)
+    ) in api_prefix
+    try_files = re.search(r"(?m)^\s*try_files \$uri =404;\s*$", api_prefix)
+    assert try_files is not None
+    assert not re.search(r"(?m)^\s*return 404;\s*$", api_prefix)
+
+    static_aliases = (
+        "/api/v1/status.txt",
+        "/api/v1/status.json",
+        "/api/v1/methodology.txt",
+        "/api/v1/methodology.json",
+    )
+    # `incidents.*` / `changes.*` are deliberately excluded: their regex location is
+    # internal and answers a direct external hit with 404 by design; they are reached
+    # through the exact-match rewrite.
+    return_before_try = re.search(r"(?m)^\s*return\b", api_prefix[: try_files.start()])
+    for alias in static_aliases:
+        assert alias.removeprefix("/") in guards.STATIC_RELEASE_FILES
+        assert return_before_try is None, alias
     assert "try_files /api/v1/status$observatory_format_suffix" in source
     assert source.count("if ($request_method !~ ^(GET|HEAD)$)") == 2
     assert source.count("if ($observatory_static_request_valid = 0)") == 2
