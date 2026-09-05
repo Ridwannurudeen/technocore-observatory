@@ -1,79 +1,98 @@
-    <header class="masthead" aria-labelledby="home-title">
-      <p class="issue-line"><span>PUBLIC EVIDENCE REGISTER</span><span>EDITION %%PUBLISHED_DATE%%</span></p>
-      <div class="masthead-layout">
-        <div>
-          <p class="eyebrow">TECHNOCORE / OUTSIDE OBSERVATION</p>
-          <h1 id="home-title">PUBLIC EVIDENCE REGISTER</h1>
-        </div>
-        <p class="standfirst">A read-only register of public rooms, service observations, collection boundaries and versioned methodology. It states what was observed. It does not infer what the evidence cannot establish.</p>
+    <section class="home-hero" aria-labelledby="home-title">
+      <div class="home-intro">
+        <p class="eyebrow">TECHNOCORE / INDEPENDENT OBSERVATORY</p>
+        <h1 id="home-title">Find the rooms.<br><span>Read the evidence.</span></h1>
+        <p class="standfirst">Search retained Technocore room records, inspect service observations, and trace changes over time.</p>
+        <form class="room-search" action="/rooms/" method="get" role="search">
+          <label for="room-query">SEARCH RETAINED ROOMS</label>
+          <div class="search-line">
+            <input id="room-query" name="q" type="search" placeholder="Part of a room name" autocomplete="off" spellcheck="false" maxlength="80" required aria-describedby="search-boundary search-feedback">
+            <button type="submit">Search rooms</button>
+          </div>
+          <p id="search-boundary" class="boundary-note">Untrusted labels · Maximum 20 results · Zero origin reads</p>
+          <p id="search-feedback" class="search-feedback" aria-live="polite"></p>
+        </form>
+        <a class="home-text-link" href="#api-access">Explore the API <span aria-hidden="true">↗</span></a>
+        <p class="home-affiliation">Independent, read-only, and unaffiliated with FLOP Labs.</p>
       </div>
-    </header>
 
-    <section class="search-stage" aria-labelledby="search-title">
-      <p class="figure-label">01 / ROOM REGISTER</p>
-      <h2 id="search-title">Search the local record</h2>
-      <p>Room names are untrusted labels. Search returns at most 20 locally stored results and performs zero origin reads.</p>
-      <form class="room-search" action="/rooms/" method="get" role="search">
-        <label for="room-query">ROOM NAME</label>
-        <div class="search-line">
-          <input id="room-query" name="q" type="search" autocomplete="off" spellcheck="false" maxlength="80" required aria-describedby="search-boundary search-feedback">
-          <button type="submit">SEARCH REGISTER</button>
+      <aside class="home-reading" aria-labelledby="reading-title">
+        <div class="home-reading-heading">
+          <p class="figure-label">PUBLIC EVIDENCE / %%PUBLISHED_DATE%%</p>
+          <h2 id="reading-title">The recorded state.</h2>
+          <p>Separate observations. No composite score.</p>
         </div>
-        <p id="search-boundary" class="boundary-note">LOCAL EVIDENCE · MAXIMUM 20 RESULTS · ZERO ORIGIN READS</p>
-        <p id="search-feedback" class="search-feedback" aria-live="polite"></p>
-      </form>
-      <dl class="evidence-rail" aria-label="Search evidence boundary">
-        <div><dt>Observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
-        <div><dt>Window</dt><dd>Valid until <time id="collector-valid-until" datetime="%%COLLECTOR_VALID_UNTIL%%">%%COLLECTOR_VALID_UNTIL%%</time> · <span class="freshness-state" data-freshness-for="collector-valid-until">%%COLLECTOR_FRESHNESS%%</span></dd></div>
-        <div><dt>Coverage</dt><dd>%%TICK_COVERAGE%% accepted ticks</dd></div>
-        <div><dt>Method</dt><dd>Local room-name index</dd></div>
-        <div><dt>Ceiling</dt><dd>Not observed is not absent</dd></div>
-      </dl>
+        <dl class="home-readings">
+          <div>
+            <dt>Origin probe <span>Unmetered <code>/healthz</code> request</span></dt>
+            <dd><strong class="state state-%%ORIGIN_TONE%%">%%ORIGIN_STATE%%</strong><span class="home-source-time">Observed %%ORIGIN_OBSERVED_AT%%</span></dd>
+          </div>
+          <div>
+            <dt>Collector <span>Freshness of the latest tick</span></dt>
+            <dd><strong class="state"><span class="freshness-state" data-freshness-for="collector-valid-until">%%COLLECTOR_FRESHNESS%%</span></strong><span class="home-source-time">Observed %%COLLECTOR_OBSERVED_AT%%<br>Valid until <time id="collector-valid-until" datetime="%%COLLECTOR_VALID_UNTIL%%">%%COLLECTOR_VALID_UNTIL%%</time></span></dd>
+          </div>
+          <div>
+            <dt>Endpoint evidence <span>Stored request telemetry</span></dt>
+            <dd><strong class="state">%%ATTEMPT_COUNT%% attempts</strong><span class="home-source-time">Trailing window: %%WINDOW_LABEL%%</span></dd>
+          </div>
+        </dl>
+        <div class="home-reading-footer">
+          <p>Snapshot at publication. Source times and validity define what each reading can establish.</p>
+          <a class="home-text-link" href="/status/">Inspect status evidence <span aria-hidden="true">↗</span></a>
+        </div>
+      </aside>
     </section>
 
-    <section class="current-reading" aria-labelledby="reading-title">
-      <div class="section-heading">
-        <div>
-          <p class="figure-label">02 / CURRENT READING</p>
-          <h2 id="reading-title">Independent evidence states</h2>
-        </div>
-        <p>No composite score. Every line retains its own source time and validity.</p>
+    <section class="home-retention" aria-labelledby="retention-title">
+      <div>
+        <p class="figure-label">01 / RETAINED ROOM SEARCH</p>
+        <h2 id="retention-title">Beyond the rolling listing.</h2>
+        <p>A room can leave the origin’s listing and still be found in the local record. Search the names we have observed, then open a stable evidence URL with that room’s recorded history.</p>
+        <p class="home-caveat">Only forward-collected observations are retained. Not observed is not absent.</p>
+        <a class="home-text-link" href="/rooms/">Open the room register <span aria-hidden="true">↗</span></a>
       </div>
-      <ol class="reading-list">
-        <li>
-          <span class="reading-number">01</span>
-          <div>
-            <h3>Origin probe</h3>
-            <p>Latest unmetered <code>/healthz</code> observation.</p>
-          </div>
-          <strong class="state state-%%ORIGIN_TONE%%">%%ORIGIN_STATE%%</strong>
-          <span class="reading-evidence">OBSERVED %%ORIGIN_OBSERVED_AT%%</span>
-        </li>
-        <li>
-          <span class="reading-number">02</span>
-          <div>
-            <h3>Collector</h3>
-            <p>Newest accepted, locally stored collector tick.</p>
-          </div>
-          <strong class="state state-%%COLLECTOR_TONE%%">%%COLLECTOR_STATE%%</strong>
-          <span class="reading-evidence">OBSERVED %%COLLECTOR_OBSERVED_AT%%</span>
-        </li>
-        <li>
-          <span class="reading-number">03</span>
-          <div>
-            <h3>Endpoint evidence</h3>
-            <p>Normalized attempts in the declared trailing window.</p>
-          </div>
-          <strong class="state">%%ATTEMPT_COUNT%% attempts</strong>
-          <span class="reading-evidence">WINDOW %%WINDOW_LABEL%%</span>
-        </li>
-      </ol>
-      <p class="section-link"><a href="/status/">OPEN THE STATUS LEDGER</a></p>
+      <div class="home-coverage">
+        <p class="figure-label">COLLECTION BOUNDARY</p>
+        <dl class="evidence-rail" aria-label="Search evidence boundary">
+          <div><dt>Observed</dt><dd>%%SOURCE_OBSERVED_AT%%</dd></div>
+          <div><dt>Valid until</dt><dd>%%COLLECTOR_VALID_UNTIL%%</dd></div>
+          <div><dt>Coverage</dt><dd>%%TICK_COVERAGE%% accepted ticks</dd></div>
+          <div><dt>Method</dt><dd>Local room-name index · <a href="/methodology/">Derivation rules</a></dd></div>
+        </dl>
+        <p class="boundary-note">Names appear only after an explicit search or record lookup and remain untrusted labels.</p>
+      </div>
     </section>
 
-    <aside class="editorial-note" aria-labelledby="boundary-title">
+    <section class="home-history" aria-labelledby="history-title">
+      <div class="home-section-heading">
+        <p class="figure-label">02 / RECORDED CHANGES</p>
+        <h2 id="history-title">See what changed.<br>Keep the source in view.</h2>
+        <p>Follow observed intervals and configuration changes back to their evidence. Every record keeps its time, scope, and limits.</p>
+      </div>
+      <div class="home-history-links">
+        <a href="/incidents/"><span class="figure-label">INCIDENT REGISTER</span><h3>Observed failures, over named windows.</h3><p>Health observations, HTTP 5xx attempts, and collector cadence intervals.</p><span class="home-link-label">Read incident history <span aria-hidden="true">↗</span></span></a>
+        <a href="/changes/"><span class="figure-label">CONFIGURATION REGISTER</span><h3>The before, the after, and when.</h3><p>Allowlisted public discovery fields, with recorded values and observation times.</p><span class="home-link-label">Inspect configuration changes <span aria-hidden="true">↗</span></span></a>
+      </div>
+    </section>
+
+    <section class="home-api" id="api-access" aria-labelledby="api-title">
+      <div>
+        <p class="figure-label">03 / FOR BUILDERS &amp; AGENTS</p>
+        <h2 id="api-title">The same evidence.<br>A plain GET request.</h2>
+        <p>Read status, incidents, changes, and methodology as text or JSON. Query retained rooms by name. Every request is served from local evidence.</p>
+        <a class="home-text-link" href="/llms.txt">Read the agent guide <span aria-hidden="true">↗</span></a>
+      </div>
+      <div class="home-api-example">
+        <p class="figure-label">STATUS / JSON</p>
+        <pre aria-label="Example status API request"><code>curl 'https://technocore.gudman.xyz/api/v1/status?format=json'</code></pre>
+        <p>No credentials required. Omit <code>?format=json</code> for text.</p>
+        <div class="home-api-links"><a href="/api/v1/status?format=json">Open JSON <span aria-hidden="true">↗</span></a><a href="/openapi.json">API contract <span aria-hidden="true">↗</span></a></div>
+      </div>
+    </section>
+
+    <aside class="home-boundary" aria-labelledby="boundary-title">
       <p class="figure-label">CLAIM BOUNDARY</p>
       <h2 id="boundary-title">Observation is not certification.</h2>
-      <p>Failures are recorded as observed attempts over named windows. The Observatory does not infer causes, promise availability, rank rooms or inspect message content.</p>
-      <a href="/methodology/">READ THE DERIVATION RULES</a>
+      <p>The Observatory does not infer causes, promise availability, rank rooms, or inspect message content.</p>
+      <a class="home-text-link" href="/methodology/">Read the methodology <span aria-hidden="true">↗</span></a>
     </aside>

@@ -1,10 +1,13 @@
+import http.server
 import json
 import os
 import re
 import stat
 import struct
 import sys
+import threading
 import types
+import urllib.parse
 from datetime import timedelta
 from pathlib import Path
 
@@ -107,6 +110,33 @@ def built_release(tmp_path):
         published_at="2026-08-30T00:02:00Z",
     )
     return release, hostile_name
+
+
+@pytest.fixture
+def served_release(built_release):
+    release, _ = built_release
+    requested_paths = []
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(release), **kwargs)
+
+        def do_GET(self):
+            requested_paths.append(self.path)
+            super().do_GET()
+
+        def log_message(self, format, *args):
+            return None
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", requested_paths
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_static_build_is_complete_versioned_and_contains_no_room_names(built_release):
@@ -281,6 +311,121 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     assert ".textContent" in script
     assert "\u00e2" not in home + rooms + script
     assert "\u00c2" not in home + rooms + script
+
+
+def test_homepage_room_search_submits_a_native_local_encoded_get(served_release):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, requested_paths = served_release
+    base = urllib.parse.urlsplit(base_url)
+    query = '"><script>& room'
+    expected_target = "/rooms/?" + urllib.parse.urlencode({"q": query})
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            for java_script_enabled in (False, True):
+                context = browser.new_context(
+                    java_script_enabled=java_script_enabled,
+                    viewport={"width": 1440, "height": 900},
+                )
+                page = context.new_page()
+                request_urls = []
+                navigation_urls = []
+
+                def record_request(request):
+                    request_urls.append(request.url)
+                    if request.is_navigation_request():
+                        navigation_urls.append(request.url)
+
+                page.on("request", record_request)
+                page.goto(f"{base_url}/")
+                navigation_urls.clear()
+
+                assert (
+                    page.get_by_role(
+                        "heading",
+                        name="Find the rooms. Read the evidence.",
+                        exact=True,
+                    ).count()
+                    == 1
+                )
+                search = page.locator(".room-search")
+                query_input = search.locator("#room-query")
+                submit = page.get_by_role("button", name="Search rooms", exact=True)
+                assert search.locator("#search-feedback").count() == 1
+                assert page.locator(".evidence-rail").count() == 1
+
+                submit.click()
+                assert query_input.evaluate("input => input.validity.valueMissing")
+                assert page.url == f"{base_url}/"
+                assert navigation_urls == []
+
+                query_input.fill(query)
+                with page.expect_navigation(wait_until="load"):
+                    submit.click()
+
+                target = urllib.parse.urlsplit(page.url)
+                assert target.path == "/rooms/"
+                assert urllib.parse.parse_qs(target.query, strict_parsing=True) == {
+                    "q": [query]
+                }
+                assert navigation_urls == [f"{base_url}{expected_target}"]
+                assert expected_target in requested_paths
+                assert request_urls
+                for request_url in request_urls:
+                    requested = urllib.parse.urlsplit(request_url)
+                    assert (
+                        requested.scheme,
+                        requested.hostname,
+                        requested.port,
+                    ) == (base.scheme, base.hostname, base.port)
+                context.close()
+        finally:
+            browser.close()
+
+
+def test_homepage_search_action_stays_above_the_fold(served_release):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, _ = served_release
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            for label, width, height in (
+                ("desktop", 1440, 900),
+                ("small mobile", 375, 667),
+                ("mobile", 375, 812),
+            ):
+                page = browser.new_page(viewport={"width": width, "height": height})
+                page.goto(f"{base_url}/")
+                submit = page.locator(".room-search button[type=submit]")
+                box = submit.bounding_box()
+
+                assert box is not None, label
+                assert box["x"] >= 0, label
+                assert box["x"] + box["width"] <= width, label
+                assert box["y"] >= 0, label
+                assert box["y"] + box["height"] <= height, label
+                assert submit.evaluate(
+                    "button => {"
+                    " const box = button.getBoundingClientRect();"
+                    " const hit = document.elementFromPoint("
+                    "   box.left + box.width / 2, box.top + box.height / 2"
+                    " );"
+                    " return hit === button || button.contains(hit);"
+                    "}"
+                ), label
+                if label == "desktop":
+                    assert box["y"] < height * 0.7
+                page.close()
+        finally:
+            browser.close()
 
 
 def test_pages_publish_canonical_icon_and_generic_social_cards(built_release):
