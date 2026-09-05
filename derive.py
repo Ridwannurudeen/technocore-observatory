@@ -4634,11 +4634,229 @@ def replace_meta(source: str, attribute: str, name: str, value: str) -> str:
     return updated
 
 
+EMBEDDED_DATA_FIELDS = (
+    "collector_version",
+    "methodology_version",
+    "computed_at",
+    "collection_started",
+    "collection_stall_banner",
+    "collection_phase",
+    "status_display",
+    "points",
+    "gaps",
+    "gap_count",
+    "history",
+    "composition_display",
+    "ledger_chain",
+    "accepted_ticks",
+    "rejected_ticks",
+    "methodology",
+)
+EMBEDDED_POINT_FIELDS = (
+    "ts",
+    "notes_total",
+    "lobby_last_seq",
+    "observed_public_rooms",
+    "rates",
+    "rate_display",
+    "census_display",
+    "identity_census_run_display",
+    "composition",
+    "stillborn_display",
+    "sampling_display",
+    "selected_display",
+    "series_display",
+    "signer_funnel",
+    "room_lifecycle_display",
+    "room_lifecycle_sampling_display",
+    "engagement_display",
+    "capacity_display",
+)
+EMBEDDED_RATE_METRICS = (
+    "public_rooms_per_second",
+    "lobby_messages_per_second",
+    "notes_per_second",
+)
+EMBEDDED_HISTORY_FIELDS = (
+    "raw_started_at",
+    "raw_resolution_label",
+    "chart_resolution_label",
+    "rollup_levels",
+)
+EMBEDDED_ROLLUP_LEVEL_FIELDS = (
+    "resolution_label",
+    "start",
+    "end",
+    "buckets",
+)
+EMBEDDED_ROLLUP_BUCKET_FIELDS = (
+    "start",
+    "end",
+    "first",
+    "last",
+    "complete",
+    "has_gap",
+)
+EMBEDDED_HISTORY_CLAIM = (
+    "The embedded page and /data.json retain collector-tick raw points for the "
+    "newest 24 hours."
+)
+EMBEDDED_HISTORY_DISCLOSURE = (
+    "The page embeds a rendering-only projection of collector-tick raw points for "
+    "the newest 24 hours; /data.json retains the complete derived points for that "
+    "window."
+)
+
+
+def selected_fields(source: Any, fields: Iterable[str]) -> Any:
+    if not isinstance(source, dict):
+        return source
+    return {field: source[field] for field in fields if field in source}
+
+
+def embedded_chart_snapshot(snapshot: Any) -> Any:
+    return selected_fields(snapshot, ("ts", *ROLLUP_VALUE_FIELDS))
+
+
+def embedded_history(history: Any) -> Any:
+    projected = selected_fields(history, EMBEDDED_HISTORY_FIELDS)
+    if not isinstance(projected, dict):
+        return projected
+    levels = history.get("rollup_levels")
+    if not isinstance(levels, list):
+        return projected
+
+    projected_levels = []
+    for level in levels:
+        projected_level = selected_fields(level, EMBEDDED_ROLLUP_LEVEL_FIELDS)
+        if not isinstance(projected_level, dict):
+            projected_levels.append(projected_level)
+            continue
+        buckets = level.get("buckets")
+        if isinstance(buckets, list):
+            projected_buckets = []
+            for bucket in buckets:
+                projected_bucket = selected_fields(
+                    bucket,
+                    EMBEDDED_ROLLUP_BUCKET_FIELDS,
+                )
+                if isinstance(projected_bucket, dict):
+                    projected_bucket["first"] = embedded_chart_snapshot(
+                        bucket.get("first")
+                    )
+                    projected_bucket["last"] = embedded_chart_snapshot(
+                        bucket.get("last")
+                    )
+                projected_buckets.append(projected_bucket)
+            projected_level["buckets"] = projected_buckets
+        projected_levels.append(projected_level)
+    projected["rollup_levels"] = projected_levels
+    return projected
+
+
+def embedded_point(point: Any) -> Any:
+    projected = selected_fields(point, EMBEDDED_POINT_FIELDS)
+    if not isinstance(projected, dict):
+        return projected
+
+    projected["rates"] = selected_fields(
+        point.get("rates"),
+        EMBEDDED_RATE_METRICS,
+    )
+    projected["rate_display"] = selected_fields(
+        point.get("rate_display"),
+        EMBEDDED_RATE_METRICS,
+    )
+    projected["census_display"] = selected_fields(
+        point.get("census_display"),
+        ("value_text", "context"),
+    )
+    composition = selected_fields(
+        point.get("composition"),
+        ("counts", "samples", "complete"),
+    )
+    if isinstance(composition, dict):
+        composition["counts"] = selected_fields(composition.get("counts"), CLASSES)
+    projected["composition"] = composition
+    funnel = point.get("signer_funnel")
+    if isinstance(funnel, dict) and isinstance(funnel.get("display"), dict):
+        display = selected_fields(
+            funnel["display"],
+            ("census", "stages", "warning", "coverage_text", "tracked_text"),
+        )
+        display["census"] = selected_fields(
+            display.get("census"),
+            ("value_text", "context"),
+        )
+        if isinstance(display.get("stages"), list):
+            display["stages"] = [
+                selected_fields(
+                    stage,
+                    ("key", "value_text", "context", "width_percent"),
+                )
+                for stage in display["stages"]
+            ]
+        projected["signer_funnel"] = {"display": display}
+    else:
+        projected["signer_funnel"] = funnel
+    return projected
+
+
+def embedded_methodology(methodology: Any) -> Any:
+    projected = dict(methodology) if isinstance(methodology, dict) else methodology
+    if isinstance(projected, dict) and isinstance(projected.get("history"), str):
+        projected["history"] = projected["history"].replace(
+            EMBEDDED_HISTORY_CLAIM,
+            EMBEDDED_HISTORY_DISCLOSURE,
+        )
+    return projected
+
+
+def embedded_rendering_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the bounded browser payload without changing the data artifact."""
+    projected = selected_fields(data, EMBEDDED_DATA_FIELDS)
+    points = data.get("points")
+    if isinstance(points, list):
+        projected["points"] = [embedded_point(point) for point in points]
+    gaps = data.get("gaps")
+    if isinstance(gaps, list):
+        projected["gaps"] = [
+            selected_fields(gap, ("to", "cadence_gap")) for gap in gaps
+        ]
+    projected["history"] = embedded_history(data.get("history"))
+    projected["status_display"] = selected_fields(
+        data.get("status_display"),
+        ("state_text", "age_text", "schema_text", "raw_window_text"),
+    )
+    composition = selected_fields(
+        data.get("composition_display"),
+        ("summary_text", "classes_text", "classes"),
+    )
+    if isinstance(composition, dict) and isinstance(composition.get("classes"), list):
+        composition["classes"] = [
+            selected_fields(
+                entry,
+                ("key", "label", "count_text", "share_text", "window_text"),
+            )
+            for entry in composition["classes"]
+        ]
+    projected["composition_display"] = composition
+    projected["ledger_chain"] = selected_fields(
+        data.get("ledger_chain"),
+        ("display", "anchor_display"),
+    )
+    projected["methodology"] = embedded_methodology(data.get("methodology"))
+    return projected
+
+
 def inject_html(path: Path, data: dict[str, Any]) -> None:
     source = path.read_text(encoding="utf-8")
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace(
-        "<", "\\u003c"
-    )
+    rendering_data = embedded_rendering_data(data)
+    payload = json.dumps(
+        rendering_data,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).replace("<", "\\u003c")
     pattern = re.compile(
         r'(<script id="observatory-data" type="application/json">).*?(</script>)',
         re.DOTALL,

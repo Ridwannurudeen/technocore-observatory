@@ -714,7 +714,9 @@ def test_guards_validate_the_static_release_before_rendering_it(tmp_path, monkey
 
     def fake_build_page(_html, _derive, _ticks, into):
         (into / "data.json").write_text('{"points":[]}', encoding="utf-8")
-        return into / "index.html"
+        built = into / "index.html"
+        built.write_text("<!doctype html>", encoding="utf-8")
+        return built
 
     def record(name):
         def guard(*_args):
@@ -1366,26 +1368,90 @@ def test_static_release_guard_requires_every_generated_route_artifact():
     } <= guards.STATIC_RELEASE_FILES
 
 
+def payload_guard_page(tmp_path, ticks):
+    destination = tmp_path / "payload-guard"
+    destination.mkdir()
+    return guards.build_page(
+        ROOT / "index.html",
+        ROOT / "derive.py",
+        ticks,
+        destination,
+    ).read_text(encoding="utf-8")
+
+
+def test_embedded_point_projection_matches_every_script_read():
+    source = read(ROOT / "index.html")
+    paths = guards.read_paths(source)
+    data_fields = {path.split(".", 2)[1] for path in paths if path.startswith("data.")}
+    local_fields = {"x", "y", "breakBefore", "_break_before", "_partial", "partial"}
+    point_fields = {
+        path.split(".", 2)[1] for path in paths if path.startswith("point.")
+    } - local_fields
+
+    assert data_fields == set(derive.EMBEDDED_DATA_FIELDS)
+    assert point_fields == set(derive.EMBEDDED_POINT_FIELDS)
+
+    class_keys = re.search(r"const CLASS_KEYS = \[(.*?)\];", source, re.S)
+    rate_metrics = re.search(r"const SERIES_RATE_METRICS = \{(.*?)\};", source, re.S)
+    assert class_keys is not None
+    assert rate_metrics is not None
+    assert set(re.findall(r'"([a-z_]+)"', class_keys.group(1))) == set(derive.CLASSES)
+    assert set(re.findall(r': "([a-z_]+)"', rate_metrics.group(1))) == set(
+        derive.EMBEDDED_RATE_METRICS
+    )
+
+
+def test_payload_path_reader_canonicalises_observation_aliases_and_destructuring():
+    html = (
+        "<script>"
+        "const {capacity_display: capacity} = point;"
+        "record.rates;"
+        "seriesBaseline.notes_total;"
+        "point['sampling_display'];"
+        "</script>"
+    )
+
+    assert guards.read_paths(html) == {
+        "point.capacity_display",
+        "point.rates",
+        "point.notes_total",
+        "point.sampling_display",
+    }
+
+
 def test_payload_guard_accepts_a_declared_but_unobserved_optional_branch(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
+    html = payload_guard_page(tmp_path, ticks)
 
-    assert (
-        guards.guard_payload_contract(
-            read(ROOT / "index.html"), ROOT / "derive.py", ticks
-        )
-        == []
-    )
+    assert guards.guard_payload_contract(html, ROOT / "derive.py", ticks) == []
 
 
 def test_payload_guard_still_rejects_an_undeclared_field(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
-    html = "<script>const value = point.never_emitted;</script>"
+    html = payload_guard_page(tmp_path, ticks).replace(
+        "</body>",
+        "<script>const value = point.never_emitted;</script></body>",
+    )
 
     assert guards.guard_payload_contract(html, ROOT / "derive.py", ticks) == [
         "the page reads `point.never_emitted` but the deriver never emits it "
         "(producer/consumer drift)"
+    ]
+
+
+def test_payload_guard_rejects_a_field_dropped_only_from_rendering_data(tmp_path):
+    ticks = tmp_path / "ticks.jsonl"
+    write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
+    html = payload_guard_page(tmp_path, ticks).replace(
+        "</body>",
+        "<script>const value = point.room_lifecycle;</script></body>",
+    )
+
+    assert guards.guard_payload_contract(html, ROOT / "derive.py", ticks) == [
+        "the page reads `point.room_lifecycle` but the embedded rendering "
+        "projection drops it (producer/consumer drift)"
     ]
 
 
