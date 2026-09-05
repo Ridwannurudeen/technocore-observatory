@@ -314,8 +314,17 @@ def write_pages(root: Path, snapshots: dict[str, dict[str, Any]]) -> None:
     status_envelope = snapshots["status"]
     status = status_envelope["status"]
     collector_coverage = status_envelope["coverage"]["collector"]
+    telemetry_coverage = status_envelope["coverage"]["telemetry"]
     published_date = status_envelope["published_at"].split("T", 1)[0]
     window_label = f"{status_envelope['window']['seconds'] // 60} minutes"
+    endpoint_window = (
+        "Not observed"
+        if telemetry_coverage["to"] is None
+        else (
+            f"{telemetry_coverage['from']} to {telemetry_coverage['to']} "
+            f"({window_label})"
+        )
+    )
 
     write_text(
         root,
@@ -349,7 +358,7 @@ def write_pages(root: Path, snapshots: dict[str, dict[str, Any]]) -> None:
                 "ATTEMPT_COUNT": escaped(
                     status_envelope["coverage"]["telemetry"]["attempts"]
                 ),
-                "WINDOW_LABEL": escaped(window_label),
+                "ENDPOINT_WINDOW": escaped(endpoint_window),
             },
         ),
     )

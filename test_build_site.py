@@ -398,6 +398,20 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     assert "\u00c2" not in home + rooms + script
 
 
+def test_homepage_endpoint_preview_names_its_counted_telemetry_window(
+    built_release,
+):
+    release, _ = built_release
+    home = (release / "index.html").read_text(encoding="utf-8")
+    status = json.loads((release / "api/v1/status.json").read_text(encoding="utf-8"))
+    coverage = status["coverage"]["telemetry"]
+    endpoint_row = re.search(r"<div>\s*<dt>Endpoint evidence\b.*?</div>", home, re.S)
+
+    assert endpoint_row is not None
+    assert coverage["from"] in endpoint_row.group(0)
+    assert coverage["to"] in endpoint_row.group(0)
+
+
 def test_homepage_room_search_submits_a_native_local_encoded_get(served_release):
     sync_api = pytest.importorskip("playwright.sync_api")
     base_url, requested_paths = served_release
@@ -561,6 +575,67 @@ def test_homepage_stylesheet_bypasses_a_cached_bare_asset_url(served_release):
             browser.close()
 
 
+def test_home_motion_does_not_reposition_static_narrative_when_loaded_late(
+    served_release,
+):
+    sync_api = pytest.importorskip("playwright.sync_api")
+    base_url, _ = served_release
+
+    with sync_api.sync_playwright() as playwright:
+        chromium_executable = Path(playwright.chromium.executable_path)
+        if not chromium_executable.is_file():
+            pytest.skip("Playwright Chromium is not installed")
+        browser = playwright.chromium.launch(executable_path=chromium_executable)
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            motion_requests = 0
+
+            def replace_initial_motion_script(route):
+                nonlocal motion_requests
+                motion_requests += 1
+                if motion_requests == 1:
+                    route.fulfill(
+                        status=200,
+                        content_type="application/javascript",
+                        body="",
+                    )
+                else:
+                    route.continue_()
+
+            page.route(
+                lambda url: urllib.parse.urlsplit(url).path == "/assets/home-motion.js",
+                replace_initial_motion_script,
+            )
+            record_home_animations(page, pause=True)
+            page.goto(f"{base_url}/")
+            narrative = page.locator(".home-retention > div:first-child")
+            narrative.scroll_into_view_if_needed()
+            before = narrative.bounding_box()
+            assert before is not None
+            assert_home_elements_visible_and_untransformed(
+                page, ".home-retention > div:first-child"
+            )
+
+            page.add_script_tag(url=f"{base_url}/assets/home-motion.js?v=late")
+            page.wait_for_timeout(100)
+            after = narrative.bounding_box()
+            assert after is not None
+            calls = page.evaluate(
+                "element => window.__homeMotionCalls.filter("
+                " call => call.element === element"
+                ").length",
+                narrative.element_handle(),
+            )
+
+            assert motion_requests == 2
+            assert calls == 0
+            assert after["x"] == pytest.approx(before["x"])
+            assert after["y"] == pytest.approx(before["y"])
+            page.close()
+        finally:
+            browser.close()
+
+
 def test_home_motion_runs_once_finishes_and_never_targets_facts(served_release):
     sync_api = pytest.importorskip("playwright.sync_api")
     base_url, _ = served_release
@@ -607,13 +682,12 @@ def test_home_motion_runs_once_finishes_and_never_targets_facts(served_release):
             narrative = page.locator(HOME_MOTION_NARRATIVE_SELECTOR)
             assert narrative.count() == 7
             for index in range(narrative.count()):
-                element = narrative.nth(index)
-                element.scroll_into_view_if_needed()
-                page.wait_for_function(
-                    "element => window.__homeMotionCalls.some("
-                    " call => call.element === element)",
-                    arg=element.element_handle(),
-                )
+                narrative.nth(index).scroll_into_view_if_needed()
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame("
+                " () => requestAnimationFrame(resolve)"
+                "))"
+            )
 
             boundary = page.locator(".home-boundary")
             calls_before_reentry = page.evaluate("window.__homeMotionCalls.length")
@@ -690,17 +764,14 @@ def test_home_motion_runs_once_finishes_and_never_targets_facts(served_release):
                 },
             )
             assert audit["edgeCounts"] == [1, 1, 1, 1]
-            assert audit["narrativeCounts"] == [2] * narrative.count()
+            assert audit["narrativeCounts"] == [0] * narrative.count()
             assert audit["edgeProperties"] == [["transform"]] * edges.count()
-            assert (
-                audit["narrativeProperties"]
-                == [["opacity", "transform"]] * narrative.count()
-            )
+            assert audit["narrativeProperties"] == [[]] * narrative.count()
             assert audit["rejected"] == 0
             assert audit["unexpectedTargets"] == 0
             assert audit["factTargets"] == 0
             assert all(0 < duration <= 1200 for duration in audit["edgeDurations"])
-            assert all(0 < duration <= 500 for duration in audit["narrativeDurations"])
+            assert audit["narrativeDurations"] == []
             assert_home_elements_visible_and_untransformed(
                 page, HOME_MOTION_FACT_SELECTOR
             )
@@ -819,16 +890,8 @@ def test_home_motion_honors_initial_and_runtime_reduced_motion(served_release):
             page = context.new_page()
             record_home_animations(page, pause=True)
             page.goto(f"{base_url}/")
-            page.wait_for_function("window.__homeMotionCalls.length > 0")
+            page.wait_for_function("window.__homeMotionCalls.length === 4")
             narrative = page.locator(HOME_MOTION_NARRATIVE_SELECTOR)
-            active_narrative = narrative.first
-            active_narrative.scroll_into_view_if_needed()
-            page.wait_for_function(
-                "element => window.__homeMotionCalls.filter("
-                " call => call.element === element"
-                ").length === 2",
-                arg=active_narrative.element_handle(),
-            )
             started = page.evaluate("window.__homeMotionCalls.length")
             assert page.evaluate(
                 "selector => Array.from(document.querySelectorAll(selector)).some("
