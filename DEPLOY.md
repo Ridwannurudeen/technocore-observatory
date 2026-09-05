@@ -598,7 +598,9 @@ link pattern and run `nginx -t`. This changes no collector, telemetry, or signer
 immediate predecessor is always retained for this purpose; older releases are subject to the
 documented count/byte bounds. Keep the rejected release for diagnosis. A release built before
 `errors/query-rate-limited.html` existed serves nginx's built-in 429 body on the two human page
-routes, with the same status and headers, until a newer release is published.
+routes, with the same status and headers, until a newer release is published. A release built
+before `errors/query-not-found.html` existed likewise serves nginx's built-in 404 body on the
+room/key human detail routes until a newer release is published.
 
 ```bash
 (

@@ -46,6 +46,7 @@ DEPLOY_FILES = {
         for stem in API_FALLBACKS
         for suffix in ("json", "txt")
     ),
+    FALLBACK / "query-not-found.html",
     FALLBACK / "query-rate-limited.html",
     FALLBACK / "query-unavailable.html",
     ROOT / "recover_publication.py",
@@ -391,7 +392,12 @@ def test_rooms_index_is_static_without_args_and_search_requests_are_proxied():
         vhost,
     )
     assert did_match is not None
-    assert "error_page 429 =429 @html_rate_limited;" in did_match.group(1)
+    did_location = did_match.group(1)
+    assert "error_page 404 =404 @html_not_found;" in did_location
+    assert "error_page 429 =429 @html_rate_limited;" in did_location
+    assert "location @html_not_found {" in vhost
+    assert "try_files /errors/query-not-found.html =404;" in vhost
+    assert "errors/query-not-found.html" in guards.STATIC_RELEASE_FILES
     assert "errors/query-rate-limited.html" in guards.STATIC_RELEASE_FILES
 
 
@@ -1316,6 +1322,7 @@ def test_docs_state_the_unwaived_lint_command_and_failure_metadata_boundary():
     assert "every generated directory mode `0755`" in deploy
     assert "every ordinary generated file mode" in deploy
     assert "same exclusive publication-root lock" in deploy
+    assert "before `errors/query-not-found.html` existed" in deploy
     assert re.search(
         r"TRACE must return the bounded `no-store` 405 method\s+artifact",
         deploy,
@@ -1327,12 +1334,15 @@ def test_fallback_contracts_are_bounded_credential_free_and_non_indexable():
     for name, claim in (
         ("query-unavailable", "local query service is unavailable"),
         ("query-rate-limited", "exceeded the local query rate"),
+        ("query-not-found", "outside the stored record"),
     ):
         html = read(FALLBACK / f"{name}.html")
         assert '<meta name="robots" content="noindex,nofollow,noarchive">' in html
         assert claim in html.lower()
         assert "<script" not in html.lower()
         assert 'id="theme-toggle"' not in html
+    not_found = read(FALLBACK / "query-not-found.html").lower()
+    assert "not observed is not absent" in not_found
     for stem, error in API_FALLBACKS.items():
         payload = json.loads(read(FALLBACK / f"{stem}.json"))
         plain = (FALLBACK / f"{stem}.txt").read_bytes()
@@ -1579,6 +1589,21 @@ def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
         for finding in findings
     )
     rate_limited_path.write_text(rate_limited, encoding="utf-8")
+
+    not_found_path = release / "errors/query-not-found.html"
+    not_found = not_found_path.read_text(encoding="utf-8")
+    not_found_path.write_text(
+        not_found.replace(
+            '<meta name="robots" content="noindex,nofollow,noarchive">', ""
+        ),
+        encoding="utf-8",
+    )
+    findings = guards.guard_static_release(release)
+    assert any(
+        "query-not-found.html" in finding and "noindex" in finding
+        for finding in findings
+    )
+    not_found_path.write_text(not_found, encoding="utf-8")
 
     openapi_path.unlink()
     findings = guards.guard_static_release(release)

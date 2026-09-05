@@ -94,6 +94,7 @@ STATIC_RELEASE_FILES = frozenset(
         "changes/index.html",
         "data.json",
         "favicon.ico",
+        "errors/query-not-found.html",
         "errors/query-rate-limited.html",
         "errors/query-unavailable.html",
         "incidents/index.html",
@@ -674,7 +675,11 @@ def guard_static_release(root: Path) -> list[str]:
     rooms = (root / "rooms/index.html").read_text(encoding="utf-8")
     if '<meta name="robots" content="noindex,nofollow,noarchive">' not in rooms:
         failures.append("room search shell is missing its noindex metadata")
-    for relative in ("errors/query-rate-limited.html", "errors/query-unavailable.html"):
+    for relative in (
+        "errors/query-not-found.html",
+        "errors/query-rate-limited.html",
+        "errors/query-unavailable.html",
+    ):
         page = (root / relative).read_text(encoding="utf-8")
         if '<meta name="robots" content="noindex,nofollow,noarchive">' not in page:
             failures.append(f"`{relative}` is missing its noindex metadata")
