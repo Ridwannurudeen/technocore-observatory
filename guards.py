@@ -196,6 +196,44 @@ def guard_zero_width_render(html_path: Path) -> list[str]:
     return failures
 
 
+def guard_mobile_horizontal_overflow(root: Path) -> list[str]:
+    """Render every published page at phone size and fail horizontal overflow."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return ["SKIPPED: playwright is not installed, so layout could not be verified"]
+
+    failures: list[str] = []
+    root = root.resolve()
+    with sync_playwright() as pw:
+        browser = launch_browser(pw)
+        if browser is None:
+            return [
+                "SKIPPED: no Chromium/Chrome/Edge available, so layout could not be verified"
+            ]
+        try:
+            page = browser.new_page(viewport={"width": 390, "height": 844})
+            for html_path in sorted(root.rglob("*.html")):
+                relative = html_path.relative_to(root).as_posix()
+                page.goto(html_path.as_uri())
+                dimensions = page.evaluate(
+                    "() => ({"
+                    " scrollWidth: document.documentElement.scrollWidth,"
+                    " clientWidth: document.documentElement.clientWidth"
+                    " })"
+                )
+                if dimensions["scrollWidth"] > dimensions["clientWidth"]:
+                    failures.append(
+                        f"`{relative}` has horizontal overflow at 390x844: "
+                        f"scrollWidth {dimensions['scrollWidth']}px exceeds "
+                        f"clientWidth {dimensions['clientWidth']}px"
+                    )
+            page.close()
+        finally:
+            browser.close()
+    return failures
+
+
 def read_paths(html: str) -> set[str]:
     """Payload paths the page's JavaScript reads, as `data.x` / `point.x.y`.
 
@@ -756,6 +794,10 @@ def main() -> int:
             ("static release", guard_static_release(args.site_root)),
             ("zero-width render", guard_zero_width_render(built)),
             ("no-JS honesty", guard_no_js_state(built, payload)),
+            (
+                "mobile horizontal overflow",
+                guard_mobile_horizontal_overflow(args.site_root),
+            ),
         )
 
         failed = 0
