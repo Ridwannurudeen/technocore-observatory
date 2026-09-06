@@ -2140,7 +2140,7 @@ def test_no_js_guard_fails_when_every_bar_anchor_disappears(monkeypatch):
 
 
 def test_render_guards_hold_on_a_built_release(built_release):
-    """Run the two browser guards that never run anywhere else.
+    """Run the three browser guards that never run anywhere else.
 
     `rebuild.sh` invokes them on the collector host, which has no browser, so
     they SKIP on every deploy; nothing else calls them. They are the only
@@ -2152,9 +2152,29 @@ def test_render_guards_hold_on_a_built_release(built_release):
     release, _ = built_release
     built = release / "observatory/index.html"
     payload = json.loads((release / "data.json").read_text(encoding="utf-8"))
+    source = built.read_text(encoding="utf-8")
+    opening = '<script id="observatory-data" type="application/json">'
+    head, separator, rest = source.partition(opening)
+    encoded, closing, tail = rest.partition("</script>")
+    assert separator and closing
+    rendering_payload = json.loads(encoded)
+    stages = rendering_payload["points"][-1]["room_lifecycle_sampling_display"][
+        "stages"
+    ]
+    for stage in ("300", "3600", "86400"):
+        stages[stage]["value_text"] = "22,734 / 195,090 completed"
+    rewritten = json.dumps(
+        rendering_payload, ensure_ascii=False, separators=(",", ":")
+    ).replace("<", "\\u003c")
+    built.write_text(
+        head + opening + rewritten + "</script>" + tail,
+        encoding="utf-8",
+    )
 
-    findings = guards.guard_zero_width_render(built) + guards.guard_no_js_state(
-        built, payload
+    findings = (
+        guards.guard_zero_width_render(built)
+        + guards.guard_no_js_state(built, payload)
+        + guards.guard_mobile_horizontal_overflow(release)
     )
     skipped = [f for f in findings if f.startswith("SKIPPED:")]
     if skipped:
