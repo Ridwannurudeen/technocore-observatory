@@ -1194,14 +1194,14 @@ def test_runbook_rollback_validates_an_exact_release_child_before_linking(tmp_pa
         assert linked.returncode != 0
 
 
-def test_runbook_has_no_sqlite_wal_sidecar_dependency():
+def test_runbook_documents_signer_wal_without_changing_telemetry():
     source = read(ROOT / "DEPLOY.md")
 
-    assert "signer and telemetry databases use SQLite DELETE journal mode" in source
-    assert "no WAL/SHM sidecar dependency" in source
-    assert "sidecar for both SQLite databases" not in source
-    assert "signer database and any WAL/SHM sidecars" not in source
-    assert "telemetry database remains in WAL mode" not in source
+    assert "signer database uses WAL journal mode" in source
+    assert "`synchronous=NORMAL`" in source
+    assert "1,000-page" in source
+    assert "last committed transaction can be lost" in source
+    assert "Telemetry remains on DELETE/FULL" in source
 
 
 def test_runbook_fences_both_legacy_crons_and_preserves_live_census_state():

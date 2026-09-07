@@ -64,10 +64,10 @@ the zone replenishes one request every 2 s with a burst of 10. All five error st
 remain publicly cacheable. Every loopback proxy suppresses GET/HEAD request bodies and clears the
 forwarded `Content-Length`.
 
-The signer and telemetry databases use SQLite DELETE journal mode. Consequently, the read-only
-query and rebuild services have no WAL/SHM sidecar dependency. An interrupted write can still
-leave a hot rollback journal; until normalized, each database and its existing `-journal` are one
-recovery family.
+The signer database uses WAL journal mode with `synchronous=NORMAL` and an explicit 1,000-page
+automatic-checkpoint threshold. WAL with NORMAL remains durable against a process crash and cannot
+corrupt the database on power loss, but the last committed transaction can be lost after power
+loss; the tick outbox already tolerates that loss boundary. Telemetry remains on DELETE/FULL.
 
 ## 1. Verify the candidate locally
 

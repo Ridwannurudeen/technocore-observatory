@@ -126,6 +126,7 @@ SQLITE_INTEGER_MAX = (1 << 63) - 1
 MAX_RETRIES = 10
 PINNED_SQLITE_VERSION = (3, 53, 4)
 VENDORED_SQLITE_DIRECTORY = "/home/technocore/observatory/lib"
+SIGNER_WAL_AUTOCHECKPOINT_PAGES = 1_000
 
 
 class CollectionError(RuntimeError):
@@ -4773,8 +4774,19 @@ def connect_signer_database(path: Path) -> sqlite3.Connection:
     assert_pinned_sqlite()
     connection = sqlite3.connect(path, timeout=5.0)
     try:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute("PRAGMA synchronous = FULL")
+        journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        if str(journal_mode).lower() != "wal":
+            raise CollectionError(
+                f"signer database refused WAL journal mode: {journal_mode}"
+            )
+        connection.execute("PRAGMA synchronous = NORMAL")
+        autocheckpoint = connection.execute(
+            f"PRAGMA wal_autocheckpoint = {SIGNER_WAL_AUTOCHECKPOINT_PAGES}"
+        ).fetchone()[0]
+        if autocheckpoint != SIGNER_WAL_AUTOCHECKPOINT_PAGES:
+            raise CollectionError(
+                "signer database refused the configured WAL autocheckpoint"
+            )
         connection.execute("PRAGMA foreign_keys = ON")
         initialize_signer_database(connection)
     except Exception:

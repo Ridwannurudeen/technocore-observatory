@@ -343,6 +343,11 @@ def open_readonly_database(
             raise SchemaError(
                 "query database requires a case-sensitive trigram search index"
             )
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(journal_mode).lower() != "wal":
+            raise SchemaError(
+                f"query database must use WAL journal mode; found {journal_mode}"
+            )
         arm_query_deadline(connection, query_timeout_seconds)
     except Exception:
         connection.close()

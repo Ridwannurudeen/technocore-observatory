@@ -87,10 +87,16 @@ def collect_revisits(
     )
 
 
-def test_signer_database_uses_delete_journal_without_sidecars(tmp_path):
+def test_signer_database_uses_wal_normal_and_bounded_autocheckpoint(tmp_path):
     path = tmp_path / "signers.sqlite3"
     connection = connect_signer_database(path)
-    assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+    assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+    assert connection.execute("PRAGMA synchronous").fetchone() == (1,)
+    assert connection.execute("PRAGMA wal_autocheckpoint").fetchone() == (
+        collect.SIGNER_WAL_AUTOCHECKPOINT_PAGES,
+    )
+    assert path.with_name(path.name + "-wal").exists()
+    assert path.with_name(path.name + "-shm").exists()
     connection.close()
 
     assert not path.with_name(path.name + "-wal").exists()
