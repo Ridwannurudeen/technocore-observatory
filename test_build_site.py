@@ -305,6 +305,8 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
     home = (release / "index.html").read_text(encoding="utf-8")
     rooms = (release / "rooms/index.html").read_text(encoding="utf-8")
     status = (release / "status/index.html").read_text(encoding="utf-8")
+    about = (release / "about/index.html").read_text(encoding="utf-8")
+    observatory = (release / "observatory/index.html").read_text(encoding="utf-8")
     script = (release / "assets/site.js").read_text(encoding="utf-8")
 
     shell_markers = (
@@ -318,9 +320,19 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
         '<main id="main-content" class="page-shell" tabindex="-1">',
         '<footer class="site-footer">',
     )
+    author_links = (
+        '<a href="https://github.com/Ridwannurudeen" rel="me noopener">GITHUB</a>',
+        '<a href="https://x.com/Ggudman1" rel="me noopener">X</a>',
+    )
     for source in (home, rooms):
         for marker in shell_markers:
             assert marker in source
+        footer = source.split('<footer class="site-footer">', 1)[1].split(
+            "</footer>", 1
+        )[0]
+        assert "BUILT BY RIDWAN NURUDEEN" in footer
+        for marker in author_links:
+            assert marker in footer
         assert '<nav class="priority-nav" aria-label="Primary">' in source
         form_match = re.search(
             r'<form class="room-search"[^>]*>.*?</form>',
@@ -337,6 +349,14 @@ def test_pages_use_local_assets_progressive_search_and_evidence_rails(built_rele
         assert 'maxlength="80"' in form
         assert 'id="search-feedback"' in form
         assert 'aria-live="polite"' in form
+
+    assert '<h2 id="provenance-title">Built by Ridwan Nurudeen.</h2>' in about
+    machine_line = re.search(r'<p class="machine-line">.*?</p>', observatory, re.S)
+    assert machine_line is not None
+    assert "BUILT BY RIDWAN NURUDEEN" in machine_line.group(0)
+    for source in (about, machine_line.group(0)):
+        for marker in author_links:
+            assert marker in source
 
     assert "Room name or 16-character record ID" not in home
     assert 'href="/changes/"' in home
