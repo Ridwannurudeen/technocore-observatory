@@ -124,6 +124,9 @@ MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 SQLITE_INTEGER_MAX = (1 << 63) - 1
 MAX_RETRIES = 10
+PINNED_SQLITE_VERSION = (3, 53, 4)
+VENDORED_SQLITE_DIRECTORY = "/home/technocore/observatory/lib"
+SIGNER_WAL_AUTOCHECKPOINT_PAGES = 1_000
 
 
 class CollectionError(RuntimeError):
@@ -143,6 +146,16 @@ class CollectionError(RuntimeError):
 
 class TickOutboxCommittedError(OSError):
     """The durable tick exists, but its metadata mirror was not published."""
+
+
+def assert_pinned_sqlite() -> None:
+    if sqlite3.sqlite_version_info < PINNED_SQLITE_VERSION:
+        required = ".".join(str(part) for part in PINNED_SQLITE_VERSION)
+        raise CollectionError(
+            f"signer database requires vendored SQLite {required} or newer; "
+            f"loaded {sqlite3.sqlite_version}. Set "
+            f"LD_LIBRARY_PATH={VENDORED_SQLITE_DIRECTORY} before starting this process"
+        )
 
 
 def utc_now() -> str:
@@ -3116,6 +3129,8 @@ def drain_tick_outbox(
     signer_state_path: Path,
     census_state_path: Path,
     lock_timeout: float = SIGNER_LOCK_TIMEOUT,
+    *,
+    signer_connection: sqlite3.Connection | None = None,
 ) -> bool:
     database_path = signer_database_path(signer_state_path)
     if not database_path.exists():
@@ -3124,7 +3139,12 @@ def drain_tick_outbox(
     with exclusive_state_lock(signer_state_path, lock_timeout):
         if not database_path.exists():
             return False
-        connection = connect_signer_database(database_path)
+        owns_connection = signer_connection is None
+        connection = (
+            signer_connection
+            if signer_connection is not None
+            else connect_signer_database(database_path)
+        )
         try:
             connection.execute("BEGIN IMMEDIATE")
             outbox = load_tick_outbox(connection)
@@ -3160,7 +3180,8 @@ def drain_tick_outbox(
             connection.rollback()
             raise
         finally:
-            connection.close()
+            if owns_connection:
+                connection.close()
 
 
 def _migrate_room_generation_schema(connection: sqlite3.Connection) -> None:
@@ -4750,10 +4771,22 @@ def initialize_signer_database(connection: sqlite3.Connection) -> None:
 
 
 def connect_signer_database(path: Path) -> sqlite3.Connection:
+    assert_pinned_sqlite()
     connection = sqlite3.connect(path, timeout=5.0)
     try:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute("PRAGMA synchronous = FULL")
+        journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        if str(journal_mode).lower() != "wal":
+            raise CollectionError(
+                f"signer database refused WAL journal mode: {journal_mode}"
+            )
+        connection.execute("PRAGMA synchronous = NORMAL")
+        autocheckpoint = connection.execute(
+            f"PRAGMA wal_autocheckpoint = {SIGNER_WAL_AUTOCHECKPOINT_PAGES}"
+        ).fetchone()[0]
+        if autocheckpoint != SIGNER_WAL_AUTOCHECKPOINT_PAGES:
+            raise CollectionError(
+                "signer database refused the configured WAL autocheckpoint"
+            )
         connection.execute("PRAGMA foreign_keys = ON")
         initialize_signer_database(connection)
     except Exception:
@@ -6695,6 +6728,8 @@ def collect_tick(
     census_started: str | None = None,
     census_run: dict[str, Any] | None = None,
     lock_timeout: float = SIGNER_LOCK_TIMEOUT,
+    *,
+    signer_connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     tick_started = time.monotonic()
     rooms = parse_collected_response(
@@ -6717,7 +6752,11 @@ def collect_tick(
         # Phase 1a: load the durable signer state and advance the room-sample
         # selector. The existing metadata transaction remains intentionally
         # separate from the tick transaction and performs no origin I/O.
-        connection = connect_signer_database(database_path)
+        connection = (
+            signer_connection
+            if signer_connection is not None
+            else connect_signer_database(database_path)
+        )
         try:
             connection.execute("BEGIN IMMEDIATE")
             if load_tick_outbox(connection) is not None:
@@ -6733,10 +6772,11 @@ def collect_tick(
             connection.rollback()
             raise
         finally:
-            connection.close()
+            if signer_connection is None:
+                connection.close()
 
         # Phase 2a: fetch the event window without an open signer-database
-        # connection. The tick timestamp deliberately remains immediately
+        # transaction. The tick timestamp deliberately remains immediately
         # after this response, preserving the published observation time.
         events_path = "/r/events?format=json&limit=200"
         events_last_seq, events, class_counts, primary_counts = (
@@ -6752,12 +6792,17 @@ def collect_tick(
         # Phase 1b: finish the read-only plan now that the event window and
         # tick timestamp are known. Newly observed room generations are
         # overlaid in memory so their schedules affect this tick exactly as
-        # they did when inserted before selection. Close the read connection
-        # before any remaining origin request.
-        planning_connection = sqlite3.connect(
-            database_path.resolve().as_uri() + "?mode=ro",
-            uri=True,
-            timeout=5.0,
+        # they did when inserted before selection. A daemon's held connection
+        # is query-only during this phase; direct callers retain the isolated
+        # read-only planning connection.
+        planning_connection = (
+            signer_connection
+            if signer_connection is not None
+            else sqlite3.connect(
+                database_path.resolve().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
         )
         try:
             planning_connection.execute("PRAGMA query_only = ON")
@@ -6783,10 +6828,13 @@ def collect_tick(
                 created_rooms=planned_created_rooms,
             )
         finally:
-            planning_connection.close()
+            if signer_connection is None:
+                planning_connection.close()
+            else:
+                planning_connection.execute("PRAGMA query_only = OFF")
 
         # Phase 2b: complete every origin read from the immutable plan. No
-        # signer-database connection is open during this network work.
+        # signer-database transaction is open during this network work.
         fetched_revisits = fetch_room_revisits(
             client,
             revisit_plan,
@@ -6849,7 +6897,11 @@ def collect_tick(
 
         # Phase 3: apply the complete tick under one short write transaction.
         # Only local validation, writes and published-summary reads occur here.
-        connection = connect_signer_database(database_path)
+        connection = (
+            signer_connection
+            if signer_connection is not None
+            else connect_signer_database(database_path)
+        )
         try:
             connection.execute("BEGIN IMMEDIATE")
             created_this_tick = apply_created_rooms(
@@ -6904,7 +6956,8 @@ def collect_tick(
             connection.rollback()
             raise
         finally:
-            connection.close()
+            if signer_connection is None:
+                connection.close()
 
     return outbox["tick"]
 
@@ -6968,6 +7021,16 @@ def main() -> int:
     )
     telemetry_path.parent.mkdir(parents=True, exist_ok=True)
     telemetry: TelemetryStore | None = None
+    signer_lock_timeout = (
+        CENSUS_SIGNER_LOCK_TIMEOUT if args.census else SIGNER_LOCK_TIMEOUT
+    )
+    with exclusive_state_lock(signer_state_path, signer_lock_timeout):
+        database_path = signer_database_path(signer_state_path)
+        if signer_state_path.exists() and not database_path.exists():
+            raise CollectionError(
+                "signer metadata exists without its SQLite store; run migrate_signers.py"
+            )
+        signer_connection = connect_signer_database(database_path)
 
     try:
         while True:
@@ -7001,14 +7064,12 @@ def main() -> int:
                         )
                     telemetry = None
             try:
-                signer_lock_timeout = (
-                    CENSUS_SIGNER_LOCK_TIMEOUT if args.census else SIGNER_LOCK_TIMEOUT
-                )
                 startup_drained = drain_tick_outbox(
                     args.output,
                     signer_state_path,
                     census_state_path,
                     lock_timeout=signer_lock_timeout,
+                    signer_connection=signer_connection,
                 )
                 if startup_drained:
                     tick_written = True
@@ -7054,6 +7115,7 @@ def main() -> int:
                         census_started,
                         census_run,
                         lock_timeout=signer_lock_timeout,
+                        signer_connection=signer_connection,
                     )
                     outbox_committed = True
                     if not drain_tick_outbox(
@@ -7061,6 +7123,7 @@ def main() -> int:
                         signer_state_path,
                         census_state_path,
                         lock_timeout=signer_lock_timeout,
+                        signer_connection=signer_connection,
                     ):
                         raise CollectionError(
                             "collector transaction committed without a tick outbox"
@@ -7162,6 +7225,7 @@ def main() -> int:
                     f"{utc_now()} telemetry degraded; local store did not close cleanly",
                     file=sys.stderr,
                 )
+        signer_connection.close()
 
 
 if __name__ == "__main__":

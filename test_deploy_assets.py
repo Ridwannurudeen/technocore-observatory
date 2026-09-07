@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ import pytest
 import collect
 import derive
 import guards
+import query_service
 from api_contract import text_bytes
 from build_site import build_release
 from test_snapshots import telemetry_database, tick, write_ticks
@@ -22,6 +24,7 @@ ROOT = Path(__file__).parent
 NGINX_HTTP = ROOT / "deploy/nginx/http-context.conf"
 NGINX_VHOST = ROOT / "deploy/nginx/technocore.gudman.xyz.conf"
 SYSTEMD = ROOT / "deploy/systemd"
+SQLITE_DEPLOY = ROOT / "deploy/sqlite"
 FALLBACK = ROOT / "deploy/fallback"
 API_FALLBACKS = {
     "api-bad-request": "bad_request",
@@ -53,6 +56,9 @@ DEPLOY_FILES = {
     ROOT / "recover_publication.py",
     ROOT / "rebuild.sh",
     ROOT / "check_staleness.py",
+    SQLITE_DEPLOY / "PIN.md",
+    SQLITE_DEPLOY / "build.sh",
+    SQLITE_DEPLOY / "rehearse-wal.sh",
     ROOT / "DEMO.md",
 }
 
@@ -478,6 +484,7 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
         "ReadOnlyPaths=/home/technocore/observatory /opt/technocore-observatory"
         in query
     )
+    assert "includes signers.sqlite3 and its -wal/-shm family" in query
     assert "ReadWritePaths=" not in query
 
     assert "User=technocore" in rebuild
@@ -503,6 +510,89 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     assert "OnUnitActiveSec=5min" in staleness_timer
     assert "Unit=technocore-observatory-staleness.service" in staleness_timer
     assert "technocore-observatory-rebuild.service" not in staleness_timer
+
+
+def test_only_signer_database_units_load_the_pinned_sqlite_and_openers_guard_it(
+    tmp_path,
+    monkeypatch,
+):
+    vendored_environment = (
+        "Environment=LD_LIBRARY_PATH=/home/technocore/observatory/lib"
+    )
+    signer_units = {
+        "technocore-observatory.service",
+        "technocore-observatory-query.service",
+    }
+    service_sources = {
+        path.name: read(path) for path in sorted(SYSTEMD.glob("*.service"))
+    }
+
+    assert {
+        name for name, source in service_sources.items() if "LD_LIBRARY_PATH" in source
+    } == signer_units
+    for name, source in service_sources.items():
+        assert source.count(vendored_environment) == int(name in signer_units)
+
+    for source_path in (ROOT / "collect.py", ROOT / "query_service.py"):
+        assert re.search(
+            r"(?m)^PINNED_SQLITE_VERSION = \(3, 53, 4\)$",
+            read(source_path),
+        )
+    unavailable_version = (sqlite3.sqlite_version_info[0] + 1, 0, 0)
+    monkeypatch.setattr(collect, "PINNED_SQLITE_VERSION", unavailable_version)
+    monkeypatch.setattr(query_service, "PINNED_SQLITE_VERSION", unavailable_version)
+
+    with pytest.raises(
+        collect.CollectionError,
+        match=r"requires vendored SQLite .*LD_LIBRARY_PATH=",
+    ):
+        collect.connect_signer_database(tmp_path / "writer.sqlite3")
+    with pytest.raises(
+        query_service.SchemaError,
+        match=r"requires vendored SQLite .*LD_LIBRARY_PATH=",
+    ):
+        query_service.open_readonly_database(tmp_path / "reader.sqlite3")
+
+
+def test_wal_rehearsal_uses_a_confined_copy_and_reports_every_gate():
+    source = read(SQLITE_DEPLOY / "rehearse-wal.sh")
+
+    assert source.startswith("#!/usr/bin/env bash\nset -u\nset -o pipefail\n")
+    backup = source.index("source_connection.backup(destination_connection)")
+    wal_switch = source.index("PRAGMA journal_mode = WAL")
+    held_write = source.index('connection.execute("BEGIN IMMEDIATE")')
+    confined_reader = source.index("if systemd-run")
+    room_search = source.index("FROM room_search WHERE room_search MATCH ?")
+    delete_switch = source.index("PRAGMA journal_mode = DELETE")
+    assert (
+        backup < wal_switch < held_write < confined_reader < room_search < delete_switch
+    )
+    assert 'source.as_uri() + "?mode=ro"' in source
+    assert 'mktemp -d "${OBSERVATORY_ROOT}/.wal-rehearsal.XXXXXXXX"' in source
+    assert "--property=User=technocore-query" in source
+    assert "--property=Group=technocore-query" in source
+    assert "--property=SupplementaryGroups=technocore" in source
+    assert "--property=ProtectSystem=strict" in source
+    assert "--property=ProtectHome=read-only" in source
+    assert (
+        '--property="ReadOnlyPaths=${OBSERVATORY_ROOT} '
+        '/opt/technocore-observatory"' in source
+    )
+    assert "ReadWritePaths" not in source
+    assert "sudo -u technocore-query -- test ! -w" in source
+    assert '--setenv=LD_LIBRARY_PATH="$SQLITE_LIBRARY_DIRECTORY"' in source
+    assert 'sqlite3.connect(\n    database.as_uri() + "?mode=ro"' in source
+    assert 'rm -rf -- "$scratch_directory"' in source
+
+    for gate in (
+        "read succeeds during write",
+        "-shm group-readable",
+        "version assertion",
+        "checkpoint on close",
+        "switch back to DELETE succeeds",
+    ):
+        assert source.count(f'echo "PASS: {gate}"') == 1
+        assert source.count(f'echo "FAIL: {gate}"') == 1
 
 
 @pytest.mark.parametrize(
@@ -1194,14 +1284,14 @@ def test_runbook_rollback_validates_an_exact_release_child_before_linking(tmp_pa
         assert linked.returncode != 0
 
 
-def test_runbook_has_no_sqlite_wal_sidecar_dependency():
+def test_runbook_documents_signer_wal_without_changing_telemetry():
     source = read(ROOT / "DEPLOY.md")
 
-    assert "signer and telemetry databases use SQLite DELETE journal mode" in source
-    assert "no WAL/SHM sidecar dependency" in source
-    assert "sidecar for both SQLite databases" not in source
-    assert "signer database and any WAL/SHM sidecars" not in source
-    assert "telemetry database remains in WAL mode" not in source
+    assert "signer database uses WAL journal mode" in source
+    assert "`synchronous=NORMAL`" in source
+    assert "1,000-page" in source
+    assert "last committed transaction can be lost" in source
+    assert "Telemetry remains on DELETE/FULL" in source
 
 
 def test_runbook_fences_both_legacy_crons_and_preserves_live_census_state():
@@ -1640,8 +1730,16 @@ def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
     assert any("openapi.json" in finding for finding in findings)
 
 
-def test_shell_syntax_when_bash_is_available():
-    script = str(ROOT / "rebuild.sh")
+@pytest.mark.parametrize(
+    "relative_script",
+    (
+        "rebuild.sh",
+        "deploy/sqlite/build.sh",
+        "deploy/sqlite/rehearse-wal.sh",
+    ),
+)
+def test_shell_syntax_when_bash_is_available(relative_script):
+    script = str(ROOT / relative_script)
     if os.name == "nt":
         git_bash = Path("C:/Program Files/Git/bin/bash.exe")
         bash = str(git_bash) if git_bash.is_file() else None

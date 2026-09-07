@@ -73,6 +73,7 @@ def insert_room(
 def query_database(tmp_path):
     path = tmp_path / "signers.sqlite3"
     connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode = WAL")
     connection.executescript(
         """
         CREATE TABLE signer_metadata (
