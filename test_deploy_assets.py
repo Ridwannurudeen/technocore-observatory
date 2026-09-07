@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ import pytest
 import collect
 import derive
 import guards
+import query_service
 from api_contract import text_bytes
 from build_site import build_release
 from test_snapshots import telemetry_database, tick, write_ticks
@@ -504,6 +506,48 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     assert "OnUnitActiveSec=5min" in staleness_timer
     assert "Unit=technocore-observatory-staleness.service" in staleness_timer
     assert "technocore-observatory-rebuild.service" not in staleness_timer
+
+
+def test_only_signer_database_units_load_the_pinned_sqlite_and_openers_guard_it(
+    tmp_path,
+    monkeypatch,
+):
+    vendored_environment = (
+        "Environment=LD_LIBRARY_PATH=/home/technocore/observatory/lib"
+    )
+    signer_units = {
+        "technocore-observatory.service",
+        "technocore-observatory-query.service",
+    }
+    service_sources = {
+        path.name: read(path) for path in sorted(SYSTEMD.glob("*.service"))
+    }
+
+    assert {
+        name for name, source in service_sources.items() if "LD_LIBRARY_PATH" in source
+    } == signer_units
+    for name, source in service_sources.items():
+        assert source.count(vendored_environment) == int(name in signer_units)
+
+    for source_path in (ROOT / "collect.py", ROOT / "query_service.py"):
+        assert re.search(
+            r"(?m)^PINNED_SQLITE_VERSION = \(3, 53, 4\)$",
+            read(source_path),
+        )
+    unavailable_version = (sqlite3.sqlite_version_info[0] + 1, 0, 0)
+    monkeypatch.setattr(collect, "PINNED_SQLITE_VERSION", unavailable_version)
+    monkeypatch.setattr(query_service, "PINNED_SQLITE_VERSION", unavailable_version)
+
+    with pytest.raises(
+        collect.CollectionError,
+        match=r"requires vendored SQLite .*LD_LIBRARY_PATH=",
+    ):
+        collect.connect_signer_database(tmp_path / "writer.sqlite3")
+    with pytest.raises(
+        query_service.SchemaError,
+        match=r"requires vendored SQLite .*LD_LIBRARY_PATH=",
+    ):
+        query_service.open_readonly_database(tmp_path / "reader.sqlite3")
 
 
 @pytest.mark.parametrize(
