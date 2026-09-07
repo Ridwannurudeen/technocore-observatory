@@ -29,6 +29,9 @@ MAX_ATTEMPTS = 50_000
 MAX_DISCOVERY_SNAPSHOTS = 5_000
 MAX_INCIDENTS = 100
 MAX_CHANGES = 100
+# DELETE-mode writers can incur seconds of fsync latency on the shared host,
+# while the rebuild budget is measured in minutes.
+TELEMETRY_BUSY_TIMEOUT_SECONDS = 30.0
 FIELD_ABSENT = {"state": "field_absent"}
 MISSING = object()
 
@@ -93,7 +96,9 @@ def load_ticks(path: Path) -> tuple[list[dict[str, Any]], int]:
 
 def load_telemetry(path: Path) -> dict[str, Any]:
     uri = f"file:{path.resolve().as_posix()}?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True)) as connection:
+    with closing(
+        sqlite3.connect(uri, uri=True, timeout=TELEMETRY_BUSY_TIMEOUT_SECONDS)
+    ) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("BEGIN")
         schema_version = connection.execute("PRAGMA user_version").fetchone()[0]

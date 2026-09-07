@@ -1,5 +1,8 @@
 import json
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -524,6 +527,52 @@ def test_load_telemetry_reads_cycles_attempts_and_discoveries_in_one_snapshot(
         "continuity": "complete",
         "predecessor_records_loaded": 0,
     }
+
+
+def test_load_telemetry_waits_for_delete_mode_writer_with_explicit_timeout(
+    tmp_path,
+    monkeypatch,
+):
+    telemetry = tmp_path / "telemetry.sqlite3"
+    telemetry_database(telemetry).close()
+    writer = sqlite3.connect(telemetry)
+    writer.execute("BEGIN EXCLUSIVE")
+    add_attempt(
+        writer,
+        attempt_id=1,
+        route="/healthz",
+        observed_at="2026-09-07T18:55:00Z",
+        outcome="success",
+        status=200,
+    )
+
+    real_connect = sqlite3.connect
+    connect_kwargs = {}
+    reader_started = threading.Event()
+
+    def recording_connect(*args, **kwargs):
+        connect_kwargs.update(kwargs)
+        reader_started.set()
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(snapshots.sqlite3, "connect", recording_connect)
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(load_telemetry, telemetry)
+        assert reader_started.wait(timeout=1.0)
+        time.sleep(1.0)
+        assert not future.done()
+        writer.commit()
+        result = future.result(timeout=5.0)
+    finally:
+        if writer.in_transaction:
+            writer.rollback()
+        writer.close()
+        executor.shutdown(wait=True)
+
+    assert snapshots.TELEMETRY_BUSY_TIMEOUT_SECONDS == 30.0
+    assert connect_kwargs["timeout"] == snapshots.TELEMETRY_BUSY_TIMEOUT_SECONDS
+    assert [attempt["route"] for attempt in result["attempts"]] == ["/healthz"]
 
 
 @pytest.mark.parametrize(
