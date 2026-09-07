@@ -5426,10 +5426,11 @@ def test_census_main_publishes_the_committed_outbox_after_collection(
         events.append("collect")
         return {"tick": 1}
 
-    def drain(path, signer_state, census_state, lock_timeout):
+    def drain(path, signer_state, census_state, lock_timeout, *, signer_connection):
         assert path == output
         assert census_state == state_path
         assert lock_timeout == collect.CENSUS_SIGNER_LOCK_TIMEOUT
+        assert isinstance(signer_connection, sqlite3.Connection)
         if not events:
             events.append("drain-empty")
             return False
@@ -5603,7 +5604,8 @@ def test_sqlite_error_skips_tick_and_daemon_loop_continues(
     drain_calls = []
     monkeypatch.setattr(collect, "collect_tick", collect_once_then_succeed)
 
-    def drain(path, signer_state, census_state, lock_timeout):
+    def drain(path, signer_state, census_state, lock_timeout, *, signer_connection):
+        assert isinstance(signer_connection, sqlite3.Connection)
         drain_calls.append((path, signer_state, census_state, lock_timeout))
         return next(drain_results)
 
