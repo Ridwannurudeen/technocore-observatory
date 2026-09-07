@@ -478,6 +478,7 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
         "ReadOnlyPaths=/home/technocore/observatory /opt/technocore-observatory"
         in query
     )
+    assert "includes signers.sqlite3 and its -wal/-shm family" in query
     assert "ReadWritePaths=" not in query
 
     assert "User=technocore" in rebuild

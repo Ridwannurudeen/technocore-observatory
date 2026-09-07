@@ -290,7 +290,11 @@ Atomically replaced JSON state, the tick ledger, and lock files deliberately use
 Before starting the query service, verify the signer database is owned by
 `technocore:technocore` and is not group-writable. The `technocore-query` user receives read access
 through its supplementary `technocore` group; its unit has no `ReadWritePaths` and opens SQLite in
-`mode=ro` with `PRAGMA query_only=ON`.
+`mode=ro` with `PRAGMA query_only=ON`. The directory-level `ReadOnlyPaths` boundary covers
+`signers.sqlite3`, `signers.sqlite3-wal`, and `signers.sqlite3-shm`; do not add a writable exception
+for any family member. The rehearsal must prove that the confined query identity can mmap the
+existing read-only SHM file. If systemd confinement blocks that mmap, stop the deployment and
+report the failure instead of loosening permissions.
 
 ## 4. Run the one-time signer migration only when needed
 

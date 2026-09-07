@@ -28,6 +28,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
+# This directory boundary includes signers.sqlite3 and its -wal/-shm family.
 ReadOnlyPaths=/home/technocore/observatory /opt/technocore-observatory
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=any
