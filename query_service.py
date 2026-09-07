@@ -32,6 +32,8 @@ from api_contract import (
 )
 
 DATABASE_SCHEMA_VERSION = 6
+PINNED_SQLITE_VERSION = (3, 53, 4)
+VENDORED_SQLITE_DIRECTORY = "/home/technocore/observatory/lib"
 MAX_REQUEST_TARGET_BYTES = 2 * 1024
 MAX_QUERY_FIELDS = 8
 MAX_QUERY_CHARACTERS = 80
@@ -189,6 +191,16 @@ class ApiError(RuntimeError):
         self.message = message
 
 
+def assert_pinned_sqlite() -> None:
+    if sqlite3.sqlite_version_info < PINNED_SQLITE_VERSION:
+        required = ".".join(str(part) for part in PINNED_SQLITE_VERSION)
+        raise SchemaError(
+            f"signer database requires vendored SQLite {required} or newer; "
+            f"loaded {sqlite3.sqlite_version}. Set "
+            f"LD_LIBRARY_PATH={VENDORED_SQLITE_DIRECTORY} before starting this process"
+        )
+
+
 def utc_datetime() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -297,6 +309,7 @@ def open_readonly_database(
     *,
     query_timeout_seconds: float = DEFAULT_QUERY_TIMEOUT_SECONDS,
 ) -> sqlite3.Connection:
+    assert_pinned_sqlite()
     resolved = path.resolve()
     if not resolved.is_file():
         raise SchemaError(f"query database does not exist: {resolved}")

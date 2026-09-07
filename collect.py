@@ -124,6 +124,8 @@ MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 RESPONSE_READ_CHUNK_BYTES = 64 * 1024
 SQLITE_INTEGER_MAX = (1 << 63) - 1
 MAX_RETRIES = 10
+PINNED_SQLITE_VERSION = (3, 53, 4)
+VENDORED_SQLITE_DIRECTORY = "/home/technocore/observatory/lib"
 
 
 class CollectionError(RuntimeError):
@@ -143,6 +145,16 @@ class CollectionError(RuntimeError):
 
 class TickOutboxCommittedError(OSError):
     """The durable tick exists, but its metadata mirror was not published."""
+
+
+def assert_pinned_sqlite() -> None:
+    if sqlite3.sqlite_version_info < PINNED_SQLITE_VERSION:
+        required = ".".join(str(part) for part in PINNED_SQLITE_VERSION)
+        raise CollectionError(
+            f"signer database requires vendored SQLite {required} or newer; "
+            f"loaded {sqlite3.sqlite_version}. Set "
+            f"LD_LIBRARY_PATH={VENDORED_SQLITE_DIRECTORY} before starting this process"
+        )
 
 
 def utc_now() -> str:
@@ -4750,6 +4762,7 @@ def initialize_signer_database(connection: sqlite3.Connection) -> None:
 
 
 def connect_signer_database(path: Path) -> sqlite3.Connection:
+    assert_pinned_sqlite()
     connection = sqlite3.connect(path, timeout=5.0)
     try:
         connection.execute("PRAGMA journal_mode = DELETE")

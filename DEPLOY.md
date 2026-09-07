@@ -20,7 +20,7 @@ tagged Observatory jobs:
 
 ```cron
 */10 * * * * /home/technocore/observatory/rebuild.sh # technocore-observatory-rebuild
-23 */6 * * * /usr/bin/python3 /home/technocore/observatory/collect.py --base-url https://technocore.chat --output /home/technocore/observatory/ticks.jsonl --once --census --census-state /home/technocore/observatory/census.json --signer-state /home/technocore/observatory/signers.json >/dev/null 2>&1 # technocore-observatory-census
+23 */6 * * * LD_LIBRARY_PATH=/home/technocore/observatory/lib /usr/bin/python3 /home/technocore/observatory/collect.py --base-url https://technocore.chat --output /home/technocore/observatory/ticks.jsonl --once --census --census-state /home/technocore/observatory/census.json --signer-state /home/technocore/observatory/signers.json >/dev/null 2>&1 # technocore-observatory-census
 ```
 
 Snapshot and fence both tagged jobs during migration. The legacy rebuild cron writes the flat
@@ -41,6 +41,9 @@ the rollback evidence.
   TLS certificate paths, static root, and loopback proxy routes.
 - `deploy/systemd/` contains the collector, query, pulse, rebuild, and publication-staleness units
   and the pulse, rebuild, and staleness timers.
+- `deploy/sqlite/` pins and builds the SQLite shared library used by every process that opens the
+  signer database. The collector and query units set `LD_LIBRARY_PATH`; pulse, rebuild, and
+  staleness remain on their normal runtime environment because they do not open that database.
 - `rebuild.sh` takes a non-blocking exclusive lock on the resolved publication root, recovers
   interrupted unpublished builds, copies the tick ledger once while holding the collector's
   `ticks.jsonl.lock` so the build and the guards read one untorn snapshot, creates a new versioned
@@ -176,7 +179,8 @@ Next, use the staged candidate's recovery-only command against the fenced live s
 ```bash
 (
   cd /home/technocore/observatory-candidate
-  sudo -u technocore -- python3 recover_publication.py \
+  sudo -u technocore -- env LD_LIBRARY_PATH=/home/technocore/observatory/lib \
+    python3 recover_publication.py \
     --output /home/technocore/observatory/ticks.jsonl \
     --signer-state /home/technocore/observatory/signers.json \
     --census-state /home/technocore/observatory/census.json
@@ -290,10 +294,15 @@ through its supplementary `technocore` group; its unit has no `ReadWritePaths` a
 
 ## 4. Run the one-time signer migration only when needed
 
+Every invocation of `migrate_signers.py` or `recover_publication.py` that can open the signer
+database must run with `LD_LIBRARY_PATH=/home/technocore/observatory/lib`. Both tools use the
+collector's signer-database opener and fail closed when the vendored SQLite version is not loaded.
+
 First inspect the checked-in contract:
 
 ```bash
-/usr/bin/python3 /home/technocore/observatory/migrate_signers.py --help
+LD_LIBRARY_PATH=/home/technocore/observatory/lib \
+  /usr/bin/python3 /home/technocore/observatory/migrate_signers.py --help
 ```
 
 Skip the JSON-to-SQLite migrator when an authoritative v3-v5 `signers.sqlite3` already exists. The
@@ -305,7 +314,8 @@ Preserve the fenced v2 file under a distinct absolute path, make sure both targe
 then run:
 
 ```bash
-/usr/bin/python3 /home/technocore/observatory/migrate_signers.py \
+LD_LIBRARY_PATH=/home/technocore/observatory/lib \
+  /usr/bin/python3 /home/technocore/observatory/migrate_signers.py \
   /absolute/fenced/source/signers-v2.json \
   /home/technocore/observatory/signers.json
 ```

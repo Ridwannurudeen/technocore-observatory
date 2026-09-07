@@ -12,7 +12,7 @@ URL, version, or hash independently.
 ## WAL-reset safety floor
 
 The SQLite [release history](https://sqlite.org/changes.html) records that **3.51.3**, released
-2026-03-13, fixes the WAL-reset database corruption bug. That release is the minimum acceptable
-runtime version for every process that opens the signer database. The pinned 3.53.4 amalgamation
-includes that fix; the 3.53.0 release notes also explicitly list the same fix after the withdrawn
-3.52.0 release.
+2026-03-13, fixes the WAL-reset database corruption bug. That release is the first version with the
+fix. This deployment deliberately enforces the newer pinned version, 3.53.4, as the minimum runtime
+for every process that opens the signer database. The 3.53.0 release notes also explicitly list the
+same fix after the withdrawn 3.52.0 release.
