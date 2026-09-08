@@ -50,13 +50,12 @@ def telemetry_store(tmp_path):
     store.close()
 
 
-def test_telemetry_schema_is_delete_journal_strict_and_rejects_raw_routes(
+def test_telemetry_schema_is_wal_journal_strict_and_rejects_raw_routes(
     telemetry_store,
 ):
     assert telemetry_store.connection.execute("PRAGMA user_version").fetchone() == (1,)
     assert (
-        telemetry_store.connection.execute("PRAGMA journal_mode").fetchone()[0]
-        == "delete"
+        telemetry_store.connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     )
     cycle_id = telemetry_store.start_cycle("collector", "2026-08-30T10:00:00Z")
 

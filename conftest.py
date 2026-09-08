@@ -6,6 +6,7 @@ import pytest
 
 import collect
 import query_service
+import telemetry
 
 
 @pytest.fixture(autouse=True)
@@ -14,6 +15,11 @@ def allow_test_runner_sqlite(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(collect, "PINNED_SQLITE_VERSION", sqlite3.sqlite_version_info)
     monkeypatch.setattr(
         query_service,
+        "PINNED_SQLITE_VERSION",
+        sqlite3.sqlite_version_info,
+    )
+    monkeypatch.setattr(
+        telemetry,
         "PINNED_SQLITE_VERSION",
         sqlite3.sqlite_version_info,
     )

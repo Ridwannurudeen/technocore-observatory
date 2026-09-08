@@ -21,6 +21,7 @@ from api_contract import (
     text_bytes,
     utc_now,
 )
+from telemetry import assert_pinned_sqlite
 
 INCIDENT_RULES_VERSION = "1.1.0"
 VALID_FOR = timedelta(minutes=15)
@@ -29,8 +30,8 @@ MAX_ATTEMPTS = 50_000
 MAX_DISCOVERY_SNAPSHOTS = 5_000
 MAX_INCIDENTS = 100
 MAX_CHANGES = 100
-# DELETE-mode writers can incur seconds of fsync latency on the shared host,
-# while the rebuild budget is measured in minutes.
+# Keep a bounded wait for WAL setup or checkpoint contention even though normal
+# telemetry reads no longer block the writer.
 TELEMETRY_BUSY_TIMEOUT_SECONDS = 30.0
 FIELD_ABSENT = {"state": "field_absent"}
 MISSING = object()
@@ -95,6 +96,7 @@ def load_ticks(path: Path) -> tuple[list[dict[str, Any]], int]:
 
 
 def load_telemetry(path: Path) -> dict[str, Any]:
+    assert_pinned_sqlite()
     uri = f"file:{path.resolve().as_posix()}?mode=ro"
     with closing(
         sqlite3.connect(uri, uri=True, timeout=TELEMETRY_BUSY_TIMEOUT_SECONDS)
@@ -104,6 +106,11 @@ def load_telemetry(path: Path) -> dict[str, Any]:
         schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
         if schema_version != 1:
             raise ValueError(f"unsupported telemetry schema version: {schema_version}")
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(journal_mode).lower() != "wal":
+            raise ValueError(
+                f"telemetry database must use WAL journal mode; found {journal_mode}"
+            )
         cycles = [
             dict(row)
             for row in connection.execute(

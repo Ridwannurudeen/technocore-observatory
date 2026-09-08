@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 TELEMETRY_SCHEMA_VERSION = 1
+PINNED_SQLITE_VERSION = (3, 53, 4)
+VENDORED_SQLITE_DIRECTORY = "/home/technocore/observatory/lib"
+TELEMETRY_WAL_AUTOCHECKPOINT_PAGES = 1_000
 RAW_RETENTION_SECONDS = 90 * 24 * 60 * 60
 PRUNE_BATCH_SIZE = 1_000
 MAX_DATABASE_BYTES = 128 * 1024 * 1024
@@ -37,6 +40,16 @@ ATTEMPT_OUTCOMES = frozenset(
         "invalid_response",
     )
 )
+
+
+def assert_pinned_sqlite() -> None:
+    if sqlite3.sqlite_version_info < PINNED_SQLITE_VERSION:
+        required = ".".join(str(part) for part in PINNED_SQLITE_VERSION)
+        raise sqlite3.DatabaseError(
+            f"telemetry database requires vendored SQLite {required} or newer; "
+            f"loaded {sqlite3.sqlite_version}. Set "
+            f"LD_LIBRARY_PATH={VENDORED_SQLITE_DIRECTORY} before starting this process"
+        )
 
 
 def utc_now() -> str:
@@ -70,13 +83,27 @@ def normalize_route(path: str) -> tuple[str, bool]:
 
 class TelemetryStore:
     def __init__(self, path: Path) -> None:
+        assert_pinned_sqlite()
         self.path = Path(path)
         self.connection = sqlite3.connect(self.path, timeout=5.0)
         try:
             if self.connection.execute("PRAGMA user_version").fetchone()[0] == 0:
                 self.connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
-            self.connection.execute("PRAGMA journal_mode = DELETE")
-            self.connection.execute("PRAGMA synchronous = FULL")
+            journal_mode = self.connection.execute(
+                "PRAGMA journal_mode = WAL"
+            ).fetchone()[0]
+            if str(journal_mode).lower() != "wal":
+                raise sqlite3.DatabaseError(
+                    f"telemetry database refused WAL journal mode: {journal_mode}"
+                )
+            self.connection.execute("PRAGMA synchronous = NORMAL")
+            autocheckpoint = self.connection.execute(
+                f"PRAGMA wal_autocheckpoint = {TELEMETRY_WAL_AUTOCHECKPOINT_PAGES}"
+            ).fetchone()[0]
+            if autocheckpoint != TELEMETRY_WAL_AUTOCHECKPOINT_PAGES:
+                raise sqlite3.DatabaseError(
+                    "telemetry database refused the configured WAL autocheckpoint"
+                )
             self.connection.execute("PRAGMA foreign_keys = ON")
             page_size = self.connection.execute("PRAGMA page_size").fetchone()[0]
             maximum_pages = max(1, MAX_DATABASE_BYTES // page_size)
