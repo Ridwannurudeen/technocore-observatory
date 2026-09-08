@@ -659,6 +659,20 @@ def test_telemetry_wal_rehearsal_covers_both_lock_directions_and_rollback():
     assert 'rm -rf -- "$scratch_directory"' in source
 
 
+def write_release_status(release, valid_until):
+    status = release / "api" / "v1"
+    status.mkdir(parents=True)
+    (status / "status.json").write_text(
+        json.dumps({"valid_until": valid_until}), encoding="utf-8"
+    )
+
+
+def utc_in(seconds):
+    return datetime.fromtimestamp(time.time() + seconds, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
 @pytest.mark.parametrize(
     ("age_seconds", "mtime_age_seconds", "expected_returncode"),
     ((60, 3600, 0), (3600, 60, 1)),
@@ -676,6 +690,7 @@ def test_staleness_check_uses_the_release_name_timestamp(
     ).strftime("%Y%m%d%H%M%S")
     release = releases / f"{timestamp}-0123456789ab"
     release.mkdir()
+    write_release_status(release, utc_in(600))
     os.utime(release, (time.time() - mtime_age_seconds,) * 2)
     current = tmp_path / "current"
     try:
@@ -716,6 +731,7 @@ def test_staleness_check_falls_back_to_the_resolved_target_mtime(
     releases.mkdir()
     release = releases / release_name
     release.mkdir()
+    write_release_status(release, utc_in(600))
     modified_at = time.time() - age_seconds
     os.utime(release, (modified_at, modified_at))
     current = tmp_path / "current"
@@ -741,6 +757,62 @@ def test_staleness_check_falls_back_to_the_resolved_target_mtime(
         assert f"release={release.resolve()}" in result.stderr
     else:
         assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("valid_until", "expected_returncode", "expected_message"),
+    (
+        (lambda: utc_in(300), 0, ""),
+        (lambda: utc_in(-300), 0, ""),
+        (lambda: utc_in(-660), 1, "publication is past its validity: overdue="),
+        (lambda: None, 1, "carries no valid_until"),
+        (lambda: "2026-09-08 15:00", 1, "valid_until is not UTC"),
+    ),
+)
+def test_staleness_check_reads_the_published_validity(
+    tmp_path, valid_until, expected_returncode, expected_message
+):
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    timestamp = datetime.fromtimestamp(time.time() - 60, timezone.utc).strftime(
+        "%Y%m%d%H%M%S"
+    )
+    release = releases / f"{timestamp}-0123456789ab"
+    release.mkdir()
+    write_release_status(release, valid_until())
+
+    result = subprocess.run(
+        [sys.executable, ROOT / "check_staleness.py", release],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_returncode
+    assert result.stdout == ""
+    assert expected_message in result.stderr
+    if expected_returncode:
+        assert str(release.resolve()) in result.stderr
+    else:
+        assert result.stderr == ""
+
+
+def test_staleness_check_fails_closed_without_a_published_status(tmp_path):
+    timestamp = datetime.fromtimestamp(time.time() - 60, timezone.utc).strftime(
+        "%Y%m%d%H%M%S"
+    )
+    release = tmp_path / f"{timestamp}-0123456789ab"
+    release.mkdir()
+
+    result = subprocess.run(
+        [sys.executable, ROOT / "check_staleness.py", release],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert f"publication validity check failed for {release.resolve()}" in result.stderr
 
 
 def test_staleness_check_fails_closed_when_current_cannot_be_resolved(tmp_path):
@@ -1433,6 +1505,10 @@ def test_runbook_documents_the_independent_staleness_alarm():
     assert "technocore-observatory-staleness.service" in alarm_section
     assert "30 minutes" in alarm_section
     assert "mtime" in alarm_section
+    assert "api/v1/status.json" in alarm_section
+    assert "`valid_until`" in alarm_section
+    assert "more than 10 minutes in the past" in alarm_section
+    assert "publication is past its" in alarm_section
     assert "read-only" in alarm_section
     assert re.search(r"does not inspect the rebuild\s+service", alarm_section)
     assert (
