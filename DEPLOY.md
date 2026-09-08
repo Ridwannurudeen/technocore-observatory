@@ -780,7 +780,10 @@ service exit non-zero and write the reason to stderr and the journal.
    public envelope promises (fifteen minutes after the source observation the build read). When
    that instant is more than 10 minutes in the past the check fails with `publication is past its
    validity: overdue=<seconds>s release=<resolved-path>`; a release without a readable
-   `valid_until` fails with `publication validity check failed`. This fires when rebuilds keep
+   `valid_until` fails with `publication validity check failed`. A `null` is not corruption: the
+   envelope publishes `valid_until: null` with `freshness: not_observed` when no source was
+   observed, and the alarm fails on it deliberately, because nothing then vouches for the
+   publication's age. This fires when rebuilds keep
    landing but each one is already past the validity it publishes, which the age condition cannot
    see: builds running longer than the rebuild interval on a loaded host, or a collector whose
    ticks have stopped while the rebuild keeps republishing old observations. Compare the rebuild
