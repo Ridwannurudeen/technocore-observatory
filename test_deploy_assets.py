@@ -59,6 +59,7 @@ DEPLOY_FILES = {
     SQLITE_DEPLOY / "PIN.md",
     SQLITE_DEPLOY / "build.sh",
     SQLITE_DEPLOY / "rehearse-wal.sh",
+    SQLITE_DEPLOY / "rehearse-telemetry-wal.sh",
     ROOT / "DEMO.md",
 }
 
@@ -595,6 +596,47 @@ def test_wal_rehearsal_uses_a_confined_copy_and_reports_every_gate():
     ):
         assert source.count(f'echo "PASS: {gate}"') == 1
         assert source.count(f'echo "FAIL: {gate}"') == 1
+
+
+def test_telemetry_wal_rehearsal_covers_both_lock_directions_and_rollback():
+    source = read(SQLITE_DEPLOY / "rehearse-telemetry-wal.sh")
+
+    assert source.startswith("#!/usr/bin/env bash\nset -u\nset -o pipefail\n")
+    backup = source.index("source_connection.backup(destination_connection)")
+    telemetry_store = source.index("store = TelemetryStore(database)")
+    confined_reader = source.index("loaded = load_telemetry(database)")
+    long_select = source.index("SELECT request_attempts.id, sequence.value")
+    record_attempt = source.index("attempt_id = store.record_attempt(")
+    checkpoint = source.index("PY_CHECKPOINT")
+    delete_switch = source.index("PRAGMA journal_mode = DELETE")
+    assert (
+        backup
+        < telemetry_store
+        < record_attempt
+        < confined_reader
+        < long_select
+        < checkpoint
+        < delete_switch
+    )
+    assert source.index('wait_for(long_reader_ready, "long reader")') < record_attempt
+    assert '--property="ReadOnlyPaths=${OBSERVATORY_ROOT}"' in source
+    assert 'mktemp -d "${OBSERVATORY_ROOT}/.telemetry-wal-rehearsal.XXXXXXXX"' in source
+    for result in (
+        "PASS: read succeeds during write under ReadOnlyPaths",
+        "PASS: record_attempt commits during long read",
+        "PASS: version assertion",
+        "PASS: checkpoint on close",
+        "PASS: switch back to DELETE succeeds",
+    ):
+        assert result in source
+    assert "--property=User=technocore" in source
+    assert "--property=Group=technocore" in source
+    assert "--property=ProtectSystem=strict" in source
+    assert "--property=ProtectHome=read-only" in source
+    assert '--property="ReadOnlyPaths=${OBSERVATORY_ROOT}"' in source
+    assert '--property="ReadWritePaths=/opt/technocore-observatory"' in source
+    assert '--setenv=LD_LIBRARY_PATH="$SQLITE_LIBRARY_DIRECTORY"' in source
+    assert 'rm -rf -- "$scratch_directory"' in source
 
 
 @pytest.mark.parametrize(
@@ -1738,6 +1780,7 @@ def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
         "rebuild.sh",
         "deploy/sqlite/build.sh",
         "deploy/sqlite/rehearse-wal.sh",
+        "deploy/sqlite/rehearse-telemetry-wal.sh",
     ),
 )
 def test_shell_syntax_when_bash_is_available(relative_script):
