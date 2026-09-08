@@ -33,7 +33,7 @@ previews, and never included in a default listing or bulk export.
 |---|---|---|---|
 | `collect.py` | `https://technocore.chat` | append-only ticks, signer metadata/SQLite, request telemetry | `technocore` user |
 | `pulse_probe.py --once` | unmetered `/healthz`, `/config`, discovery | telemetry SQLite | one-minute systemd timer as `technocore` |
-| `build_site.py` through `rebuild.sh` | ticks and telemetry | a guarded `releases/<id>` candidate, one atomic `current` symlink flip, then bounded retention | ten-minute systemd timer as `technocore` |
+| `build_site.py` through `rebuild.sh` | ticks and telemetry | a guarded `releases/<id>` candidate, one atomic `current` symlink flip, then bounded retention | five-minute systemd timer as `technocore` |
 | `query_service.py` | signer SQLite in `mode=ro`, current static snapshots | nothing persistent | `127.0.0.1:8765` as distinct `technocore-query` user |
 | nginx | `/opt/technocore-observatory/current` and loopback query responses | query-free access logs | public GET/HEAD boundary |
 
@@ -46,7 +46,7 @@ the same bounded failure boundary. A public request never causes an upstream Tec
 A failure after the builder returns a validated candidate but before the atomic flip removes that
 exact unpublished candidate without changing `current`. After a successful flip, retention always
 protects the active release and its immediate predecessor, then keeps the newest releases while the
-retained set remains at or below both 1,008 entries (seven days at the ten-minute cadence) and 2 GiB
+retained set remains at or below both 1,008 entries (three and a half days at the five-minute cadence) and 2 GiB
 of apparent payload bytes. If the two protected releases alone exceed a bound, they remain and older
 history is removed.
 

@@ -572,7 +572,7 @@ access log contains no raw `q`, `since`,
 successful static status, incidents, changes, or methodology response retains the documented
 public cache policy.
 
-The ten-minute rebuild retains the active release and its immediate predecessor unconditionally.
+The five-minute rebuild retains the active release and its immediate predecessor unconditionally.
 It then retains the newest direct-child release directories only while the total retained set is
 at or below both 1,008 entries and 2 GiB of apparent payload bytes. Once the next-newest release
 would cross either limit, it and all older managed releases are removed. The two protected releases

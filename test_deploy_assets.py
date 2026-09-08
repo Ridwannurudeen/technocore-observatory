@@ -493,7 +493,7 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     assert "User=technocore" in rebuild
     assert "ExecStart=/home/technocore/observatory/rebuild.sh" in rebuild
     assert "ReadWritePaths=/opt/technocore-observatory" in rebuild
-    assert "OnUnitActiveSec=10min" in rebuild_timer
+    assert "OnUnitActiveSec=5min" in rebuild_timer
 
     assert "Type=oneshot" in staleness
     assert "User=technocore" in staleness
