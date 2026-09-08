@@ -762,6 +762,7 @@ def build_page(html: Path, derive: Path, ticks: Path, into: Path) -> Path:
         ],
         check=True,
         capture_output=True,
+        text=True,
     )
     return page
 
@@ -775,7 +776,15 @@ def main() -> int:
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
-        built = build_page(args.html, args.derive, args.ticks, Path(tmp))
+        try:
+            built = build_page(args.html, args.derive, args.ticks, Path(tmp))
+        except subprocess.CalledProcessError as error:
+            print("FAIL  derive")
+            print(
+                "        derive.py failed, so nothing could be checked: "
+                + error.stderr.strip()[:300]
+            )
+            return 1
         html = built.read_text(encoding="utf-8")
         payload = json.loads((Path(tmp) / "data.json").read_text(encoding="utf-8"))
         checks = (

@@ -52,7 +52,9 @@ def validity_deadline(release: Path) -> float:
     try:
         deadline = datetime.strptime(valid_until, "%Y-%m-%dT%H:%M:%SZ")
     except ValueError as error:
-        raise ValueError(f"{status_path} valid_until is not UTC: {error}") from None
+        raise ValueError(
+            f"{status_path} valid_until is not YYYY-mm-ddTHH:MM:SSZ: {error}"
+        ) from None
     return deadline.replace(tzinfo=timezone.utc).timestamp()
 
 

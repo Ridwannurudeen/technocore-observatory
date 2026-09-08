@@ -659,11 +659,12 @@ def test_telemetry_wal_rehearsal_covers_both_lock_directions_and_rollback():
     assert 'rm -rf -- "$scratch_directory"' in source
 
 
-def write_release_status(release, valid_until):
+def write_release_status(release, valid_until, raw=None):
     status = release / "api" / "v1"
     status.mkdir(parents=True)
     (status / "status.json").write_text(
-        json.dumps({"valid_until": valid_until}), encoding="utf-8"
+        json.dumps({"valid_until": valid_until}) if raw is None else raw,
+        encoding="utf-8",
     )
 
 
@@ -766,7 +767,9 @@ def test_staleness_check_falls_back_to_the_resolved_target_mtime(
         (lambda: utc_in(-300), 0, ""),
         (lambda: utc_in(-660), 1, "publication is past its validity: overdue="),
         (lambda: None, 1, "carries no valid_until"),
-        (lambda: "2026-09-08 15:00", 1, "valid_until is not UTC"),
+        (lambda: 123, 1, "carries no valid_until"),
+        (lambda: "2026-09-08 15:00", 1, "valid_until is not YYYY-mm-ddTHH:MM:SSZ"),
+        (lambda: "2026-09-08T15:00:00+00:00", 1, "is not YYYY-mm-ddTHH:MM:SSZ"),
     ),
 )
 def test_staleness_check_reads_the_published_validity(
@@ -795,6 +798,36 @@ def test_staleness_check_reads_the_published_validity(
         assert str(release.resolve()) in result.stderr
     else:
         assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_message"),
+    (
+        ("{not json", "publication validity check failed"),
+        ("[]", "carries no valid_until"),
+        ('"2026-09-08T15:00:00Z"', "carries no valid_until"),
+    ),
+)
+def test_staleness_check_fails_closed_on_a_malformed_status(
+    tmp_path, raw, expected_message
+):
+    timestamp = datetime.fromtimestamp(time.time() - 60, timezone.utc).strftime(
+        "%Y%m%d%H%M%S"
+    )
+    release = tmp_path / f"{timestamp}-0123456789ab"
+    release.mkdir()
+    write_release_status(release, None, raw=raw)
+
+    result = subprocess.run(
+        [sys.executable, ROOT / "check_staleness.py", release],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert expected_message in result.stderr
+    assert str(release.resolve()) in result.stderr
 
 
 def test_staleness_check_fails_closed_without_a_published_status(tmp_path):
@@ -1807,6 +1840,36 @@ def test_guards_run_the_deriver_exactly_once(tmp_path, monkeypatch, capsys):
     assert guards.main() == 0
     assert len(derive_runs) == 1
     assert "ok    payload contract" in capsys.readouterr().out
+
+
+def test_guards_report_a_failing_deriver_instead_of_crashing(
+    tmp_path, monkeypatch, capsys
+):
+    broken = tmp_path / "derive.py"
+    broken.write_text(
+        "import sys; sys.stderr.write('ledger line 3 is not a tick'); sys.exit(2)",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "guards.py",
+            "--html",
+            str(ROOT / "index.html"),
+            "--derive",
+            str(broken),
+            "--ticks",
+            str(tmp_path / "ticks.jsonl"),
+            "--site-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert guards.main() == 1
+    out = capsys.readouterr().out
+    assert "FAIL  derive" in out
+    assert "derive.py failed, so nothing could be checked: ledger line 3" in out
 
 
 def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
