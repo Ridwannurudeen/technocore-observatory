@@ -767,10 +767,26 @@ before assuming the origin or the collector is at fault.
 
 `technocore-observatory-staleness.timer` starts one minute after boot and every five minutes after
 that. Its `Type=oneshot` `technocore-observatory-staleness.service` resolves
-`/opt/technocore-observatory/current`, reads the release time from the leading
-`YYYYmmddHHMMSS-<hex>` UTC release name, and falls back to the resolved release directory's mtime
-when the name does not parse. A release older than 30 minutes makes the service exit non-zero and
-write `age=<seconds>s release=<resolved-path>` to stderr and the journal.
+`/opt/technocore-observatory/current` and applies two independent conditions; either one makes the
+service exit non-zero and write the reason to stderr and the journal.
+
+1. **Release age.** The release time comes from the leading `YYYYmmddHHMMSS-<hex>` UTC release
+   name, falling back to the resolved release directory's mtime when the name does not parse. A
+   release older than 30 minutes fails with `publication is stale: age=<seconds>s
+   release=<resolved-path>`. This fires when rebuilds stop landing: the timer is fenced, the
+   service fails, the build exceeds its timeout, or the host is down. Look at
+   `journalctl -u technocore-observatory-rebuild.service` first.
+2. **Published validity.** The release's own `api/v1/status.json` carries the `valid_until` the
+   public envelope promises (fifteen minutes after the source observation the build read). When
+   that instant is more than 10 minutes in the past the check fails with `publication is past its
+   validity: overdue=<seconds>s release=<resolved-path>`; a release without a readable
+   `valid_until` fails with `publication validity check failed`. This fires when rebuilds keep
+   landing but each one is already past the validity it publishes, which the age condition cannot
+   see: builds running longer than the rebuild interval on a loaded host, or a collector whose
+   ticks have stopped while the rebuild keeps republishing old observations. Compare the rebuild
+   wall time in the journal with the timer interval, and check that fresh ticks are landing in
+   `ticks.jsonl`. The ten minutes of grace are deliberate: a validity lapse of a few minutes under
+   host load is the site reporting STALE honestly, not an outage.
 
 The check is read-only: the unit exposes the source tree and publication root through read-only
 mount boundaries, and the script opens no ledger or database. It does not inspect the rebuild

@@ -313,22 +313,12 @@ def guard_ledger_chain(ticks: Path) -> list[str]:
     return [f"tick ledger hash chain breaks{location}: {result['message']}"]
 
 
-def guard_payload_contract(html: str, derive: Path, ticks: Path) -> list[str]:
-    """Every page read must exist in both the data artifact and rendering copy."""
-    with tempfile.TemporaryDirectory() as tmp:
-        out = Path(tmp) / "data.json"
-        result = subprocess.run(
-            [sys.executable, str(derive.resolve()), str(ticks.resolve()), str(out)],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return [
-                "derive.py failed, so the contract could not be checked: "
-                + result.stderr.strip()[:300]
-            ]
-        payload = json.loads(out.read_text(encoding="utf-8"))
+def guard_payload_contract(html: str, payload: dict) -> list[str]:
+    """Every page read must exist in both the data artifact and rendering copy.
 
+    `payload` is the data artifact the deriver wrote alongside `html` in
+    `build_page`; the guard derives once and checks both copies of that run.
+    """
     embedded_matches = re.findall(
         r'<script\s+id="observatory-data"\s+type="application/json">(.*?)</script>',
         html,
@@ -772,6 +762,7 @@ def build_page(html: Path, derive: Path, ticks: Path, into: Path) -> Path:
         ],
         check=True,
         capture_output=True,
+        text=True,
     )
     return page
 
@@ -785,12 +776,20 @@ def main() -> int:
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
-        built = build_page(args.html, args.derive, args.ticks, Path(tmp))
+        try:
+            built = build_page(args.html, args.derive, args.ticks, Path(tmp))
+        except subprocess.CalledProcessError as error:
+            print("FAIL  derive")
+            print(
+                "        derive.py failed, so nothing could be checked: "
+                + error.stderr.strip()[:300]
+            )
+            return 1
         html = built.read_text(encoding="utf-8")
         payload = json.loads((Path(tmp) / "data.json").read_text(encoding="utf-8"))
         checks = (
             ("tick ledger hash chain", guard_ledger_chain(args.ticks)),
-            ("payload contract", guard_payload_contract(html, args.derive, args.ticks)),
+            ("payload contract", guard_payload_contract(html, payload)),
             ("static release", guard_static_release(args.site_root)),
             ("zero-width render", guard_zero_width_render(built)),
             ("no-JS honesty", guard_no_js_state(built, payload)),

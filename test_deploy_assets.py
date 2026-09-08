@@ -659,6 +659,21 @@ def test_telemetry_wal_rehearsal_covers_both_lock_directions_and_rollback():
     assert 'rm -rf -- "$scratch_directory"' in source
 
 
+def write_release_status(release, valid_until, raw=None):
+    status = release / "api" / "v1"
+    status.mkdir(parents=True)
+    (status / "status.json").write_text(
+        json.dumps({"valid_until": valid_until}) if raw is None else raw,
+        encoding="utf-8",
+    )
+
+
+def utc_in(seconds):
+    return datetime.fromtimestamp(time.time() + seconds, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
 @pytest.mark.parametrize(
     ("age_seconds", "mtime_age_seconds", "expected_returncode"),
     ((60, 3600, 0), (3600, 60, 1)),
@@ -676,6 +691,7 @@ def test_staleness_check_uses_the_release_name_timestamp(
     ).strftime("%Y%m%d%H%M%S")
     release = releases / f"{timestamp}-0123456789ab"
     release.mkdir()
+    write_release_status(release, utc_in(600))
     os.utime(release, (time.time() - mtime_age_seconds,) * 2)
     current = tmp_path / "current"
     try:
@@ -716,6 +732,7 @@ def test_staleness_check_falls_back_to_the_resolved_target_mtime(
     releases.mkdir()
     release = releases / release_name
     release.mkdir()
+    write_release_status(release, utc_in(600))
     modified_at = time.time() - age_seconds
     os.utime(release, (modified_at, modified_at))
     current = tmp_path / "current"
@@ -741,6 +758,94 @@ def test_staleness_check_falls_back_to_the_resolved_target_mtime(
         assert f"release={release.resolve()}" in result.stderr
     else:
         assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("valid_until", "expected_returncode", "expected_message"),
+    (
+        (lambda: utc_in(300), 0, ""),
+        (lambda: utc_in(-300), 0, ""),
+        (lambda: utc_in(-660), 1, "publication is past its validity: overdue="),
+        (lambda: None, 1, "carries no valid_until"),
+        (lambda: 123, 1, "carries no valid_until"),
+        (lambda: "2026-09-08 15:00", 1, "valid_until is not YYYY-mm-ddTHH:MM:SSZ"),
+        (lambda: "2026-09-08T15:00:00+00:00", 1, "is not YYYY-mm-ddTHH:MM:SSZ"),
+    ),
+)
+def test_staleness_check_reads_the_published_validity(
+    tmp_path, valid_until, expected_returncode, expected_message
+):
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    timestamp = datetime.fromtimestamp(time.time() - 60, timezone.utc).strftime(
+        "%Y%m%d%H%M%S"
+    )
+    release = releases / f"{timestamp}-0123456789ab"
+    release.mkdir()
+    write_release_status(release, valid_until())
+
+    result = subprocess.run(
+        [sys.executable, ROOT / "check_staleness.py", release],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_returncode
+    assert result.stdout == ""
+    assert expected_message in result.stderr
+    if expected_returncode:
+        assert str(release.resolve()) in result.stderr
+    else:
+        assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_message"),
+    (
+        ("{not json", "publication validity check failed"),
+        ("[]", "carries no valid_until"),
+        ('"2026-09-08T15:00:00Z"', "carries no valid_until"),
+    ),
+)
+def test_staleness_check_fails_closed_on_a_malformed_status(
+    tmp_path, raw, expected_message
+):
+    timestamp = datetime.fromtimestamp(time.time() - 60, timezone.utc).strftime(
+        "%Y%m%d%H%M%S"
+    )
+    release = tmp_path / f"{timestamp}-0123456789ab"
+    release.mkdir()
+    write_release_status(release, None, raw=raw)
+
+    result = subprocess.run(
+        [sys.executable, ROOT / "check_staleness.py", release],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert expected_message in result.stderr
+    assert str(release.resolve()) in result.stderr
+
+
+def test_staleness_check_fails_closed_without_a_published_status(tmp_path):
+    timestamp = datetime.fromtimestamp(time.time() - 60, timezone.utc).strftime(
+        "%Y%m%d%H%M%S"
+    )
+    release = tmp_path / f"{timestamp}-0123456789ab"
+    release.mkdir()
+
+    result = subprocess.run(
+        [sys.executable, ROOT / "check_staleness.py", release],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert f"publication validity check failed for {release.resolve()}" in result.stderr
 
 
 def test_staleness_check_fails_closed_when_current_cannot_be_resolved(tmp_path):
@@ -914,9 +1019,7 @@ def test_guards_validate_the_static_release_before_rendering_it(tmp_path, monkey
 
     monkeypatch.setattr(guards, "build_page", fake_build_page)
     monkeypatch.setattr(guards, "guard_ledger_chain", lambda _ticks: [])
-    monkeypatch.setattr(
-        guards, "guard_payload_contract", lambda _html, _derive, _ticks: []
-    )
+    monkeypatch.setattr(guards, "guard_payload_contract", lambda _html, _payload: [])
     monkeypatch.setattr(guards, "guard_static_release", record("static release"))
     monkeypatch.setattr(guards, "guard_zero_width_render", record("zero-width render"))
     monkeypatch.setattr(guards, "guard_no_js_state", record("no-JS honesty"))
@@ -1435,6 +1538,10 @@ def test_runbook_documents_the_independent_staleness_alarm():
     assert "technocore-observatory-staleness.service" in alarm_section
     assert "30 minutes" in alarm_section
     assert "mtime" in alarm_section
+    assert "api/v1/status.json" in alarm_section
+    assert "`valid_until`" in alarm_section
+    assert "more than 10 minutes in the past" in alarm_section
+    assert "publication is past its" in alarm_section
     assert "read-only" in alarm_section
     assert re.search(r"does not inspect the rebuild\s+service", alarm_section)
     assert (
@@ -1609,12 +1716,14 @@ def test_static_release_guard_requires_every_generated_route_artifact():
 def payload_guard_page(tmp_path, ticks):
     destination = tmp_path / "payload-guard"
     destination.mkdir()
-    return guards.build_page(
+    html = guards.build_page(
         ROOT / "index.html",
         ROOT / "derive.py",
         ticks,
         destination,
     ).read_text(encoding="utf-8")
+    payload = json.loads((destination / "data.json").read_text(encoding="utf-8"))
+    return html, payload
 
 
 def test_embedded_point_projection_matches_every_script_read():
@@ -1660,20 +1769,21 @@ def test_payload_path_reader_canonicalises_observation_aliases_and_destructuring
 def test_payload_guard_accepts_a_declared_but_unobserved_optional_branch(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
-    html = payload_guard_page(tmp_path, ticks)
+    html, payload = payload_guard_page(tmp_path, ticks)
 
-    assert guards.guard_payload_contract(html, ROOT / "derive.py", ticks) == []
+    assert guards.guard_payload_contract(html, payload) == []
 
 
 def test_payload_guard_still_rejects_an_undeclared_field(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
-    html = payload_guard_page(tmp_path, ticks).replace(
+    html, payload = payload_guard_page(tmp_path, ticks)
+    html = html.replace(
         "</body>",
         "<script>const value = point.never_emitted;</script></body>",
     )
 
-    assert guards.guard_payload_contract(html, ROOT / "derive.py", ticks) == [
+    assert guards.guard_payload_contract(html, payload) == [
         "the page reads `point.never_emitted` but the deriver never emits it "
         "(producer/consumer drift)"
     ]
@@ -1682,15 +1792,84 @@ def test_payload_guard_still_rejects_an_undeclared_field(tmp_path):
 def test_payload_guard_rejects_a_field_dropped_only_from_rendering_data(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
-    html = payload_guard_page(tmp_path, ticks).replace(
+    html, payload = payload_guard_page(tmp_path, ticks)
+    html = html.replace(
         "</body>",
         "<script>const value = point.room_lifecycle;</script></body>",
     )
 
-    assert guards.guard_payload_contract(html, ROOT / "derive.py", ticks) == [
+    assert guards.guard_payload_contract(html, payload) == [
         "the page reads `point.room_lifecycle` but the embedded rendering "
         "projection drops it (producer/consumer drift)"
     ]
+
+
+def test_guards_run_the_deriver_exactly_once(tmp_path, monkeypatch, capsys):
+    ticks = tmp_path / "ticks.jsonl"
+    write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
+    derive_runs = []
+    real_run = subprocess.run
+
+    def counting_run(command, *args, **kwargs):
+        if any(str(part).endswith("derive.py") for part in command):
+            derive_runs.append(list(command))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(guards.subprocess, "run", counting_run)
+    monkeypatch.setattr(guards, "guard_ledger_chain", lambda _ticks: [])
+    monkeypatch.setattr(guards, "guard_static_release", lambda _root: [])
+    monkeypatch.setattr(guards, "guard_zero_width_render", lambda _html: [])
+    monkeypatch.setattr(guards, "guard_no_js_state", lambda _html, _payload: [])
+    monkeypatch.setattr(guards, "guard_mobile_horizontal_overflow", lambda _root: [])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "guards.py",
+            "--html",
+            str(ROOT / "index.html"),
+            "--derive",
+            str(ROOT / "derive.py"),
+            "--ticks",
+            str(ticks),
+            "--site-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert guards.main() == 0
+    assert len(derive_runs) == 1
+    assert "ok    payload contract" in capsys.readouterr().out
+
+
+def test_guards_report_a_failing_deriver_instead_of_crashing(
+    tmp_path, monkeypatch, capsys
+):
+    broken = tmp_path / "derive.py"
+    broken.write_text(
+        "import sys; sys.stderr.write('ledger line 3 is not a tick'); sys.exit(2)",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "guards.py",
+            "--html",
+            str(ROOT / "index.html"),
+            "--derive",
+            str(broken),
+            "--ticks",
+            str(tmp_path / "ticks.jsonl"),
+            "--site-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert guards.main() == 1
+    out = capsys.readouterr().out
+    assert "FAIL  derive" in out
+    assert "derive.py failed, so nothing could be checked: ledger line 3" in out
 
 
 def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
