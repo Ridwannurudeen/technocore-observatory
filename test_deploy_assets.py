@@ -15,6 +15,8 @@ import collect
 import derive
 import guards
 import query_service
+import snapshots
+import telemetry
 from api_contract import text_bytes
 from build_site import build_release
 from test_snapshots import telemetry_database, tick, write_ticks
@@ -59,6 +61,7 @@ DEPLOY_FILES = {
     SQLITE_DEPLOY / "PIN.md",
     SQLITE_DEPLOY / "build.sh",
     SQLITE_DEPLOY / "rehearse-wal.sh",
+    SQLITE_DEPLOY / "rehearse-telemetry-wal.sh",
     ROOT / "DEMO.md",
 }
 
@@ -512,16 +515,18 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     assert "technocore-observatory-rebuild.service" not in staleness_timer
 
 
-def test_only_signer_database_units_load_the_pinned_sqlite_and_openers_guard_it(
+def test_only_sqlite_database_units_load_the_pinned_sqlite_and_openers_guard_it(
     tmp_path,
     monkeypatch,
 ):
     vendored_environment = (
         "Environment=LD_LIBRARY_PATH=/home/technocore/observatory/lib"
     )
-    signer_units = {
+    sqlite_units = {
         "technocore-observatory.service",
+        "technocore-observatory-pulse.service",
         "technocore-observatory-query.service",
+        "technocore-observatory-rebuild.service",
     }
     service_sources = {
         path.name: read(path) for path in sorted(SYSTEMD.glob("*.service"))
@@ -529,11 +534,15 @@ def test_only_signer_database_units_load_the_pinned_sqlite_and_openers_guard_it(
 
     assert {
         name for name, source in service_sources.items() if "LD_LIBRARY_PATH" in source
-    } == signer_units
+    } == sqlite_units
     for name, source in service_sources.items():
-        assert source.count(vendored_environment) == int(name in signer_units)
+        assert source.count(vendored_environment) == int(name in sqlite_units)
 
-    for source_path in (ROOT / "collect.py", ROOT / "query_service.py"):
+    for source_path in (
+        ROOT / "collect.py",
+        ROOT / "query_service.py",
+        ROOT / "telemetry.py",
+    ):
         assert re.search(
             r"(?m)^PINNED_SQLITE_VERSION = \(3, 53, 4\)$",
             read(source_path),
@@ -541,6 +550,7 @@ def test_only_signer_database_units_load_the_pinned_sqlite_and_openers_guard_it(
     unavailable_version = (sqlite3.sqlite_version_info[0] + 1, 0, 0)
     monkeypatch.setattr(collect, "PINNED_SQLITE_VERSION", unavailable_version)
     monkeypatch.setattr(query_service, "PINNED_SQLITE_VERSION", unavailable_version)
+    monkeypatch.setattr(telemetry, "PINNED_SQLITE_VERSION", unavailable_version)
 
     with pytest.raises(
         collect.CollectionError,
@@ -552,6 +562,16 @@ def test_only_signer_database_units_load_the_pinned_sqlite_and_openers_guard_it(
         match=r"requires vendored SQLite .*LD_LIBRARY_PATH=",
     ):
         query_service.open_readonly_database(tmp_path / "reader.sqlite3")
+    with pytest.raises(
+        sqlite3.DatabaseError,
+        match=r"telemetry database requires vendored SQLite .*LD_LIBRARY_PATH=",
+    ):
+        telemetry.TelemetryStore(tmp_path / "telemetry-writer.sqlite3")
+    with pytest.raises(
+        sqlite3.DatabaseError,
+        match=r"telemetry database requires vendored SQLite .*LD_LIBRARY_PATH=",
+    ):
+        snapshots.load_telemetry(tmp_path / "telemetry-reader.sqlite3")
 
 
 def test_wal_rehearsal_uses_a_confined_copy_and_reports_every_gate():
@@ -593,6 +613,50 @@ def test_wal_rehearsal_uses_a_confined_copy_and_reports_every_gate():
     ):
         assert source.count(f'echo "PASS: {gate}"') == 1
         assert source.count(f'echo "FAIL: {gate}"') == 1
+
+
+def test_telemetry_wal_rehearsal_covers_both_lock_directions_and_rollback():
+    source = read(SQLITE_DEPLOY / "rehearse-telemetry-wal.sh")
+
+    assert source.startswith("#!/usr/bin/env bash\nset -u\nset -o pipefail\n")
+    backup = source.index("source_connection.backup(destination_connection)")
+    telemetry_store = source.index("store = TelemetryStore(database)")
+    confined_reader = source.index("loaded = load_telemetry(database)")
+    long_select = source.index("SELECT request_attempts.id, sequence.value")
+    record_attempt = source.index("attempt_id = store.record_attempt(")
+    checkpoint = source.index("PY_CHECKPOINT")
+    delete_switch = source.index("PRAGMA journal_mode = DELETE")
+    assert (
+        backup
+        < telemetry_store
+        < record_attempt
+        < confined_reader
+        < long_select
+        < checkpoint
+        < delete_switch
+    )
+    assert source.index('wait_for(long_reader_ready, "long reader")') < record_attempt
+    assert '--property="ReadOnlyPaths=${OBSERVATORY_ROOT}"' in source
+    assert 'mktemp -d "${OBSERVATORY_ROOT}/.telemetry-wal-rehearsal.XXXXXXXX"' in source
+    for result in (
+        "PASS: read succeeds during write under ReadOnlyPaths",
+        "PASS: record_attempt commits during long read",
+        "PASS: version assertion",
+        "PASS: checkpoint on close",
+        "PASS: switch back to DELETE succeeds",
+    ):
+        assert result in source
+    assert "--property=User=technocore" in source
+    assert "--property=Group=technocore" in source
+    assert "--property=ProtectSystem=strict" in source
+    assert "--property=ProtectHome=read-only" in source
+    assert '--property="ReadOnlyPaths=${OBSERVATORY_ROOT}"' in source
+    assert '--property="ReadWritePaths=/opt/technocore-observatory"' in source
+    assert '--setenv=LD_LIBRARY_PATH="$SQLITE_LIBRARY_DIRECTORY"' in source
+    assert 'print("READY: long read transaction is open", flush=True)' in source
+    assert 'touch -- "$long_reader_ready"' in source
+    assert 'ready.write_text("long read transaction is open' not in source
+    assert 'rm -rf -- "$scratch_directory"' in source
 
 
 @pytest.mark.parametrize(
@@ -1284,14 +1348,58 @@ def test_runbook_rollback_validates_an_exact_release_child_before_linking(tmp_pa
         assert linked.returncode != 0
 
 
-def test_runbook_documents_signer_wal_without_changing_telemetry():
+def test_runbook_documents_signer_and_telemetry_wal_recovery_families():
     source = read(ROOT / "DEPLOY.md")
 
-    assert "signer database uses WAL journal mode" in source
+    assert "signer and telemetry databases use WAL journal mode" in source
     assert "`synchronous=NORMAL`" in source
     assert "1,000-page" in source
     assert "last committed transaction can be lost" in source
-    assert "Telemetry remains on DELETE/FULL" in source
+    assert (
+        "`telemetry.sqlite3`, `telemetry.sqlite3-wal`, and `telemetry.sqlite3-shm`"
+        in source
+    )
+    assert "the rebuild's telemetry read can fail closed" in source
+
+
+def test_runbook_orders_telemetry_wal_activation_and_rollback_gates():
+    source = read(ROOT / "DEPLOY.md")
+    start = source.index("### Telemetry WAL deploy order")
+    end = source.index("## 1. Verify the candidate locally", start)
+    deploy = source[start:end]
+
+    deploy_tree = deploy.index("Deploy the tracked tree")
+    install_units = deploy.index("Install the updated pulse and rebuild units")
+    rehearse = deploy.index("rehearse-telemetry-wal.sh")
+    stop_pulse = deploy.index("technocore-observatory-pulse.timer")
+    stop_rebuild = deploy.index("technocore-observatory-rebuild.timer")
+    stop_collector = deploy.index("Only then stop `technocore-observatory.service`")
+    switch_wal = deploy.index("PY_SWITCH_TELEMETRY_WAL")
+    start_collector = deploy.index("Start `technocore-observatory.service`")
+    verify_sidecars = deploy.index("verify `telemetry.sqlite3-wal`")
+    start_pulse = deploy.index("Start `technocore-observatory-pulse.timer`")
+    start_rebuild = deploy.index("`technocore-observatory-rebuild.timer`", start_pulse)
+    latency_gate = deploy.index("under three minutes")
+    assert (
+        deploy_tree
+        < install_units
+        < rehearse
+        < stop_pulse
+        < stop_rebuild
+        < stop_collector
+        < switch_wal
+        < start_collector
+        < verify_sidecars
+        < start_pulse
+        < start_rebuild
+        < latency_gate
+    )
+
+    rollback = source[source.index("### Roll back telemetry WAL to DELETE") :]
+    assert "rehearse-telemetry-wal.sh" in rollback
+    assert "snapshot `telemetry.sqlite3` with both existing sidecars" in rollback
+    assert "PRAGMA journal_mode = DELETE" in rollback
+    assert "telemetry integrity check failed" in rollback
 
 
 def test_runbook_fences_both_legacy_crons_and_preserves_live_census_state():
@@ -1736,6 +1844,7 @@ def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
         "rebuild.sh",
         "deploy/sqlite/build.sh",
         "deploy/sqlite/rehearse-wal.sh",
+        "deploy/sqlite/rehearse-telemetry-wal.sh",
     ),
 )
 def test_shell_syntax_when_bash_is_available(relative_script):
@@ -1815,7 +1924,7 @@ def test_query_unit_pins_the_versions_the_code_actually_publishes():
     # deploy-order sections legitimately name older collector versions.
     deploy = read(ROOT / "DEPLOY.md")
     step = re.search(
-        r"2\. Start `technocore-observatory\.service`.*?in local state\.",
+        r"\d+\. Start `technocore-observatory\.service`.*?in local state\.",
         deploy,
         re.S,
     )

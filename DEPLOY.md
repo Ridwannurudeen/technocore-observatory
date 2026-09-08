@@ -42,8 +42,9 @@ the rollback evidence.
 - `deploy/systemd/` contains the collector, query, pulse, rebuild, and publication-staleness units
   and the pulse, rebuild, and staleness timers.
 - `deploy/sqlite/` pins and builds the SQLite shared library used by every process that opens the
-  signer database. The collector and query units set `LD_LIBRARY_PATH`; pulse, rebuild, and
-  staleness remain on their normal runtime environment because they do not open that database.
+  signer or telemetry database. The collector, query, pulse, and rebuild units set
+  `LD_LIBRARY_PATH`; staleness remains on its normal runtime environment because it opens neither
+  database.
 - `rebuild.sh` takes a non-blocking exclusive lock on the resolved publication root, recovers
   interrupted unpublished builds, copies the tick ledger once while holding the collector's
   `ticks.jsonl.lock` so the build and the guards read one untorn snapshot, creates a new versioned
@@ -64,20 +65,27 @@ the zone replenishes one request every 2 s with a burst of 10. All five error st
 remain publicly cacheable. Every loopback proxy suppresses GET/HEAD request bodies and clears the
 forwarded `Content-Length`.
 
-The signer database uses WAL journal mode with `synchronous=NORMAL` and an explicit 1,000-page
-automatic-checkpoint threshold. WAL with NORMAL remains durable against a process crash and cannot
-corrupt the database on power loss, but the last committed transaction can be lost after power
-loss; the tick outbox already tolerates that loss boundary. Telemetry remains on DELETE/FULL.
+The signer and telemetry databases use WAL journal mode with `synchronous=NORMAL` and an explicit
+1,000-page automatic-checkpoint threshold. WAL with NORMAL remains durable against a process crash
+and cannot corrupt either database on power loss, but the last committed transaction can be lost
+after power loss. The signer tick outbox and best-effort telemetry path already tolerate that loss
+boundary.
 
-Treat `signers.sqlite3`, `signers.sqlite3-wal`, and `signers.sqlite3-shm` as one recovery family.
-Never copy, restore, or delete either sidecar independently of the other existing family members.
-When the last signer-database connection closes cleanly, SQLite checkpoints the WAL and normally
-removes both sidecars. The collector therefore holds one connection for its whole process lifetime
-so the SHM file remains available to the confined read-only query service between ticks. While the
-collector is stopped, a read-only query open can fail closed until the collector starts and
-recreates the sidecars; nginx then returns the bounded 503 response.
+Treat each of these sets as a separate recovery family:
 
-### Deploy order
+- `signers.sqlite3`, `signers.sqlite3-wal`, and `signers.sqlite3-shm`;
+- `telemetry.sqlite3`, `telemetry.sqlite3-wal`, and `telemetry.sqlite3-shm`.
+
+Never copy, restore, or delete either sidecar independently of the other existing members of its
+family. When the last connection to a WAL database closes cleanly, SQLite checkpoints the WAL and
+normally removes both sidecars. The collector therefore holds one connection to each database for
+its whole process lifetime, so the SHM files remain available to the confined read-only query and
+rebuild services between ticks. While the collector is stopped, the query service's signer read
+and the rebuild's telemetry read can fail closed until the collector starts and recreates the
+corresponding sidecars; nginx returns the bounded 503 for a failed query, and a failed rebuild
+leaves the prior `current` release untouched.
+
+### Signer WAL deploy order
 
 Apply the signer-WAL change in this order; do not combine or reorder the storage gates:
 
@@ -128,6 +136,64 @@ Apply the signer-WAL change in this order; do not combine or reorder the storage
 The rehearsal's switch-back gate is also the rollback rehearsal: it proves on a copy that a clean
 close checkpoints the WAL and that `PRAGMA journal_mode = DELETE` succeeds under the vendored
 library before the production mode is changed.
+
+### Telemetry WAL deploy order
+
+Apply the telemetry-WAL change in this order. Do not combine or reorder the storage gates:
+
+1. Deploy the tracked tree to `/home/technocore/observatory`. The already-running collector still
+   has its old code mapped until it is stopped below.
+2. Install the updated pulse and rebuild units, then run `systemctl daemon-reload`. Confirm the
+   collector unit still carries the same vendored-library environment; do not restart anything
+   yet.
+3. Run the telemetry rehearsal as root against a scratch backup of the real database:
+
+   ```bash
+   sudo /home/technocore/observatory/deploy/sqlite/rehearse-telemetry-wal.sh \
+     /home/technocore/observatory/telemetry.sqlite3
+   ```
+
+   Continue only if it prints PASS for read-during-write under the rebuild's `ReadOnlyPaths`,
+   `record_attempt` during a held 50,000-row read, the exact SQLite version, checkpoint-on-close,
+   and switch-back to DELETE. The script never changes the source database.
+4. Stop `technocore-observatory-pulse.timer`, then
+   `technocore-observatory-rebuild.timer`. Confirm both oneshot services are inactive, stopping
+   either service if necessary. Fence the census cron and confirm no census process is running.
+   Only then stop `technocore-observatory.service` and confirm no process has the real telemetry
+   database open.
+5. Switch the real telemetry database to WAL under the vendored library:
+
+   ```bash
+   sudo -u technocore -- env LD_LIBRARY_PATH=/home/technocore/observatory/lib \
+     /usr/bin/python3 - <<'PY_SWITCH_TELEMETRY_WAL'
+   import sqlite3
+
+
+   if sqlite3.sqlite_version_info < (3, 53, 4):
+       raise SystemExit(f"vendored SQLite 3.53.4+ required; loaded {sqlite3.sqlite_version}")
+   database = "/home/technocore/observatory/telemetry.sqlite3"
+   with sqlite3.connect(database) as connection:
+       mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+       if mode.lower() != "wal":
+           raise SystemExit(f"failed to switch telemetry database to WAL: {mode!r}")
+   PY_SWITCH_TELEMETRY_WAL
+   ```
+
+6. Start `technocore-observatory.service`. Its process-lifetime `TelemetryStore` connection
+   verifies WAL, applies `synchronous=NORMAL` and `wal_autocheckpoint=1000`, and keeps the sidecars
+   present between ticks.
+7. Before starting either reader, verify `telemetry.sqlite3-wal` and `telemetry.sqlite3-shm` both
+   exist and are owned by `technocore:technocore`. A missing member means stop; do not create or
+   copy a sidecar by hand.
+8. Start `technocore-observatory-pulse.timer`, then
+   `technocore-observatory-rebuild.timer`, and restore the exact fenced census cron entry.
+9. Trigger or await one rebuild and confirm it succeeds while the collector remains active. Confirm
+   a new collector tick lands in under three minutes during that rebuild, and record the rebuild
+   duration, tick duration, WAL size, and checkpoint behavior.
+
+While the collector remains stopped, do not treat a rebuild telemetry-open failure as permission
+to loosen `ReadOnlyPaths`: the missing SHM file is the expected fail-closed state. Start the
+collector, verify the complete telemetry recovery family, and retry the rebuild.
 
 ## 1. Verify the candidate locally
 
@@ -219,15 +285,14 @@ copy before running candidate code. Copy:
 - the complete ledger recovery state family: `ticks.jsonl`,
   `ticks.jsonl.ledger-checkpoint.json`, and `ticks.jsonl.ledger-pending.json`;
 - `signers.json`, `census.json`, and `census.json.lock`;
-- `telemetry.sqlite3` together with `telemetry.sqlite3-journal` if that journal exists, recording
-  its absence otherwise;
+- `telemetry.sqlite3` if it exists, together with every existing `telemetry.sqlite3-wal` and
+  `telemetry.sqlite3-shm` sidecar; if the pre-switch database instead has a legacy
+  `telemetry.sqlite3-journal`, preserve that evidence too and record the absence of every missing
+  telemetry-family member;
 - `signers.sqlite3` if it exists, together with every existing `signers.sqlite3-wal` and
   `signers.sqlite3-shm` sidecar; if the pre-switch database instead has a legacy
   `signers.sqlite3-journal`, preserve that evidence too and record the absence of every missing
   signer-family member;
-- any unexpected legacy WAL/SHM evidence files `telemetry.sqlite3-wal` or
-  `telemetry.sqlite3-shm` that exist in the raw fenced state; they are evidence inputs only, not
-  dependencies of the normalized telemetry database;
 - the complete legacy flat publication, including `/opt/technocore-observatory/index.html` and
   `/opt/technocore-observatory/data.json`, plus the old nginx vhost;
 - the output of `readlink /opt/technocore-observatory/current`, or record `current` as absent for
@@ -235,9 +300,10 @@ copy before running candidate code. Copy:
 
 This first copy is disaster-recovery evidence, not an ordinary code-rollback input. Snapshot every
 ledger-family member that exists and record any absent sidecar; do not synthesize a missing member.
-For an already-WAL signer database, copy the database, WAL, and SHM together while every process is
-fenced. Never infer that a missing sidecar is disposable or delete one to make the family look
-normalized.
+For an already-WAL signer or telemetry database, copy the database, WAL, and SHM together while
+every process is fenced. Never infer that a missing sidecar is disposable or delete one to make
+the family look normalized. Those files remain legacy WAL/SHM evidence for the pre-transition raw
+snapshot; after activation they are live recovery-family members.
 
 Next, use the staged candidate's recovery-only command against the fenced live state:
 
@@ -305,7 +371,7 @@ This pre-switch normalization lets SQLite finish any hot rollback journal left b
 mode before the integrity check. A non-`ok` result or surviving journal means stop; never delete
 the journal to force this gate. If the signer database was already in WAL mode,
 `PRAGMA journal_mode = DELETE` performs the checkpoint and mode switch; it must run under the
-vendored library, with every other signer opener fenced.
+vendored library, with every other opener of that database fenced.
 
 After it succeeds, create a separate recovery-ready state snapshot containing `ticks.jsonl`, the
 recorded absence of `ticks.jsonl.ledger-pending.json`, `telemetry.sqlite3`, `signers.json`, and
@@ -314,12 +380,11 @@ verified legacy ledger without one, record a missing legacy checkpoint; the next
 creates its canonical checkpoint. Include `signers.sqlite3` when it exists; for a v2 JSON source,
 record that it was absent before migration. This snapshot is deliberately pre-transition. The
 recovery-ready snapshot must contain no SQLite `-journal`, `-wal`, or `-shm`. After WAL activation,
-a new recovery
-snapshot must instead preserve `signers.sqlite3` and every existing `-wal` and `-shm` member as one
-family; only a successful clean checkpoint or an explicit switch to DELETE may leave the sidecars
-absent. If disaster recovery becomes necessary, keep every opener fenced, restore every member from
-one snapshot, then run the same recovery command before starting a writer. Never mix members from
-different snapshots.
+a new recovery snapshot must instead preserve each SQLite database and every existing `-wal` and
+`-shm` member of its signer or telemetry recovery family; only a successful clean checkpoint or an
+explicit switch to DELETE may leave that family's sidecars absent. If disaster recovery becomes
+necessary, keep every opener fenced, restore every member from one snapshot, then run the same
+recovery command before starting a writer. Never mix members from different snapshots.
 
 Do not continue unless the rollback directory contains the prior deployed code/config evidence,
 the recovery-ready state snapshot, and the recorded `current` target.
@@ -328,8 +393,8 @@ Only now copy the candidate's tracked source files into `/home/technocore/observ
 candidate must have been extracted from the verified commit archive and contain no state files, so
 this additive copy cannot replace a state member. Preserve
 `ticks.jsonl`, `ticks.jsonl.ledger-checkpoint.json`, and `ticks.jsonl.ledger-pending.json` as the
-same family, plus `telemetry.sqlite3`, `signers.json`, `signers.sqlite3`, `census.json`, and all lock
-files. Provision the query identity idempotently:
+same family, plus both complete SQLite recovery families, `signers.json`, `census.json`, and all
+lock files. Provision the query identity idempotently:
 
 ```bash
 if ! getent passwd technocore-query >/dev/null; then
@@ -372,6 +437,13 @@ through its supplementary `technocore` group; its unit has no `ReadWritePaths` a
 for any family member. The rehearsal must prove that the confined query identity can mmap the
 existing read-only SHM file. If systemd confinement blocks that mmap, stop the deployment and
 report the failure instead of loosening permissions.
+
+The rebuild runs as `technocore`, but its unit exposes `/home/technocore/observatory` through
+`ReadOnlyPaths` and opens telemetry with `mode=ro`. That boundary covers `telemetry.sqlite3`,
+`telemetry.sqlite3-wal`, and `telemetry.sqlite3-shm`; do not add a writable exception for any
+member. The telemetry rehearsal must prove both that this confined reader can use the existing SHM
+while `TelemetryStore` holds it and that `record_attempt` commits while the reader holds a large
+SELECT. A confinement failure is a stop condition, not permission to loosen the unit.
 
 ## 4. Run the one-time signer migration only when needed
 
@@ -439,32 +511,34 @@ nginx -t
 
 Then establish data before consumers:
 
-1. Run `systemctl start technocore-observatory-pulse.service` once so telemetry schema/data exist.
-2. Start `technocore-observatory.service`, wait for one accepted tick, and verify collector 2.15.0,
+1. Start `technocore-observatory.service`, wait for one accepted tick, and verify collector 2.15.0,
    signer-state/SQLite schema 6, and telemetry schema 1 in local state. This upgrades an existing
    v3-v5 SQLite store before any schema-v6-only reader starts.
-3. Run `systemctl start technocore-observatory-rebuild.service`. It must create a new
+2. Verify both the signer and telemetry `-wal`/`-shm` pairs exist while the collector is running.
+3. Run `systemctl start technocore-observatory-pulse.service` once.
+4. Run `systemctl start technocore-observatory-rebuild.service`. It must create a new
    `releases/<id>` and atomically set `current`; a failed build or guard leaves the prior `current`
    untouched and removes the exact unpublished candidate. The builder creates an external
    `.unpublished-<id>` sidecar before the staging-directory rename, and the rebuild clears that
    sidecar only after the atomic flip proves the candidate is current. Only then does it prune
    release history.
-4. Confirm `/api/v1/status.txt`, `/api/v1/status.json`, discovery documents, local assets, and the
+5. Confirm `/api/v1/status.txt`, `/api/v1/status.json`, discovery documents, local assets, and the
    static error artifacts exist beneath the resolved `current` release.
-5. Start `technocore-observatory-query.service`; confirm it listens only on `127.0.0.1:8765` and
+6. Start `technocore-observatory-query.service`; confirm it listens only on `127.0.0.1:8765` and
    can read but not mutate the signer database.
-6. Restore the exact fenced census cron entry.
-7. Enable/start `technocore-observatory-pulse.timer` and
+7. Restore the exact fenced census cron entry.
+8. Enable/start `technocore-observatory-pulse.timer` and
    `technocore-observatory-rebuild.timer`.
-8. Reload nginx only after another successful `nginx -t`.
+9. Reload nginx only after another successful `nginx -t`.
 
 The corresponding activation commands are:
 
 ```bash
-systemctl start technocore-observatory-pulse.service
 systemctl start technocore-observatory.service
 systemctl enable technocore-observatory.service
 # Wait for one accepted tick and verify schema 6 before continuing.
+# Verify both WAL/SHM pairs while the collector holds its connections.
+systemctl start technocore-observatory-pulse.service
 systemctl start technocore-observatory-rebuild.service
 systemctl start technocore-observatory-query.service
 systemctl enable technocore-observatory-query.service
@@ -563,7 +637,50 @@ The `PRAGMA journal_mode = DELETE` statement checkpoints the WAL and changes the
 Do not remove the vendored library, remove either sidecar, restore an older unit, or restart a
 system-library signer opener before that command and integrity check succeed. Once they do, update
 the collector unit and census cron together, start the compatible collector, then restart the query
-service. This procedure changes only the signer database; telemetry stays on DELETE/FULL throughout.
+service. This procedure changes only the signer database; use the telemetry procedure below when a
+rollback also removes telemetry-WAL support.
+
+### Roll back telemetry WAL to DELETE
+
+Apply the signer rollback procedure to telemetry as its own recovery family. First run
+`deploy/sqlite/rehearse-telemetry-wal.sh`; its checkpoint-on-close and switch-back gates must print
+PASS. Stop the pulse and rebuild timers, confirm both oneshot services are inactive, fence the
+census cron, then stop the collector. Confirm no process has the telemetry database open and
+snapshot `telemetry.sqlite3` with both existing sidecars before touching the real family.
+
+Switch the real database under the vendored library and verify its integrity:
+
+```bash
+sudo -u technocore -- env LD_LIBRARY_PATH=/home/technocore/observatory/lib \
+  /usr/bin/python3 - <<'PY_ROLLBACK_TELEMETRY_DELETE'
+import sqlite3
+from pathlib import Path
+
+
+if sqlite3.sqlite_version_info < (3, 53, 4):
+    raise SystemExit(f"vendored SQLite 3.53.4+ required; loaded {sqlite3.sqlite_version}")
+database = Path("/home/technocore/observatory/telemetry.sqlite3")
+connection = sqlite3.connect(database)
+try:
+    mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+    if mode.lower() != "delete":
+        raise SystemExit(f"failed to switch telemetry database to DELETE: {mode!r}")
+    result = connection.execute("PRAGMA integrity_check").fetchall()
+finally:
+    connection.close()
+if result != [("ok",)]:
+    raise SystemExit(f"telemetry integrity check failed: {result!r}")
+for suffix in ("-wal", "-shm"):
+    sidecar = database.with_name(database.name + suffix)
+    if sidecar.exists():
+        raise SystemExit(f"telemetry sidecar remains after DELETE switch: {sidecar}")
+PY_ROLLBACK_TELEMETRY_DELETE
+```
+
+Do not remove the vendored library, change any of the four units' `LD_LIBRARY_PATH`, delete a
+sidecar, or start an older opener before the DELETE switch and integrity check succeed. Then deploy
+the mutually compatible older code and units, start the collector, restore the census entry, and
+start the pulse and rebuild timers. This rollback changes no telemetry schema or record content.
 
 ### Deploy order at 2.13.0
 
@@ -791,12 +908,12 @@ nginx -t && systemctl reload nginx
 
 For a code rollback, fence collector and census writers again and snapshot the *current* state
 before replacing code. If the target code does not load the vendored library, complete the
-WAL-to-DELETE procedure above before removing the library or changing `LD_LIBRARY_PATH`. Restore only
-code/config that supports the current on-disk schema, then build a fresh release from the current
-`ticks.jsonl` and `telemetry.sqlite3`. Never restore old `ticks.jsonl`, `telemetry.sqlite3`,
-`signers.json`, or `signers.sqlite3` as part of an ordinary code rollback. If old code cannot read
-the forward schema, leave writers stopped and roll forward with a compatible fix instead of
-destroying newer observations.
+applicable signer and telemetry WAL-to-DELETE procedures above before removing the library or
+changing `LD_LIBRARY_PATH`. Restore only code/config that supports the current on-disk schema, then
+build a fresh release from the current `ticks.jsonl` and `telemetry.sqlite3`. Never restore old
+`ticks.jsonl`, `telemetry.sqlite3`, `signers.json`, or `signers.sqlite3` as part of an ordinary code
+rollback. If old code cannot read the forward schema, leave writers stopped and roll forward with a
+compatible fix instead of destroying newer observations.
 
 No step in this runbook authorizes a post, integration message, repository push, or submission.
 Those remain separately approval-gated.
