@@ -104,6 +104,26 @@ wait_for_file() {
     return 0
 }
 
+wait_for_log() {
+    log_path=$1
+    owner_pid=$2
+    marker=$3
+    description=$4
+    attempt=0
+    while kill -0 "$owner_pid" 2>/dev/null; do
+        if [ -f "$log_path" ] && grep -F -q -- "$marker" "$log_path"; then
+            return 0
+        fi
+        if [ "$attempt" -ge 300 ]; then
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    echo "timed out waiting for $description" >&2
+    return 1
+}
+
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
@@ -115,7 +135,7 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "the telemetry WAL rehearsal must run as root for systemd confinement" >&2
     finish
 fi
-for command in readlink mktemp chown chmod sudo systemd-run; do
+for command in readlink mktemp chown chmod grep sudo systemd-run; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "required command is unavailable: $command" >&2
         finish
@@ -394,7 +414,6 @@ systemd-run \
     --setenv=LD_LIBRARY_PATH="$SQLITE_LIBRARY_DIRECTORY" \
     /usr/bin/python3 - \
     "$copy_database" \
-    "$long_reader_ready" \
     "$long_reader_release" \
     "$PINNED_SQLITE_VERSION" \
     >"$long_reader_log" 2>&1 <<'PY_LONG_READER' &
@@ -405,9 +424,8 @@ from pathlib import Path
 
 
 database = Path(sys.argv[1]).resolve(strict=True)
-ready = Path(sys.argv[2])
-release = Path(sys.argv[3])
-expected_version = sys.argv[4]
+release = Path(sys.argv[2])
+expected_version = sys.argv[3]
 if sqlite3.sqlite_version != expected_version:
     raise SystemExit(
         f"vendored SQLite version mismatch: expected {expected_version}, "
@@ -434,7 +452,7 @@ try:
     first = cursor.fetchone()
     if first is None:
         raise SystemExit("scratch telemetry database has no attempts for the long read")
-    ready.write_text("long read transaction is open\n", encoding="utf-8")
+    print("READY: long read transaction is open", flush=True)
     deadline = time.monotonic() + 60.0
     while not release.exists():
         if time.monotonic() >= deadline:
@@ -448,7 +466,14 @@ finally:
 PY_LONG_READER
 long_reader_pid=$!
 
-if wait_for_file "$long_reader_ready" "$long_reader_pid" "the long read transaction" \
+if wait_for_log \
+    "$long_reader_log" \
+    "$long_reader_pid" \
+    "READY: long read transaction is open" \
+    "the long read transaction"; then
+    touch -- "$long_reader_ready"
+fi
+if [ -f "$long_reader_ready" ] \
     && wait_for_file \
         "$write_during_read_succeeded" \
         "$writer_pid" \
@@ -490,12 +515,15 @@ from pathlib import Path
 
 database = Path(sys.argv[1])
 attempt_ids = tuple(int(Path(value).read_text(encoding="utf-8")) for value in sys.argv[2:])
-with sqlite3.connect(database) as connection:
+connection = sqlite3.connect(database)
+try:
     mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
     stored = connection.execute(
         "SELECT id FROM request_attempts WHERE id IN (?, ?) ORDER BY id",
         attempt_ids,
     ).fetchall()
+finally:
+    connection.close()
 if mode.lower() != "wal" or stored != [(value,) for value in sorted(attempt_ids)]:
     raise SystemExit("the committed telemetry writes were not checkpointed on close")
 for suffix in ("-wal", "-shm"):

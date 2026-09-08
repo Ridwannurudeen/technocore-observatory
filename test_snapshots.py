@@ -13,6 +13,7 @@ import derive
 import snapshots
 from api_contract import MAX_RESPONSE_BYTES, json_bytes, text_bytes
 from snapshots import build_snapshots, change_resource, load_telemetry
+from telemetry import TelemetryStore
 
 
 def tick(ts, *, event_seq=30_000, rooms=100, notes=1_000, lobby=5_000):
@@ -571,6 +572,55 @@ def test_load_telemetry_reads_during_wal_writer_with_explicit_timeout(
     assert snapshots.TELEMETRY_BUSY_TIMEOUT_SECONDS == 30.0
     assert connect_kwargs["timeout"] == snapshots.TELEMETRY_BUSY_TIMEOUT_SECONDS
     assert result["attempts"] == []
+
+
+def test_load_telemetry_succeeds_during_telemetry_store_write(tmp_path):
+    telemetry = tmp_path / "telemetry.sqlite3"
+    store = TelemetryStore(telemetry)
+    try:
+        observed_at = "2026-09-08T10:00:00Z"
+        cycle_id = store.start_cycle("collector", observed_at)
+        store.connection.execute("BEGIN EXCLUSIVE")
+        cursor = store.connection.execute(
+            """
+            INSERT INTO request_attempts (
+                cycle_id, route, metered, attempt, observed_at,
+                latency_ms, outcome, http_status
+            )
+            VALUES (?, '/healthz', 0, 1, ?, 1, 'success', 200)
+            """,
+            (cycle_id, observed_at),
+        )
+        uncommitted_id = int(cursor.lastrowid)
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(load_telemetry, telemetry)
+            try:
+                result = future.result(timeout=2.0)
+            finally:
+                store.connection.rollback()
+        finally:
+            executor.shutdown(wait=True)
+
+        assert [cycle["id"] for cycle in result["cycles"]] == [cycle_id]
+        assert all(attempt["id"] != uncommitted_id for attempt in result["attempts"])
+    finally:
+        if store.connection.in_transaction:
+            store.connection.rollback()
+        store.close()
+
+
+def test_load_telemetry_rejects_delete_journal_mode(tmp_path):
+    telemetry = tmp_path / "telemetry.sqlite3"
+    telemetry_database(telemetry).close()
+    with sqlite3.connect(telemetry) as connection:
+        assert connection.execute("PRAGMA journal_mode = DELETE").fetchone() == (
+            "delete",
+        )
+
+    with pytest.raises(ValueError, match="must use WAL journal mode; found delete"):
+        load_telemetry(telemetry)
 
 
 @pytest.mark.parametrize(

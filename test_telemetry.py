@@ -7,6 +7,8 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -18,6 +20,7 @@ from collect import Client, CollectionError
 from telemetry import (
     MAX_DATABASE_BYTES,
     RAW_RETENTION_SECONDS,
+    TELEMETRY_WAL_AUTOCHECKPOINT_PAGES,
     TelemetryStore,
     normalize_route,
     parse_timestamp,
@@ -57,6 +60,10 @@ def test_telemetry_schema_is_wal_journal_strict_and_rejects_raw_routes(
     assert (
         telemetry_store.connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     )
+    assert telemetry_store.connection.execute("PRAGMA synchronous").fetchone() == (1,)
+    assert telemetry_store.connection.execute(
+        "PRAGMA wal_autocheckpoint"
+    ).fetchone() == (TELEMETRY_WAL_AUTOCHECKPOINT_PAGES,)
     cycle_id = telemetry_store.start_cycle("collector", "2026-08-30T10:00:00Z")
 
     with pytest.raises(sqlite3.IntegrityError):
@@ -83,6 +90,83 @@ def test_closed_telemetry_store_has_no_wal_sidecar(tmp_path):
 
     assert not path.with_name(path.name + "-wal").exists()
     assert not path.with_name(path.name + "-shm").exists()
+
+
+def test_record_attempt_commits_while_large_read_transaction_is_held(tmp_path):
+    path = tmp_path / "telemetry.sqlite3"
+    store = TelemetryStore(path)
+    reader_ready = threading.Event()
+    reader_release = threading.Event()
+    try:
+        observed_at = "2026-09-08T10:00:00Z"
+        cycle_id = store.start_cycle("collector", observed_at)
+        store.connection.execute(
+            """
+            WITH RECURSIVE sequence(value) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT value + 1 FROM sequence WHERE value < 500
+            )
+            INSERT INTO request_attempts (
+                cycle_id, route, metered, attempt, observed_at,
+                latency_ms, outcome, http_status
+            )
+            SELECT ?, '/healthz', 0, value, ?, 1, 'success', 200
+            FROM sequence
+            """,
+            (cycle_id, observed_at),
+        )
+        store.connection.commit()
+
+        def hold_large_read() -> int:
+            connection = sqlite3.connect(path, timeout=1.0)
+            try:
+                connection.execute("BEGIN")
+                cursor = connection.execute(
+                    """
+                    WITH RECURSIVE multiplier(value) AS (
+                        VALUES(1)
+                        UNION ALL
+                        SELECT value + 1 FROM multiplier WHERE value < 100
+                    )
+                    SELECT request_attempts.id, multiplier.value
+                    FROM request_attempts CROSS JOIN multiplier
+                    LIMIT 50000
+                    """
+                )
+                assert cursor.fetchone() is not None
+                reader_ready.set()
+                assert reader_release.wait(timeout=10.0)
+                return 1 + sum(1 for _ in cursor)
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(hold_large_read)
+            assert reader_ready.wait(timeout=5.0)
+            try:
+                attempt_id = store.record_attempt(
+                    cycle_id,
+                    "/healthz",
+                    False,
+                    501,
+                    "2026-09-08T10:00:01Z",
+                    1.0,
+                    "success",
+                    200,
+                )
+            finally:
+                if store.connection.in_transaction:
+                    store.connection.rollback()
+                reader_release.set()
+            assert future.result(timeout=5.0) == 50_000
+
+        assert store.connection.execute(
+            "SELECT outcome FROM request_attempts WHERE id = ?", (attempt_id,)
+        ).fetchone() == ("success",)
+    finally:
+        reader_release.set()
+        store.close()
 
 
 @pytest.mark.parametrize(
@@ -710,6 +794,97 @@ def test_client_telemetry_degradation_marks_cycle_failed_without_losing_tick(
     assert collect.main() == 0
     assert output.is_file()
     assert finished == [((9, "failure"), {"error_outcome": "storage_error"})]
+
+
+def test_collector_holds_one_telemetry_store_across_two_ticks(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "ticks.jsonl"
+    stores = []
+    started_by = []
+    finished_by = []
+    closed = []
+
+    class HeldStore:
+        def __init__(self, path):
+            self.path = path
+            stores.append(self)
+
+        def start_cycle(self, source):
+            started_by.append(self)
+            return len(started_by)
+
+        def finish_cycle(self, cycle_id, outcome, **kwargs):
+            finished_by.append((self, cycle_id, outcome, kwargs))
+
+        def close(self):
+            closed.append(self)
+
+    class SignerConnection:
+        def close(self):
+            return None
+
+    class TwoTicksComplete(Exception):
+        pass
+
+    clock = iter((0.0, 1.0, 60.0, 61.0))
+
+    def monotonic():
+        assert len(stores) == 1, "telemetry must be open before the tick loop starts"
+        return next(clock)
+
+    sleep_calls = 0
+
+    def sleep(delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 2:
+            raise TwoTicksComplete
+
+    drain_calls = 0
+
+    def drain(*args, **kwargs):
+        nonlocal drain_calls
+        drain_calls += 1
+        return drain_calls % 2 == 0
+
+    collect_calls = []
+
+    def collect_tick(client, *args, **kwargs):
+        collect_calls.append(client)
+        return {"ts": "ok"}
+
+    monkeypatch.setattr(collect, "TelemetryStore", HeldStore)
+    monkeypatch.setattr(collect, "exclusive_state_lock", lambda *args: nullcontext())
+    monkeypatch.setattr(
+        collect, "connect_signer_database", lambda path: SignerConnection()
+    )
+    monkeypatch.setattr(collect, "drain_tick_outbox", drain)
+    monkeypatch.setattr(collect, "collect_tick", collect_tick)
+    monkeypatch.setattr(collect.time, "monotonic", monotonic)
+    monkeypatch.setattr(collect.time, "sleep", sleep)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect.py",
+            "--base-url",
+            "https://example.invalid",
+            "--output",
+            str(output),
+        ],
+    )
+
+    with pytest.raises(TwoTicksComplete):
+        collect.main()
+
+    assert len(stores) == 1
+    assert started_by == [stores[0], stores[0]]
+    assert [finished[0] for finished in finished_by] == [stores[0], stores[0]]
+    assert [finished[2] for finished in finished_by] == ["success", "success"]
+    assert [client.telemetry for client in collect_calls] == [stores[0], stores[0]]
+    assert closed == [stores[0]]
 
 
 def test_retention_is_bounded_and_preserves_canonical_discovery_changes(tmp_path):

@@ -15,6 +15,8 @@ import collect
 import derive
 import guards
 import query_service
+import snapshots
+import telemetry
 from api_contract import text_bytes
 from build_site import build_release
 from test_snapshots import telemetry_database, tick, write_ticks
@@ -536,7 +538,11 @@ def test_only_sqlite_database_units_load_the_pinned_sqlite_and_openers_guard_it(
     for name, source in service_sources.items():
         assert source.count(vendored_environment) == int(name in sqlite_units)
 
-    for source_path in (ROOT / "collect.py", ROOT / "query_service.py"):
+    for source_path in (
+        ROOT / "collect.py",
+        ROOT / "query_service.py",
+        ROOT / "telemetry.py",
+    ):
         assert re.search(
             r"(?m)^PINNED_SQLITE_VERSION = \(3, 53, 4\)$",
             read(source_path),
@@ -544,6 +550,7 @@ def test_only_sqlite_database_units_load_the_pinned_sqlite_and_openers_guard_it(
     unavailable_version = (sqlite3.sqlite_version_info[0] + 1, 0, 0)
     monkeypatch.setattr(collect, "PINNED_SQLITE_VERSION", unavailable_version)
     monkeypatch.setattr(query_service, "PINNED_SQLITE_VERSION", unavailable_version)
+    monkeypatch.setattr(telemetry, "PINNED_SQLITE_VERSION", unavailable_version)
 
     with pytest.raises(
         collect.CollectionError,
@@ -555,6 +562,16 @@ def test_only_sqlite_database_units_load_the_pinned_sqlite_and_openers_guard_it(
         match=r"requires vendored SQLite .*LD_LIBRARY_PATH=",
     ):
         query_service.open_readonly_database(tmp_path / "reader.sqlite3")
+    with pytest.raises(
+        sqlite3.DatabaseError,
+        match=r"telemetry database requires vendored SQLite .*LD_LIBRARY_PATH=",
+    ):
+        telemetry.TelemetryStore(tmp_path / "telemetry-writer.sqlite3")
+    with pytest.raises(
+        sqlite3.DatabaseError,
+        match=r"telemetry database requires vendored SQLite .*LD_LIBRARY_PATH=",
+    ):
+        snapshots.load_telemetry(tmp_path / "telemetry-reader.sqlite3")
 
 
 def test_wal_rehearsal_uses_a_confined_copy_and_reports_every_gate():
@@ -636,6 +653,9 @@ def test_telemetry_wal_rehearsal_covers_both_lock_directions_and_rollback():
     assert '--property="ReadOnlyPaths=${OBSERVATORY_ROOT}"' in source
     assert '--property="ReadWritePaths=/opt/technocore-observatory"' in source
     assert '--setenv=LD_LIBRARY_PATH="$SQLITE_LIBRARY_DIRECTORY"' in source
+    assert 'print("READY: long read transaction is open", flush=True)' in source
+    assert 'touch -- "$long_reader_ready"' in source
+    assert 'ready.write_text("long read transaction is open' not in source
     assert 'rm -rf -- "$scratch_directory"' in source
 
 
