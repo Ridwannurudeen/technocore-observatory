@@ -1328,14 +1328,58 @@ def test_runbook_rollback_validates_an_exact_release_child_before_linking(tmp_pa
         assert linked.returncode != 0
 
 
-def test_runbook_documents_signer_wal_without_changing_telemetry():
+def test_runbook_documents_signer_and_telemetry_wal_recovery_families():
     source = read(ROOT / "DEPLOY.md")
 
-    assert "signer database uses WAL journal mode" in source
+    assert "signer and telemetry databases use WAL journal mode" in source
     assert "`synchronous=NORMAL`" in source
     assert "1,000-page" in source
     assert "last committed transaction can be lost" in source
-    assert "Telemetry remains on DELETE/FULL" in source
+    assert (
+        "`telemetry.sqlite3`, `telemetry.sqlite3-wal`, and `telemetry.sqlite3-shm`"
+        in source
+    )
+    assert "the rebuild's telemetry read can fail closed" in source
+
+
+def test_runbook_orders_telemetry_wal_activation_and_rollback_gates():
+    source = read(ROOT / "DEPLOY.md")
+    start = source.index("### Telemetry WAL deploy order")
+    end = source.index("## 1. Verify the candidate locally", start)
+    deploy = source[start:end]
+
+    deploy_tree = deploy.index("Deploy the tracked tree")
+    install_units = deploy.index("Install the updated pulse and rebuild units")
+    rehearse = deploy.index("rehearse-telemetry-wal.sh")
+    stop_pulse = deploy.index("technocore-observatory-pulse.timer")
+    stop_rebuild = deploy.index("technocore-observatory-rebuild.timer")
+    stop_collector = deploy.index("Only then stop `technocore-observatory.service`")
+    switch_wal = deploy.index("PY_SWITCH_TELEMETRY_WAL")
+    start_collector = deploy.index("Start `technocore-observatory.service`")
+    verify_sidecars = deploy.index("verify `telemetry.sqlite3-wal`")
+    start_pulse = deploy.index("Start `technocore-observatory-pulse.timer`")
+    start_rebuild = deploy.index("`technocore-observatory-rebuild.timer`", start_pulse)
+    latency_gate = deploy.index("under three minutes")
+    assert (
+        deploy_tree
+        < install_units
+        < rehearse
+        < stop_pulse
+        < stop_rebuild
+        < stop_collector
+        < switch_wal
+        < start_collector
+        < verify_sidecars
+        < start_pulse
+        < start_rebuild
+        < latency_gate
+    )
+
+    rollback = source[source.index("### Roll back telemetry WAL to DELETE") :]
+    assert "rehearse-telemetry-wal.sh" in rollback
+    assert "snapshot `telemetry.sqlite3` with both existing sidecars" in rollback
+    assert "PRAGMA journal_mode = DELETE" in rollback
+    assert "telemetry integrity check failed" in rollback
 
 
 def test_runbook_fences_both_legacy_crons_and_preserves_live_census_state():
@@ -1860,7 +1904,7 @@ def test_query_unit_pins_the_versions_the_code_actually_publishes():
     # deploy-order sections legitimately name older collector versions.
     deploy = read(ROOT / "DEPLOY.md")
     step = re.search(
-        r"2\. Start `technocore-observatory\.service`.*?in local state\.",
+        r"\d+\. Start `technocore-observatory\.service`.*?in local state\.",
         deploy,
         re.S,
     )
