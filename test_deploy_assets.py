@@ -512,16 +512,18 @@ def test_systemd_units_use_the_verified_cli_contracts_and_permissions():
     assert "technocore-observatory-rebuild.service" not in staleness_timer
 
 
-def test_only_signer_database_units_load_the_pinned_sqlite_and_openers_guard_it(
+def test_only_sqlite_database_units_load_the_pinned_sqlite_and_openers_guard_it(
     tmp_path,
     monkeypatch,
 ):
     vendored_environment = (
         "Environment=LD_LIBRARY_PATH=/home/technocore/observatory/lib"
     )
-    signer_units = {
+    sqlite_units = {
         "technocore-observatory.service",
+        "technocore-observatory-pulse.service",
         "technocore-observatory-query.service",
+        "technocore-observatory-rebuild.service",
     }
     service_sources = {
         path.name: read(path) for path in sorted(SYSTEMD.glob("*.service"))
@@ -529,9 +531,9 @@ def test_only_signer_database_units_load_the_pinned_sqlite_and_openers_guard_it(
 
     assert {
         name for name, source in service_sources.items() if "LD_LIBRARY_PATH" in source
-    } == signer_units
+    } == sqlite_units
     for name, source in service_sources.items():
-        assert source.count(vendored_environment) == int(name in signer_units)
+        assert source.count(vendored_environment) == int(name in sqlite_units)
 
     for source_path in (ROOT / "collect.py", ROOT / "query_service.py"):
         assert re.search(

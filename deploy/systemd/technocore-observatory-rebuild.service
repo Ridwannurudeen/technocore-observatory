@@ -8,6 +8,7 @@ User=technocore
 Group=technocore
 WorkingDirectory=/home/technocore/observatory
 UMask=0022
+Environment=LD_LIBRARY_PATH=/home/technocore/observatory/lib
 ExecStart=/home/technocore/observatory/rebuild.sh
 TimeoutStartSec=15min
 MemoryMax=2G
