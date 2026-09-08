@@ -7020,7 +7020,6 @@ def main() -> int:
         "telemetry.sqlite3"
     )
     telemetry_path.parent.mkdir(parents=True, exist_ok=True)
-    telemetry: TelemetryStore | None = None
     signer_lock_timeout = (
         CENSUS_SIGNER_LOCK_TIMEOUT if args.census else SIGNER_LOCK_TIMEOUT
     )
@@ -7032,21 +7031,21 @@ def main() -> int:
             )
         signer_connection = connect_signer_database(database_path)
 
+    telemetry: TelemetryStore | None = None
     try:
+        try:
+            telemetry = TelemetryStore(telemetry_path)
+        except (OSError, sqlite3.Error):
+            print(
+                f"{utc_now()} telemetry degraded; local store is unavailable",
+                file=sys.stderr,
+            )
         while True:
             started = time.monotonic()
             tick_written = False
             outbox_committed = False
             cycle_id: int | None = None
             client: Client | None = None
-            if telemetry is None:
-                try:
-                    telemetry = TelemetryStore(telemetry_path)
-                except (OSError, sqlite3.Error):
-                    print(
-                        f"{utc_now()} telemetry degraded; local store is unavailable",
-                        file=sys.stderr,
-                    )
             if telemetry is not None:
                 try:
                     cycle_id = telemetry.start_cycle("collector")
