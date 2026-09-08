@@ -914,9 +914,7 @@ def test_guards_validate_the_static_release_before_rendering_it(tmp_path, monkey
 
     monkeypatch.setattr(guards, "build_page", fake_build_page)
     monkeypatch.setattr(guards, "guard_ledger_chain", lambda _ticks: [])
-    monkeypatch.setattr(
-        guards, "guard_payload_contract", lambda _html, _derive, _ticks: []
-    )
+    monkeypatch.setattr(guards, "guard_payload_contract", lambda _html, _payload: [])
     monkeypatch.setattr(guards, "guard_static_release", record("static release"))
     monkeypatch.setattr(guards, "guard_zero_width_render", record("zero-width render"))
     monkeypatch.setattr(guards, "guard_no_js_state", record("no-JS honesty"))
@@ -1609,12 +1607,14 @@ def test_static_release_guard_requires_every_generated_route_artifact():
 def payload_guard_page(tmp_path, ticks):
     destination = tmp_path / "payload-guard"
     destination.mkdir()
-    return guards.build_page(
+    html = guards.build_page(
         ROOT / "index.html",
         ROOT / "derive.py",
         ticks,
         destination,
     ).read_text(encoding="utf-8")
+    payload = json.loads((destination / "data.json").read_text(encoding="utf-8"))
+    return html, payload
 
 
 def test_embedded_point_projection_matches_every_script_read():
@@ -1660,20 +1660,21 @@ def test_payload_path_reader_canonicalises_observation_aliases_and_destructuring
 def test_payload_guard_accepts_a_declared_but_unobserved_optional_branch(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
-    html = payload_guard_page(tmp_path, ticks)
+    html, payload = payload_guard_page(tmp_path, ticks)
 
-    assert guards.guard_payload_contract(html, ROOT / "derive.py", ticks) == []
+    assert guards.guard_payload_contract(html, payload) == []
 
 
 def test_payload_guard_still_rejects_an_undeclared_field(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
-    html = payload_guard_page(tmp_path, ticks).replace(
+    html, payload = payload_guard_page(tmp_path, ticks)
+    html = html.replace(
         "</body>",
         "<script>const value = point.never_emitted;</script></body>",
     )
 
-    assert guards.guard_payload_contract(html, ROOT / "derive.py", ticks) == [
+    assert guards.guard_payload_contract(html, payload) == [
         "the page reads `point.never_emitted` but the deriver never emits it "
         "(producer/consumer drift)"
     ]
@@ -1682,15 +1683,54 @@ def test_payload_guard_still_rejects_an_undeclared_field(tmp_path):
 def test_payload_guard_rejects_a_field_dropped_only_from_rendering_data(tmp_path):
     ticks = tmp_path / "ticks.jsonl"
     write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
-    html = payload_guard_page(tmp_path, ticks).replace(
+    html, payload = payload_guard_page(tmp_path, ticks)
+    html = html.replace(
         "</body>",
         "<script>const value = point.room_lifecycle;</script></body>",
     )
 
-    assert guards.guard_payload_contract(html, ROOT / "derive.py", ticks) == [
+    assert guards.guard_payload_contract(html, payload) == [
         "the page reads `point.room_lifecycle` but the embedded rendering "
         "projection drops it (producer/consumer drift)"
     ]
+
+
+def test_guards_run_the_deriver_exactly_once(tmp_path, monkeypatch, capsys):
+    ticks = tmp_path / "ticks.jsonl"
+    write_ticks(ticks, tick("2026-08-30T00:00:00Z"))
+    derive_runs = []
+    real_run = subprocess.run
+
+    def counting_run(command, *args, **kwargs):
+        if any(str(part).endswith("derive.py") for part in command):
+            derive_runs.append(list(command))
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(guards.subprocess, "run", counting_run)
+    monkeypatch.setattr(guards, "guard_ledger_chain", lambda _ticks: [])
+    monkeypatch.setattr(guards, "guard_static_release", lambda _root: [])
+    monkeypatch.setattr(guards, "guard_zero_width_render", lambda _html: [])
+    monkeypatch.setattr(guards, "guard_no_js_state", lambda _html, _payload: [])
+    monkeypatch.setattr(guards, "guard_mobile_horizontal_overflow", lambda _root: [])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "guards.py",
+            "--html",
+            str(ROOT / "index.html"),
+            "--derive",
+            str(ROOT / "derive.py"),
+            "--ticks",
+            str(ticks),
+            "--site-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert guards.main() == 0
+    assert len(derive_runs) == 1
+    assert "ok    payload contract" in capsys.readouterr().out
 
 
 def test_complete_built_tree_passes_the_static_release_guard(tmp_path):
