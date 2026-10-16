@@ -76,6 +76,10 @@ more than one full digest shares a prefix: it returns `409 ambiguous_room_id` wi
 names. A unique result may disclose its name because the caller supplied an exact hash. Every name
 is labelled `untrusted`.
 
+Any other identifier under `/api/v1/rooms/`, a room name included, returns `404 invalid_room_id`.
+A well-formed identifier with no stored room returns `404 room_unknown`. Neither echoes the
+identifier back.
+
 Lifecycle state is one of:
 
 - `present_at_last_check`: a scheduled room read returned a valid response.

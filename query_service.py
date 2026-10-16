@@ -606,7 +606,7 @@ class QueryApplication:
                     return self.room_evidence_html(room_page.group(1), params)
                 if path == "/api/v1/rooms/search":
                     return self.room_search_api(params)
-                room_api = re.fullmatch(r"/api/v1/rooms/([0-9a-f]{16})", path)
+                room_api = re.fullmatch(r"/api/v1/rooms/([^/]+)", path)
                 if room_api:
                     return self.room_evidence_api(room_api.group(1), params)
                 did_api = re.fullmatch(r"/api/v1/dids/(.+)", path)
@@ -950,7 +950,12 @@ class QueryApplication:
 
     def room_record(self, identifier: str) -> dict[str, Any]:
         if ROOM_ID_RE.fullmatch(identifier) is None:
-            raise ApiError(404, "room_unknown", "room evidence was not found")
+            raise ApiError(
+                404,
+                "invalid_room_id",
+                "a room id is 16 lowercase hex characters; "
+                "find a room by name at /api/v1/rooms/search?q=",
+            )
         with closing(self.database()) as connection:
             rows = connection.execute(ROOM_ID_LOOKUP_SQL, (identifier,)).fetchall()
             if not rows:

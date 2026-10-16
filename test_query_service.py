@@ -1339,6 +1339,22 @@ def test_short_hash_collision_fails_closed_without_names(running_server):
     assert b"collision-two" not in body
 
 
+@pytest.mark.parametrize(
+    "identifier",
+    ("lobby", "DEADBEEFDEADBEEF", "deadbeefdeadbee", "deadbeefdeadbeef0"),
+)
+def test_malformed_room_id_is_named_apart_from_an_unknown_route(
+    running_server, identifier
+):
+    status, _, payload = json_request(
+        running_server, f"/api/v1/rooms/{identifier}?format=json"
+    )
+    assert status == 404
+    assert payload["error"] == "invalid_room_id"
+    assert "/api/v1/rooms/search" in payload["message"]
+    assert identifier not in payload["message"]
+
+
 def test_room_id_selects_the_newest_generation_and_only_its_revisits(
     running_server,
 ):
